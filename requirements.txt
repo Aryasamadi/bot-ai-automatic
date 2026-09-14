@@ -1,0 +1,5 @@
+httpx
+feedparser
+trafilatura
+beautifulsoup4
+python-telegram-bot
