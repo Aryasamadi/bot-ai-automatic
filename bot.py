@@ -2892,7 +2892,7 @@ async def on_message(update, context):
     st = context.user_data.get("await")
     if not st:
         # Check if user forwarded a channel post without being in await mode
-        if msg.forward_from_chat and msg.forward_from_chat.type == "channel":
+        if msg.forward_origin and getattr(msg.forward_origin, "type", None) == "channel":
             context.user_data["await"] = {"kind": "ch_add", "back": "a:home"}
             st = context.user_data["await"]
         else:
