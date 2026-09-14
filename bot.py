@@ -687,11 +687,25 @@ async def store_deeplink(admin_id, payload):
     q("INSERT OR REPLACE INTO kv_cache VALUES(?,?,?)", (key, data, now_iso()), commit=True); return key
 
 async def load_deeplink(key):
-    r = q("SELECT value FROM kv_cache WHERE key=?", (key,), one=True)
-    if r: return json.loads(r["value"])
-    row = q("SELECT local_json FROM deeplinks WHERE key=?", (key,), one=True); data = row["local_json"] if row and row["local_json"] else (await kv_get(key) if CF_ENABLED else None)
-    if data: q("INSERT OR REPLACE INTO kv_cache VALUES(?,?,?)", (key, data, now_iso()), commit=True); return json.loads(data)
-    return None
+    key = str(key or "").strip()
+    if not key: return None
+    # اول رکورد اصلی deeplinks را بررسی می‌کنیم؛ kv_cache فقط کش است.
+    row = q("SELECT local_json FROM deeplinks WHERE key=?", (key,), one=True)
+    data = row["local_json"] if row and row["local_json"] else None
+    if not data:
+        r = q("SELECT value FROM kv_cache WHERE key=?", (key,), one=True)
+        if r: data = r["value"]
+    if not data and CF_ENABLED:
+        data = await kv_get(key)
+    if not data: return None
+    try:
+        obj = json.loads(data) if isinstance(data, str) else data
+    except Exception as e:
+        log_event("ERROR", f"Deep link JSON invalid ({key}): {e}")
+        return None
+    if isinstance(data, str):
+        q("INSERT OR REPLACE INTO kv_cache VALUES(?,?,?)", (key, data, now_iso()), commit=True)
+    return obj
 
 def init_core():
     db(); seed_plans()
@@ -3125,13 +3139,18 @@ async def cmd_start(update, context):
     user_upsert(uid, uname=update.effective_user.username, name=update.effective_user.full_name)
     if is_banned(uid): return await update.message.reply_text(tr("fa", "banned"))
     if args and (args[0].startswith("dl_") or args[0].startswith("r_")):
-        key = args[0][3:]; data = await load_deeplink(key)
-        if data and isinstance(data, dict) and data.get("full"):
-            body, _ = fit_html(data["full"], 3800)
-            return await update.message.reply_text(f"📖 <b>نسخه‌ی کامل مقاله</b>\n\n{body}", parse_mode=HTML, disable_web_page_preview=True)
-        elif data and isinstance(data, str):
+        key = args[0][3:]
+        data = await load_deeplink(key)
+        if isinstance(data, dict):
+            body = data.get("full") or data.get("short") or ""
+            if body.strip():
+                body, _ = fit_html(body, 3800)
+                title = data.get("title") or "نسخه‌ی کامل مقاله"
+                return await update.message.reply_text(f"📖 <b>{html.escape(str(title))}</b>\n\n{body}", parse_mode=HTML, disable_web_page_preview=True)
+        elif isinstance(data, str) and data.strip():
             body, _ = fit_html(data, 3800)
             return await update.message.reply_text(f"📖 <b>نسخه‌ی کامل مقاله</b>\n\n{body}", parse_mode=HTML, disable_web_page_preview=True)
+        return await update.message.reply_text("❌ این لینک مقاله منقضی شده یا محتوای آن پیدا نشد. لطفاً لینک جدید مقاله را باز کنید.", disable_web_page_preview=True)
     await go_home(update, context)
 
 async def cmd_create(update, context):
