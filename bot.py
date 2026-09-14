@@ -1252,20 +1252,20 @@ async def _api_discover(src, limit):
 
 async def discover_source(src, limit=25, use_cache=True):
     cond = {}
-    if src["etag"]: cond["If-None-Match"] = src["etag"]
-    if src["last_modified"]: cond["If-Modified-Since"] = src["last_modified"]
+    if src.get("etag"): cond["If-None-Match"] = src["etag"]
+    if src.get("last_modified"): cond["If-Modified-Since"] = src["last_modified"]
     try:
         if _has_api(src): return await _api_discover(src, limit)
         if src["feed_url"] and use_cache:
             r = await _get(src["feed_url"], cond, feed=True)
-            if r.status_code == 304: source_ok(src["id"], src["feed_url"], src["etag"], src["last_modified"]); return [], False, "feed"
+            if r.status_code == 304: source_ok(src["id"], src["feed_url"], src.get("etag"), src.get("last_modified")) if src.get("id") else None; return [], False, "feed"
             if r.status_code == 200:
                 items = _parse_any(r.content, src["feed_url"], limit)
                 if items: source_ok(src["id"], src["feed_url"], r.headers.get("etag"), r.headers.get("last-modified")); return items, True, "sitemap" if b"<urlset" in r.content[:4096].lower() else "feed"
         r = await _get(src["url"], feed=False)
         if r.status_code != 200: raise FetchError(r.status_code, src["url"])
         items = _parse_any(r.content, src["url"], limit)
-        if items: source_ok(src["id"], src["url"], r.headers.get("etag"), r.headers.get("last-modified")); return items, True, "feed"
+        if items: source_ok(src["id"], src["url"], r.headers.get("etag"), r.headers.get("last-modified")) if src.get("id") else None; return items, True, "feed"
         soup = BeautifulSoup(r.text, "lxml"); p = urlparse(src["url"]); origin = f"{p.scheme}://{p.netloc}"; cands = []
         for tag in soup.find_all("link", attrs={"type": re.compile(r"application/(rss|atom|rdf)\+xml|application/feed\+json", re.I)}):
             if tag.get("href"): cands.append(urljoin(src["url"], tag["href"]))
@@ -1294,7 +1294,7 @@ async def discover_source(src, limit=25, use_cache=True):
             head = rr.content[:4096].lower()
             if b"<urlset" in head:
                 items = _sitemap_items(rr.content.decode("utf-8", "ignore"), limit)
-                if items: source_ok(src["id"], su); return items, True, "sitemap"
+                if items: source_ok(src["id"], su) if src.get("id") else None; return items, True, "sitemap"
             elif b"<sitemapindex" in head:
                 kids = re.findall(r"<sitemap>.*?<loc>\s*(.*?)\s*</loc>", rr.content.decode("utf-8", "ignore"), re.S)
                 pref = [k for k in kids if re.search(r"news|post|article|blog|\d{4}", k, re.I)] or kids
@@ -1303,9 +1303,9 @@ async def discover_source(src, limit=25, use_cache=True):
                     except Exception: continue
                     if rk.status_code == 200 and b"<urlset" in rk.content[:4096].lower():
                         items = _sitemap_items(rk.content.decode("utf-8", "ignore"), limit)
-                        if items: source_ok(src["id"], html.unescape(ku)); return items, True, "sitemap"
-        items = _html_links(soup, src["url"], limit); source_ok(src["id"]); return items, True, "html"
-    except Exception as e: source_fail(src["id"], e); raise
+                        if items: source_ok(src["id"], html.unescape(ku)) if src.get("id") else None; return items, True, "sitemap"
+        items = _html_links(soup, src["url"], limit); source_ok(src["id"]) if src.get("id") else None; return items, True, "html"
+    except Exception as e: source_fail(src["id"], e) if src.get("id") else None; raise
 
 def _probe_status(e):
     st = getattr(e, "status", None)
