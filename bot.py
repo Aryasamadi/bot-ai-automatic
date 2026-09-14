@@ -1720,6 +1720,13 @@ async def user_is_admin(bot, chat_id, uid):
     except Exception: return False
 
 async def publish_article(bot, aid, count_usage=True):
+    global BOT_USERNAME
+    if not BOT_USERNAME:
+        try:
+            me = await bot.get_me()
+            BOT_USERNAME = me.username or ""
+        except Exception as e:
+            log.warning(f"Could not load bot username before publishing: {e}")
     a = get_article(aid)
     if not a or not a["post_html"]: return False, "not_ready"
     ch = get_channel(a["channel_id"]); admin_id = a["admin_id"]
