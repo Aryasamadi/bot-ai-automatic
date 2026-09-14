@@ -3194,6 +3194,13 @@ def main():
     log.info("Starting Telegram Bot application...")
 
     async def post_init(application):
+        global BOT_USERNAME
+        try:
+            me = await application.bot.get_me()
+            BOT_USERNAME = me.username or ""
+            log.info(f"Bot username loaded: @{BOT_USERNAME}" if BOT_USERNAME else "Bot username is empty")
+        except Exception as e:
+            log.error(f"Could not load bot username: {e}")
         asyncio.create_task(scheduler_loop(application))
 
     APP.post_init = post_init
