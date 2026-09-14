@@ -2883,6 +2883,14 @@ async def on_callback(update, context):
 
 # ============================================================
 # مدیریت پیام‌های ورودی کاربر (Message & Wizard Processing)
+def forwarded_channel(msg):
+    origin = getattr(msg, "forward_origin", None)
+    if not origin or getattr(origin, "type", None) != "channel":
+        return None
+    return getattr(origin, "chat", None)
+
+# ============================================================
+# مدیریت پیام‌های ورودی کاربر (Message & Wizard Processing)
 async def on_message(update, context):
     if not update.message: return
     uid = update.effective_user.id; msg = update.message; text = (msg.text or "").strip(); lang = L(update)
@@ -2892,7 +2900,7 @@ async def on_message(update, context):
     st = context.user_data.get("await")
     if not st:
         # Check if user forwarded a channel post without being in await mode
-        if msg.forward_origin and getattr(msg.forward_origin, "type", None) == "channel":
+        if forwarded_channel(msg):
             context.user_data["await"] = {"kind": "ch_add", "back": "a:home"}
             st = context.user_data["await"]
         else:
@@ -2981,8 +2989,9 @@ async def on_message(update, context):
     # Channel add
     if kind == "ch_add":
         chat_id, ch_title, ch_user = None, None, None
-        if msg.forward_from_chat and msg.forward_from_chat.type == "channel":
-            chat_id = msg.forward_from_chat.id; ch_title = msg.forward_from_chat.title; ch_user = msg.forward_from_chat.username
+        ch = forwarded_channel(msg)
+        if ch:
+            chat_id = ch.id; ch_title = ch.title; ch_user = ch.username
         elif text:
             target = text.strip()
             if not (target.startswith("@") or target.startswith("-100")): target = "@" + target
@@ -3093,6 +3102,8 @@ async def on_message(update, context):
 # دستورات بات تلگرام (Bot Commands)
 async def cmd_start(update, context):
     uid = update.effective_user.id; args = context.args or []
+    context.user_data.pop("panel", None)
+    context.user_data.pop("await", None)
     user_upsert(uid, uname=update.effective_user.username, name=update.effective_user.full_name)
     if is_banned(uid): return await update.message.reply_text(tr("fa", "banned"))
     if args and args[0].startswith("dl_"):
