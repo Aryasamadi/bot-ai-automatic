@@ -3117,7 +3117,7 @@ async def cmd_start(update, context):
     context.user_data.pop("await", None)
     user_upsert(uid, uname=update.effective_user.username, name=update.effective_user.full_name)
     if is_banned(uid): return await update.message.reply_text(tr("fa", "banned"))
-    if args and args[0].startswith("dl_"):
+    if args and (args[0].startswith("dl_") or args[0].startswith("r_")):
         key = args[0][3:]; data = await load_deeplink(key)
         if data and isinstance(data, dict) and data.get("full"):
             body, _ = fit_html(data["full"], 3800)
