@@ -292,7 +292,10 @@ def role_of(uid):
 def user_lang(uid):
     u = get_user(uid); return u["lang"] if u and u["lang"] in LANGS else None
 def set_lang(uid, lang): q("UPDATE users SET lang=? WHERE id=?", (lang if lang in LANGS else "fa", uid), commit=True)
-def list_users(role=None, limit=5000): return q("SELECT * FROM users" + (" WHERE role=?" if role else "") + " ORDER BY created_at DESC LIMIT ?", ((role, limit) if role else (limit,)))
+def list_users(role=None, limit=5000, offset=0):
+    offset = max(0, int(offset or 0)); limit = max(1, int(limit or 5000))
+    sql = "SELECT * FROM users" + (" WHERE role=?" if role else "") + " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    return q(sql, ((role, limit, offset) if role else (limit, offset)))
 def list_admins(): return q("SELECT * FROM users WHERE role IN ('admin','super') AND banned=0")
 def count_users(): return q("SELECT role, COUNT(*) c FROM users GROUP BY role")
 
@@ -1280,7 +1283,11 @@ async def discover_source(src, limit=25, use_cache=True):
             except Exception: continue
             if rr.status_code == 200:
                 items = _parse_any(rr.content, fu, limit)
-                if items: source_ok(src["id"], fu, rr.headers.get("etag"), rr.headers.get("last-modified")); return items, True, "feed"
+                if items:
+                    src["_discovered_feed_url"] = fu
+                    if src.get("id"):
+                        source_ok(src["id"], fu, rr.headers.get("etag"), rr.headers.get("last-modified"))
+                    return items, True, "feed"
         smaps = list(SITEMAP_PATHS)
         try:
             rb = await fetch(origin + "/robots.txt", timeout=10)
@@ -2961,9 +2968,11 @@ async def on_message(update, context):
         if q("SELECT id FROM sources WHERE channel_id=? AND url=?", (cid, url), one=True): return await msg.reply_text(tr(lang, "src_dup"))
         m_check = await msg.reply_text(tr(lang, "src_checking"))
         try:
-            items, _, method = await discover_source({"url": url, "feed_url": None, "api_url": None, "api_key": None}, use_cache=False)
-            sid = q("INSERT INTO sources(admin_id,channel_id,url,feed_url,active,bot_active,last_fetch,found_total,fail_count) VALUES(?,?,?,?,1,1,?,0,0)",
-                    (uid, cid, url, url if method.startswith("rss") else None, now_iso()), commit=True)
+            probe = {"id": None, "url": normalize_url(url), "feed_url": None, "api_url": None, "api_key": None, "etag": None, "last_modified": None}
+            items, _, method = await discover_source(probe, use_cache=False)
+            feed_url = probe.get("_discovered_feed_url") or (probe.get("feed_url") if method == "feed" else None)
+            sid = q("INSERT INTO sources(admin_id,channel_id,url,feed_url,active,bot_active,last_fetch,found_total,fail_count) VALUES(?,?,?,?,1,1,?,?,0)",
+                    (uid, cid, probe["url"], feed_url, now_iso(), len(items)), commit=True)
             context.user_data.pop("await", None)
             try: await m_check.delete()
             except Exception: pass
