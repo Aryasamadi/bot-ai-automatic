@@ -1254,6 +1254,8 @@ async def _api_discover(src, limit):
     source_ok(src["id"]); return items, True, "api"
 
 async def discover_source(src, limit=25, use_cache=True):
+    if not isinstance(src, dict):
+        src = {k: src[k] for k in src.keys()}
     cond = {}
     if src.get("etag"): cond["If-None-Match"] = src["etag"]
     if src.get("last_modified"): cond["If-Modified-Since"] = src["last_modified"]
