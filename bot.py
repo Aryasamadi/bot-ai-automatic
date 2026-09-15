@@ -1,18 +1,14 @@
 # -*- coding: utf-8 -*-
 """ 
-NewsBot v3 — نسخه بهینه‌شده و تثبیت‌شده (Single-File)
+NewsBot v3 — یک‌فایل کامل: هسته‌ی داده، موتور محتوا، رابط کاربری، پنل مدیر کلان
+نیازمندی‌ها: python-telegram-bot[job-queue]>=21, httpx, feedparser, trafilatura, beautifulsoup4, lxml
 """
 import os, re, json, html, time, random, asyncio, logging, sqlite3, hashlib, secrets, tempfile, threading, sys
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin, urlparse, parse_qsl, urlencode
+from urllib.parse import urljoin, urlparse
 import httpx, feedparser, trafilatura
 from bs4 import BeautifulSoup
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.constants import ParseMode, ChatType
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
-from telegram.error import BadRequest, RetryAfter
-
-# ============================================================
+#  ============================================================
 # تنظیمات محیطی
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 SUPER_ADMIN_IDS = {int(x) for x in os.getenv("SUPER_ADMIN_IDS", "0").split(",") if x.strip().isdigit()}
@@ -28,38 +24,33 @@ CF_API_TOKEN = os.getenv("CF_API_TOKEN", "")
 CF_ENABLED = bool(CF_ACCOUNT_ID and CF_KV_NAMESPACE_ID and CF_API_TOKEN)
 DEFAULT_UTC_OFFSET = float(os.getenv("DEFAULT_UTC_OFFSET", "3.5"))   # تهران
 BOT_USERNAME = ""
-NOTIFY_SUPER = None
-NOTIFY_USER = None
+NOTIFY_SUPER = None          # async fn(text, kb=None)   — پایین‌تر در لایه‌ی پشتیبانی ست می‌شود
+NOTIFY_USER = None           # async fn(uid, text, kb=None)
 UTC = timezone.utc
-HTML = ParseMode.HTML
-APP: Application = None
 CAPTION_LIMIT, MSG_LIMIT = 1024, 4096
-SOURCE_COOLDOWN_MIN = 10
+SOURCE_COOLDOWN_MIN = 10     # حداقل فاصله‌ی دو بررسی یک منبع در حالت خودکار
 MODEL_PROBE_MIN = 10
-MIN_INTERVAL = 30
-MAX_LOOKBACK = 48
-MAX_PPC = 5
-POST_LIMIT_DEFAULT = 700
-BOT_FULL_MAX = 2500
+MIN_INTERVAL = 30            # حداقل فاصله‌ی چرخه (دقیقه)
+MAX_LOOKBACK = 48            # حداکثر بازه‌ی مقالات (ساعت)
+MAX_PPC = 5                  # حداکثر پست در هر چرخه
+POST_LIMIT_DEFAULT = 700     # سقف کاراکتر پست کانال (پیش‌فرض)؛ بیشتر از آن → «ادامه در ربات»
+BOT_FULL_MAX = 2500          # سقف کاراکتر محتوای کامل داخل ربات («ادامه در ربات»)
 LANGS = ("fa", "en")
-
-AI_CONCURRENCY = int(os.getenv("AI_CONCURRENCY", "3"))
-FETCH_CONCURRENCY = int(os.getenv("FETCH_CONCURRENCY", "8"))
-CYCLE_CONCURRENCY = int(os.getenv("CYCLE_CONCURRENCY", "2"))
-MAX_CYCLES_PER_TICK = int(os.getenv("MAX_CYCLES_PER_TICK", "4"))
-TICK_SECONDS = int(os.getenv("TICK_SECONDS", "120"))
-TEST_COOLDOWN_SEC = int(os.getenv("TEST_COOLDOWN_SEC", "120"))
-CB_RATE = float(os.getenv("CB_RATE", "0.6"))
-
+# ---- محافظت در برابر فشار (قابل تنظیم با متغیر محیطی)
+AI_CONCURRENCY = int(os.getenv("AI_CONCURRENCY", "3"))          # درخواست هم‌زمان به مدل‌ها
+FETCH_CONCURRENCY = int(os.getenv("FETCH_CONCURRENCY", "8"))    # دانلود هم‌زمان صفحات/فیدها
+CYCLE_CONCURRENCY = int(os.getenv("CYCLE_CONCURRENCY", "2"))    # چرخه‌ی هم‌زمان کانال‌ها
+MAX_CYCLES_PER_TICK = int(os.getenv("MAX_CYCLES_PER_TICK", "4"))  # حداکثر چرخه‌ی زمان‌بندی‌شده در هر تیک
+TICK_SECONDS = int(os.getenv("TICK_SECONDS", "120"))            # فاصله‌ی تیک زمان‌بند
+TEST_COOLDOWN_SEC = int(os.getenv("TEST_COOLDOWN_SEC", "120"))  # فاصله‌ی دو تست فوری روی یک کانال
+CB_RATE = float(os.getenv("CB_RATE", "0.6"))                    # حداقل فاصله‌ی دو کلیک یک کاربر (ثانیه)
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("core")
-
 # ============================================================
-# ابزار زمان
+# ابزار زمان (فقط بر پایه‌ی آفست UTC)
 TZ_ZONES = [("tehran", 3.5), ("istanbul", 3), ("dubai", 4), ("kabul", 4.5), ("karachi", 5), ("delhi", 5.5), ("moscow", 3), ("berlin", 1), ("london", 0),
             ("beijing", 8), ("tokyo", 9), ("sydney", 10), ("newyork", -5), ("losangeles", -8), ("saopaulo", -3), ("utc", 0)]
-
 def now_utc(): return datetime.now(UTC)
 def now_iso(): return now_utc().isoformat()
 def parse_dt(s):
@@ -68,17 +59,14 @@ def parse_dt(s):
         d = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
         return d if d.tzinfo else d.replace(tzinfo=UTC)
     except Exception: return None
-
 def tz_of(off):
     try: return timezone(timedelta(hours=float(off)))
     except Exception: return timezone(timedelta(hours=DEFAULT_UTC_OFFSET))
-
 def off_label(off):
     try: off = float(off)
     except Exception: off = DEFAULT_UTC_OFFSET
     h = int(abs(off)); m = int(round((abs(off) - h) * 60))
     return f"UTC{'+' if off >= 0 else '-'}{h:02d}:{m:02d}"
-
 def utc_clock(): return now_utc().strftime("%H:%M")
 def local_clock(off): return datetime.now(tz_of(off)).strftime("%H:%M")
 def today_str(off=DEFAULT_UTC_OFFSET): return datetime.now(tz_of(off)).strftime("%Y-%m-%d")
@@ -86,63 +74,48 @@ def fmt_date(d, off=DEFAULT_UTC_OFFSET, with_time=False):
     if not d: return "—"
     if isinstance(d, str): d = parse_dt(d)
     return d.astimezone(tz_of(off)).strftime("%Y-%m-%d %H:%M" if with_time else "%Y-%m-%d") if d else "—"
-
 def ago_text(iso, lang="fa"):
     d = parse_dt(iso)
     if not d: return "—"
     s = int((now_utc() - d).total_seconds())
     if lang == "en": return f"{s}s" if s < 60 else f"{s//60}m" if s < 3600 else f"{s//3600}h" if s < 86400 else f"{s//86400}d"
     return f"{s} ثانیه" if s < 60 else f"{s//60} دقیقه" if s < 3600 else f"{s//3600} ساعت" if s < 86400 else f"{s//86400} روز"
-
 def url_hash(u): return hashlib.sha1(u.strip().encode()).hexdigest()[:20]
-
 def parse_expiry(text):
+    """«30» → ۳۰ روز بعد · «2025-12-31» → پایان همان روز (UTC). خروجی: iso یا None"""
     t = str(text).strip().translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789"))
     if t.isdigit(): return (now_utc() + timedelta(days=int(t))).isoformat()
     m = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$", t)
     if not m: return None
     try: return datetime(int(m[1]), int(m[2]), int(m[3]), 23, 59, tzinfo=UTC).isoformat()
     except Exception: return None
-
 # ============================================================
 # محافظت در برابر فشار: قفل‌ها، سمافورها، محدودکننده‌ی نرخ
 AI_SEM = asyncio.Semaphore(AI_CONCURRENCY)
 FETCH_SEM = asyncio.Semaphore(FETCH_CONCURRENCY)
 CYCLE_SEM = asyncio.Semaphore(CYCLE_CONCURRENCY)
 _ch_locks, _rl = {}, {}
-
 def ch_lock(cid):
+    """قفل هر کانال: هرگز دو چرخه (تست/خودکار/انتشار دستی) هم‌زمان روی یک کانال اجرا نمی‌شود."""
     if cid not in _ch_locks: _ch_locks[cid] = asyncio.Lock()
     return _ch_locks[cid]
-
-def purge_ch_lock(cid):
-    _ch_locks.pop(cid, None)
-
-def purge_model_lock(mid):
-    _model_locks.pop(mid, None)
-
 def rate_ok(key, min_gap):
+    """True اگر از آخرین رخداد این کلید حداقل min_gap ثانیه گذشته باشد (و زمان را به‌روز می‌کند)."""
     t = time.time(); last = _rl.get(key, 0)
     if t - last < min_gap: return False
     _rl[key] = t
-    if len(_rl) > 5000:
-        now_t = time.time()
-        expired = [k for k, ts in _rl.items() if now_t - ts > 3600]
-        for k in expired: _rl.pop(k, None)
+    if len(_rl) > 20000: [_rl.pop(k) for k in list(_rl)[:10000]]
     return True
-
-def rate_free(key, min_gap): return (time.time() - _rl.get(key, 0)) >= min_gap
+def rate_free(key, min_gap):
+    """فقط بررسی می‌کند و چیزی ثبت نمی‌کند (برای مواردی که محدودیت باید فقط بعد از موفقیت اعمال شود)."""
+    return (time.time() - _rl.get(key, 0)) >= min_gap
 def rate_mark(key):
     _rl[key] = time.time()
-    if len(_rl) > 5000:
-        now_t = time.time()
-        for k in [k for k, ts in _rl.items() if now_t - ts > 3600]: _rl.pop(k, None)
-
+    if len(_rl) > 20000: [_rl.pop(k) for k in list(_rl)[:10000]]
 def rate_clear(key): _rl.pop(key, None)
 def rate_left(key, min_gap): return max(0, int(min_gap - (time.time() - _rl.get(key, 0))))
-
 # ============================================================
-# دیتابیس با پشتیبانی امن
+# دیتابیس + مهاجرت خودکار
 _conn, _lock = None, threading.RLock()
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT, name TEXT, role TEXT DEFAULT 'user', plan_id INTEGER, plan_expires TEXT, next_plan_id INTEGER, next_plan_days INTEGER, free_used INTEGER DEFAULT 0, banned INTEGER DEFAULT 0, lang TEXT, remind_key TEXT, premium INTEGER DEFAULT 0, created_at TEXT, last_seen TEXT);
@@ -159,112 +132,64 @@ CREATE TABLE IF NOT EXISTS kv_cache(key TEXT PRIMARY KEY, value TEXT, cached_at 
 CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, level TEXT, admin_id INTEGER, msg TEXT);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS support(user_id INTEGER PRIMARY KEY, open INTEGER DEFAULT 0, opened_at TEXT);
-CREATE TABLE IF NOT EXISTS support_map(admin_id INTEGER, message_id INTEGER, user_id INTEGER, ts TEXT, PRIMARY KEY(admin_id, message_id));
+CREATE TABLE IF NOT EXISTS support_map(msg_id INTEGER PRIMARY KEY, user_id INTEGER, ts TEXT);
 CREATE TABLE IF NOT EXISTS pay_requests(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, plan_id INTEGER, status TEXT DEFAULT 'pending', created_at TEXT, receipt_chat INTEGER, receipt_msg INTEGER, note TEXT, decided_at TEXT, discount TEXT, final_price TEXT);
 CREATE INDEX IF NOT EXISTS idx_art_ch_status ON articles(channel_id, status);
 CREATE INDEX IF NOT EXISTS idx_art_created ON articles(created_at);
 CREATE INDEX IF NOT EXISTS idx_src_ch ON sources(channel_id);
 CREATE INDEX IF NOT EXISTS idx_logs_admin ON logs(admin_id, id);
 """
-
 MIGRATIONS = [("users", "next_plan_id", "INTEGER"), ("users", "next_plan_days", "INTEGER"), ("users", "lang", "TEXT"), ("users", "remind_key", "TEXT"), ("users", "premium", "INTEGER DEFAULT 0"),
               ("plans", "name_en", "TEXT"), ("plans", "price_en", "TEXT DEFAULT ''"), ("plans", "description_en", "TEXT DEFAULT ''"),
               ("channels", "lock_code", "TEXT"), ("channels", "verified_by", "INTEGER"), ("channels", "created_at", "TEXT"), ("channels", "settings", "TEXT"),
               ("sources", "channel_id", "INTEGER"), ("sources", "feed_url", "TEXT"), ("sources", "last_error", "TEXT"), ("articles", "channel_id", "INTEGER"),
               ("sources", "bot_active", "INTEGER DEFAULT 1"), ("sources", "api_url", "TEXT"), ("sources", "api_key", "TEXT"), ("sources", "api_note", "TEXT DEFAULT ''"),
               ("pay_requests", "discount", "TEXT"), ("pay_requests", "final_price", "TEXT")]
-
 def db():
     global _conn
     if _conn is None:
-        _conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=20)
+        _conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
         _conn.row_factory = sqlite3.Row
-        for pr in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL", "PRAGMA busy_timeout=15000", "PRAGMA cache_size=-16000", "PRAGMA temp_store=MEMORY"): _conn.execute(pr)
+        for pr in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL", "PRAGMA busy_timeout=8000", "PRAGMA cache_size=-16000", "PRAGMA temp_store=MEMORY"): _conn.execute(pr)
         _conn.executescript(SCHEMA)
         for tbl, col, decl in MIGRATIONS:
             try: _conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {decl}")
             except sqlite3.OperationalError: pass
         _conn.commit()
     return _conn
-
 def q(sql, params=(), one=False, commit=False):
     with _lock:
         cur = db().execute(sql, params)
         if commit: db().commit(); return cur.lastrowid
         return cur.fetchone() if one else cur.fetchall()
-
 def gset(k, v): q("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (k, json.dumps(v, ensure_ascii=False)), commit=True)
 def gget(k, default=None):
     r = q("SELECT value FROM settings WHERE key=?", (k,), one=True)
     return json.loads(r["value"]) if r else default
-
 def log_event(level, msg, admin_id=None):
     q("INSERT INTO logs(ts,level,admin_id,msg) VALUES(?,?,?,?)", (now_iso(), level, admin_id, str(msg)[:600]), commit=True)
     (log.error if level == "ERROR" else log.warning if level == "WARN" else log.info)(f"[{admin_id}] {msg}")
-
 def recent_logs(n=30, admin_id=None, level=None):
     sql, p = "SELECT * FROM logs WHERE 1=1", []
     if admin_id: sql += " AND admin_id=?"; p.append(admin_id)
     if level: sql += " AND level=?"; p.append(level)
     return q(sql + " ORDER BY id DESC LIMIT ?", (*p, n))
-
 # ============================================================
-# متن‌های سراسری دوزبانه
+# متن‌های سراسری دوزبانه (قابل ویرایش توسط مدیر کلان)
 DEFAULT_TEXTS = {
-    "welcome": {"fa": """👋 سلام {name}!
-
-این ربات، ادمین تمام‌وقت کانال شماست: منابع را می‌خواند، بهترین مقالات را انتخاب می‌کند، با هوش مصنوعی بازنویسی می‌کند و با قالب زیبا در کانال‌تان منتشر می‌کند.
-
-یک بار تنظیم کنید؛ بقیه‌اش خودکار است.""",
-                "en": """👋 Hi {name}!
-
-This bot is your channel's full-time editor: it reads your sources, picks the best articles, rewrites them with AI and publishes them beautifully formatted in your channel.
-
-Set it up once; the rest is automatic."""},
-    "help": {"fa": """📘 <b>راهنما</b>
-
-/create — پنل مدیریت و پلن رایگان
-/man — پشتیبانی
-/about — درباره
-/lang — زبان
-/cancel — لغو عملیات""",
-             "en": """📘 <b>Help</b>
-
-/create — admin panel & free plan
-/man — support
-/about — about
-/lang — language
-/cancel — cancel action"""},
-    "about": {"fa": """ℹ️ <b>درباره</b>
-
-ربات مدیریت خودکار محتوای کانال تلگرام.""", "en": """ℹ️ <b>About</b>
-
-Automated Telegram channel content manager."""},
-    "pay": {"fa": """💳 <b>پرداخت پلن «{plan}»</b>
-
-💰 مبلغ: <b>{price}</b>
-
-به شماره کارت زیر واریز کنید:
-<code>0000-0000-0000-0000</code>
-به نام: ...
-
-سپس <b>تصویر رسید</b> را همین‌جا بفرستید.""",
-            "en": """💳 <b>Payment for “{plan}”</b>
-
-💰 Amount: <b>{price}</b>
-
-Transfer to:
-<code>0000-0000-0000-0000</code>
-Name: ...
-
-Then send the <b>receipt image</b> right here."""},
+    "welcome": {"fa": "👋 سلام {name}!\n\nاین ربات، ادمین تمام‌وقت کانال شماست: منابع را می‌خواند، بهترین مقالات را انتخاب می‌کند، با هوش مصنوعی بازنویسی می‌کند و با قالب زیبا در کانال‌تان منتشر می‌کند.\n\nیک بار تنظیم کنید؛ بقیه‌اش خودکار است.",
+                "en": "👋 Hi {name}!\n\nThis bot is your channel's full-time editor: it reads your sources, picks the best articles, rewrites them with AI and publishes them beautifully formatted in your channel.\n\nSet it up once; the rest is automatic."},
+    "help": {"fa": "📘 <b>راهنما</b>\n\n/create — پنل مدیریت و پلن رایگان\n/man — پشتیبانی\n/about — درباره\n/lang — زبان\n/cancel — لغو عملیات",
+             "en": "📘 <b>Help</b>\n\n/create — admin panel & free plan\n/man — support\n/about — about\n/lang — language\n/cancel — cancel action"},
+    "about": {"fa": "ℹ️ <b>درباره</b>\n\nربات مدیریت خودکار محتوای کانال تلگرام.", "en": "ℹ️ <b>About</b>\n\nAutomated Telegram channel content manager."},
+    "pay": {"fa": "💳 <b>پرداخت پلن «{plan}»</b>\n\n💰 مبلغ: <b>{price}</b>\n\nبه شماره کارت زیر واریز کنید:\n<code>0000-0000-0000-0000</code>\nبه نام: ...\n\nسپس <b>تصویر رسید</b> را همین‌جا بفرستید.",
+            "en": "💳 <b>Payment for “{plan}”</b>\n\n💰 Amount: <b>{price}</b>\n\nTransfer to:\n<code>0000-0000-0000-0000</code>\nName: ...\n\nThen send the <b>receipt image</b> right here."},
 }
 def gtext(key, lang="fa", **kw):
     v = gget(f"text_{key}_{lang}") or DEFAULT_TEXTS[key].get(lang) or DEFAULT_TEXTS[key]["fa"]
     try: return v.format(**kw) if kw else v
     except Exception: return v
 def gtext_set(key, lang, value): gset(f"text_{key}_{lang}", value)
-
 # ============================================================
 # کاربران، نقش‌ها و زبان
 def is_super(uid): return uid in SUPER_ADMIN_IDS
@@ -273,18 +198,13 @@ def ensure_user(uid, username="", name="", premium=None):
     u = get_user(uid)
     if not u: q("INSERT INTO users(id,username,name,role,premium,created_at,last_seen) VALUES(?,?,?,?,?,?,?)", (uid, username or "", name or "", "super" if is_super(uid) else "user", 1 if premium else 0, now_iso(), now_iso()), commit=True)
     else:
+        # last_seen حداکثر هر ۵ دقیقه نوشته می‌شود تا فشار نوشتن پایین بماند
         ls = parse_dt(u["last_seen"])
         if not ls or (now_utc() - ls).total_seconds() > 300 or (premium is not None and int(bool(premium)) != (u["premium"] or 0)) or (username and username != u["username"]):
             q("UPDATE users SET username=?,name=?,last_seen=?,premium=?,role=CASE WHEN ?=1 THEN 'super' ELSE role END WHERE id=?",
               (username or u["username"], name or u["name"], now_iso(), (1 if premium else 0) if premium is not None else (u["premium"] or 0), 1 if is_super(uid) else 0, uid), commit=True)
         else: return u
     return get_user(uid)
-
-def user_upsert(uid, uname="", name="", premium=None): return ensure_user(uid, uname, name, premium)
-def is_banned(uid):
-    u = get_user(uid)
-    return bool(u and u["banned"])
-
 def set_role(uid, role): q("UPDATE users SET role=? WHERE id=?", (role, uid), commit=True)
 def role_of(uid):
     if is_super(uid): return "super"
@@ -292,20 +212,15 @@ def role_of(uid):
 def user_lang(uid):
     u = get_user(uid); return u["lang"] if u and u["lang"] in LANGS else None
 def set_lang(uid, lang): q("UPDATE users SET lang=? WHERE id=?", (lang if lang in LANGS else "fa", uid), commit=True)
-def list_users(role=None, limit=5000, offset=0):
-    offset = max(0, int(offset or 0)); limit = max(1, int(limit or 5000))
-    sql = "SELECT * FROM users" + (" WHERE role=?" if role else "") + " ORDER BY created_at DESC LIMIT ? OFFSET ?"
-    return q(sql, ((role, limit, offset) if role else (limit, offset)))
+def list_users(role=None, limit=5000): return q("SELECT * FROM users" + (" WHERE role=?" if role else "") + " ORDER BY created_at DESC LIMIT ?", ((role, limit) if role else (limit,)))
 def list_admins(): return q("SELECT * FROM users WHERE role IN ('admin','super') AND banned=0")
 def count_users(): return q("SELECT role, COUNT(*) c FROM users GROUP BY role")
-
 # ============================================================
-# پلن‌ها و اشتراک
+# پلن‌ها (زنجیره‌ای) و اشتراک
 def seed_plans():
     if not q("SELECT 1 FROM plans LIMIT 1"):
         create_plan(name="رایگان", name_en="Free", days=7, daily_posts=1, max_sources=2, max_channels=1, daily_tests=1, price="رایگان", price_en="Free", description="۱ پست در روز · ۷ روز", description_en="1 post/day · 7 days", is_free=1, sort=0)
         create_plan(name="حرفه‌ای", name_en="Pro", days=30, daily_posts=20, max_sources=15, max_channels=3, daily_tests=5, price="توافقی", price_en="Contact us", description="۲۰ پست روزانه · ۱۵ منبع · ۳ کانال", description_en="20 posts/day · 15 sources · 3 channels", is_free=0, sort=1)
-
 def list_plans(active_only=True): return q("SELECT * FROM plans" + (" WHERE active=1" if active_only else "") + " ORDER BY sort, id")
 def get_plan(pid): return q("SELECT * FROM plans WHERE id=?", (pid,), one=True) if pid else None
 def free_plan(): return q("SELECT * FROM plans WHERE is_free=1 AND active=1 ORDER BY id LIMIT 1", one=True)
@@ -313,15 +228,17 @@ def plan_txt(p, field, lang="fa"):
     if not p: return ""
     if lang == "en" and p[f"{field}_en"]: return p[f"{field}_en"]
     return p[field] or ""
-
 def create_plan(**f):
     return q("INSERT INTO plans(name,name_en,days,daily_posts,max_sources,max_channels,daily_tests,price,price_en,description,description_en,is_free,sort) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
              (f.get("name", "پلن"), f.get("name_en", ""), f.get("days", 30), f.get("daily_posts", 5), f.get("max_sources", 5), f.get("max_channels", 1), f.get("daily_tests", 2), f.get("price", ""), f.get("price_en", ""), f.get("description", ""), f.get("description_en", ""), f.get("is_free", 0), f.get("sort", 0)), commit=True)
 def update_plan(pid, **f):
     for k, v in f.items(): q(f"UPDATE plans SET {k}=? WHERE id=?", (v, pid), commit=True)
 def delete_plan(pid): q("DELETE FROM plans WHERE id=?", (pid,), commit=True)
-
 def assign_plan(uid, pid, days=None):
+    """
+    زنجیره‌ای: بدون پلن فعال → همین حالا · همان پلن فعال → روزها اضافه می‌شود · پلن متفاوت فعال → «پلن بعدی» (ارتقا از رایگان فوری است).
+    خروجی: (تاریخ انقضا/شروع, queued)
+    """
     p = get_plan(pid)
     if not p: return None, False
     u = get_user(uid); d = int(days if days is not None else p["days"]); now = now_utc()
@@ -334,7 +251,6 @@ def assign_plan(uid, pid, days=None):
     exp = (cur if active else now) + timedelta(days=d)
     q("UPDATE users SET plan_id=?, plan_expires=?, remind_key=NULL, role=CASE WHEN role='user' THEN 'admin' ELSE role END, free_used=CASE WHEN ?=1 THEN 1 ELSE free_used END WHERE id=?", (pid, exp.isoformat(), p["is_free"], uid), commit=True)
     return exp, False
-
 def revoke_plan(uid): q("UPDATE users SET plan_id=NULL, plan_expires=NULL, next_plan_id=NULL, next_plan_days=NULL, remind_key=NULL WHERE id=?", (uid,), commit=True)
 def activate_next_plans():
     out = []
@@ -345,7 +261,6 @@ def activate_next_plans():
         q("UPDATE users SET plan_id=?, plan_expires=?, next_plan_id=NULL, next_plan_days=NULL, remind_key=NULL WHERE id=?", (p["id"], exp.isoformat(), u["id"]), commit=True)
         out.append((u["id"], p, exp))
     return out
-
 def expiring_users():
     out, now = [], now_utc()
     for u in q("SELECT * FROM users WHERE plan_expires IS NOT NULL AND banned=0 AND plan_expires>?", (now_iso(),)):
@@ -356,33 +271,27 @@ def expiring_users():
         if not stage or u["remind_key"] == stage or (stage == "72" and u["remind_key"] == "24"): continue
         q("UPDATE users SET remind_key=? WHERE id=?", (stage, u["id"]), commit=True); out.append((u, stage, left))
     return out
-
 def admin_limits(uid):
     if is_super(uid): return dict(daily_posts=None, max_sources=None, max_channels=None, daily_tests=None, plan=None, plan_id=None, expires=None, active=True, next_plan=None)
     u = get_user(uid); p = get_plan(u["plan_id"]) if u and u["plan_id"] else None
     exp = parse_dt(u["plan_expires"]) if u else None; active = bool(p and exp and exp > now_utc() and not u["banned"])
     return dict(daily_posts=p["daily_posts"] if p else 0, max_sources=p["max_sources"] if p else 0, max_channels=p["max_channels"] if p else 0, daily_tests=p["daily_tests"] if p else 0, plan=p, plan_id=p["id"] if p else None, expires=exp, active=active, next_plan=get_plan(u["next_plan_id"]) if u and u["next_plan_id"] else None)
-
 def admin_offset(uid):
     ch = q("SELECT settings FROM channels WHERE admin_id=? ORDER BY id LIMIT 1", (uid,), one=True)
     try: return float(json.loads(ch["settings"]).get("utc_offset", DEFAULT_UTC_OFFSET)) if ch and ch["settings"] else DEFAULT_UTC_OFFSET
     except Exception: return DEFAULT_UTC_OFFSET
-
 def usage_today(uid):
     r = q("SELECT posts,tests FROM usage WHERE admin_id=? AND day=?", (uid, today_str(admin_offset(uid))), one=True)
     return {"posts": r["posts"], "tests": r["tests"]} if r else {"posts": 0, "tests": 0}
-
 def usage_inc(uid, field):
     d = today_str(admin_offset(uid))
     q("INSERT INTO usage(admin_id,day,posts,tests) VALUES(?,?,0,0) ON CONFLICT(admin_id,day) DO NOTHING", (uid, d), commit=True)
     q(f"UPDATE usage SET {field}={field}+1 WHERE admin_id=? AND day=?", (uid, d), commit=True)
-
 def usage_reset(uid, field="tests"): q(f"UPDATE usage SET {field}=0 WHERE admin_id=? AND day=?", (uid, today_str(admin_offset(uid))), commit=True)
 def remaining(uid, field="posts"):
     lim = admin_limits(uid); cap = lim["daily_posts"] if field == "posts" else lim["daily_tests"]
     if cap is None: return None
     return max(0, cap - usage_today(uid)[field])
-
 # ============================================================
 # کدهای تخفیف
 _FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
@@ -396,8 +305,9 @@ def disc_update(code, **f):
     for k, v in f.items(): q(f"UPDATE discounts SET {k}=? WHERE code=?", (v, code), commit=True)
 def disc_delete(code): q("DELETE FROM discounts WHERE code=?", (code,), commit=True)
 def disc_valid(code):
+    """خروجی: (row|None, reason) — reason: ok | notfound | inactive | expired | exhausted"""
     d = disc_get(code)
-    if not d: return None, "not_found"
+    if not d: return None, "notfound"
     if not d["active"]: return None, "inactive"
     e = parse_dt(d["expires"])
     if e and e <= now_utc(): return None, "expired"
@@ -405,32 +315,37 @@ def disc_valid(code):
     return d, "ok"
 def disc_use(code): q("UPDATE discounts SET used=used+1 WHERE code=?", (code,), commit=True)
 def discount_price(price_text, percent):
+    """اگر قیمت عدد داشته باشد، مبلغ پس از تخفیف را با همان واحد برمی‌گرداند؛ در غیر این‌صورت «قیمت + (٪ تخفیف)»."""
     t = str(price_text or "").translate(_FA_DIGITS); m = re.search(r"\d[\d,٬.]*", t)
     if not m: return f"{price_text} (-{percent}%)"
     try: n = float(m.group(0).replace(",", "").replace("٬", ""))
     except Exception: return f"{price_text} (-{percent}%)"
     v = n * (100 - percent) / 100; vs = f"{int(v):,}" if v == int(v) else f"{v:,.2f}"
     return t[:m.start()] + vs + t[m.end():]
-
 # ============================================================
-# کانال‌ها و تنظیمات
+# تنظیمات مستقل هر کانال
 DEFAULT_PROMPT = {
     "fa": ("تو سردبیر حرفه‌ای یک کانال تلگرامی هستی و مثل یک انسانِ خبره و خوش‌قلم می‌نویسی؛ نه مثل ربات و نه مثل هوش مصنوعی. به زبانی می‌نویسی که در «زبان خروجی» تعیین شده است. "
            "متن را روان، دقیق، بی‌طرف و بدون اغراق بازنویسی کن؛ چیزی که در منبع نیست اضافه نکن و اعداد، تاریخ‌ها و اسامی را دقیقاً حفظ کن. "
            "تیتر جذاب در خط اول داخل <b> با یک ایموجی مرتبط؛ سپس لید یک‌جمله‌ای؛ سپس پاراگراف‌های کوتاه ۲ تا ۳ خطی با یک خط خالی بین آن‌ها. "
-           "هر پاراگراف با یک ایموجی مرتبط شروع شود و در طول متن هم ایموجی‌های مناسب ادامه یابد. "
+           "هر پاراگراف با یک ایموجی مرتبط شروع شود و در طول متن هم ایموجی‌های مناسب ادامه یابد (متنِ حدود ۲۰۰۰ کاراکتری حدود ۸ تا ۱۲ ایموجی می‌خواهد). "
            "نکات و فهرست‌ها را با «•» بنویس، اصطلاحات و اعداد مهم را <b> کن، مهم‌ترین نقل‌قول یا آمار را داخل <blockquote> بگذار. "
            "از خط جداکننده مثل «---»، جملات کلیشه‌ای و لحن قالبی پرهیز کن. جمله‌ها کوتاه و متنوع، بدون مقدمه‌چینی، با یک جمع‌بندی یک‌خطی در پایان."),
     "en": ("You are a professional editor of a Telegram channel who writes like a skilled, eloquent human — never like a bot or an AI. You write in the language set in “Output language”. "
            "Rewrite clearly, precisely, neutrally and without exaggeration; never add facts missing from the source and keep numbers, dates and names exact. "
            "Catchy headline on the first line inside <b> with one relevant emoji; then a one-sentence lead; then short 2–3 line paragraphs separated by a blank line. "
-           "Every paragraph starts with a relevant emoji and suitable emojis continue naturally through the text. "
+           "Every paragraph starts with a relevant emoji and suitable emojis continue naturally through the text (a ~2000-character post wants about 8–12 emojis). "
            "List points with “•”, bold key terms and numbers with <b>, put the most important quote or figure inside <blockquote>. "
            "Never use divider lines like “---”, no clichés, no robotic tone. Short, varied sentences, no preamble, one-line takeaway at the end."),
 }
+# پرامپت‌های پیش‌فرضِ نسخه‌های قبل — اگر کانال هنوز همان‌ها را دارد، خودکار با پیش‌فرض جدید جایگزین می‌شوند
 _LEGACY_PROMPTS = (
-    "تو سردبیر حرفه‌ای یک کانال تلگرامی فارسی هستی. متن را روان، دقیق، بی‌طرف و بدون اغراق بازنویسی کن؛ چیزی که در منبع نیست اضافه نکن و اعداد، تاریخ‌ها و اسامی را دقیقاً حفظ کن.",
-    "You are a professional editor of an English Telegram channel. Rewrite clearly, precisely, neutrally and without exaggeration; never add facts missing from the source and keep numbers, dates and names exact."
+    "تو سردبیر حرفه‌ای یک کانال تلگرامی فارسی هستی. متن را روان، دقیق، بی‌طرف و بدون اغراق بازنویسی کن؛ چیزی که در منبع نیست اضافه نکن و اعداد، تاریخ‌ها و اسامی را دقیقاً حفظ کن. "
+    "تیتر جذاب در خط اول داخل <b> با یک ایموجی مرتبط؛ سپس لید یک‌جمله‌ای؛ سپس پاراگراف‌های کوتاه ۲ تا ۳ خطی با یک خط خالی بین آن‌ها. "
+    "نکات کلیدی را با «•» فهرست کن، اصطلاحات مهم را <b> کن، نقل‌قول مهم را داخل <blockquote> بگذار. در هر پاراگراف حداکثر یک ایموجی مرتبط. جمله‌ها کوتاه، بدون مقدمه‌چینی، با یک جمع‌بندی یک‌خطی در پایان.",
+    "You are a professional editor of an English Telegram channel. Rewrite clearly, precisely, neutrally and without exaggeration; never add facts missing from the source and keep numbers, dates and names exact. "
+    "Catchy headline on the first line inside <b> with one relevant emoji; then a one-sentence lead; then short 2–3 line paragraphs separated by a blank line. "
+    "List key points with “•”, bold key terms with <b>, put a key quote inside <blockquote>. At most one relevant emoji per paragraph. Short sentences, no preamble, one-line takeaway at the end.",
 )
 DEFAULT_CATEGORIES = {
     "fa": [{"name": "خبری", "emoji": "📰", "style": "تیتر کوتاه بولد، لید یک‌جمله‌ای، ۲ تا ۳ پاراگراف کوتاه، یک نکته‌ی کلیدی با «•»."},
@@ -446,7 +361,6 @@ DEFAULT_CRITERIA = {
     "fa": [{"name": "ارزش محتوایی", "weight": 40}, {"name": "غیرتبلیغاتی بودن", "weight": 15}, {"name": "کیفیت و کامل بودن", "weight": 20}, {"name": "ارتباط با موضوع کانال", "weight": 15}, {"name": "تازگی", "weight": 10}],
     "en": [{"name": "Content value", "weight": 40}, {"name": "Non-promotional", "weight": 15}, {"name": "Quality & completeness", "weight": 20}, {"name": "Relevance to channel topic", "weight": 15}, {"name": "Freshness", "weight": 10}],
 }
-
 def default_settings(lang="fa", channel_username=""):
     lang = lang if lang in LANGS else "fa"
     return {"ui_lang": lang, "enabled": True, "mode": "auto", "prompt": DEFAULT_PROMPT[lang], "topic": "", "language": "فارسی" if lang == "fa" else "English",
@@ -455,7 +369,6 @@ def default_settings(lang="fa", channel_username=""):
             "include_media": True, "include_link": True, "signature": f"@{channel_username}" if channel_username else "@channel", "max_words": 150, "post_limit": POST_LIMIT_DEFAULT,
             "strict_ads": False, "interval_minutes": 60, "posts_per_cycle": 2, "hashtags": True, "premium_format": False,
             "last_run": None, "last_end": None, "last_result": "", "last_diag": None, "last_notified_diag": ""}
-
 def get_settings(cid):
     ch = q("SELECT settings, username, admin_id FROM channels WHERE id=?", (cid,), one=True)
     stored = {}
@@ -464,134 +377,111 @@ def get_settings(cid):
         except Exception: stored = {}
     base = stored.get("ui_lang") or (user_lang(ch["admin_id"]) if ch else None) or "fa"
     s = default_settings(base if base in LANGS else "fa", ch["username"] if ch else ""); s.update(stored); s["ui_lang"] = base if base in LANGS else "fa"
+    if s.get("prompt") in _LEGACY_PROMPTS: s["prompt"] = DEFAULT_PROMPT[s["ui_lang"]]  # پرامپتِ پیش‌فرضِ قدیمی → خودکار به نسخه‌ی جدید (خنثی از زبان)
     s["interval_minutes"] = max(MIN_INTERVAL, int(s.get("interval_minutes") or MIN_INTERVAL)); s["lookback_hours"] = min(MAX_LOOKBACK, max(1, int(s.get("lookback_hours") or 24)))
     s["posts_per_cycle"] = min(MAX_PPC, max(1, int(s.get("posts_per_cycle") or 1))); s["post_limit"] = min(4000, max(300, int(s.get("post_limit") or POST_LIMIT_DEFAULT)))
     return s
-
-def save_settings(cid, s): q("UPDATE channels SET settings=? WHERE id=?", (json.dumps(s, ensure_ascii=False), cid), commit=True)
-def update_settings(cid, **kw): s = get_settings(cid); s.update(kw); save_settings(cid, s); return s
-def toggle_setting(cid, field):
-    s = get_settings(cid); val = not bool(s.get(field, False))
-    update_settings(cid, **{field: val}); return val
-def init_settings(cid, lang="fa"):
-    ch = get_channel(cid); u = ch["username"] if ch else ""; s = default_settings(lang, u); save_settings(cid, s); return s
-def in_quiet(s):
-    a, b = s.get("quiet_start"), s.get("quiet_end")
-    if a is None or b is None or a == b: return False
-    h = datetime.now(tz_of(s.get("utc_offset"))).hour
-    return (a <= h < b) if a < b else (h >= a or h < b)
-
+LOCALIZED_KEYS = ("prompt", "language", "categories", "criteria")
+def _same(a, b):
+    try: return json.dumps(a, ensure_ascii=False, sort_keys=True) == json.dumps(b, ensure_ascii=False, sort_keys=True)
+    except Exception: return a == b
 def relocalize_settings(cid, new_lang):
+    """زبان مدیر عوض شد → صفر تا صدِ تنظیمات کانال هم عوض می‌شود: هر مقداری که همان «پیش‌فرض زبان قبلی» بوده (پرامپت، زبان محتوا، دسته‌ها، معیارها) به زبان جدید بازنویسی می‌شود؛ مقادیر دست‌ساز مدیر دست‌نخورده می‌مانند."""
     new_lang = new_lang if new_lang in LANGS else "fa"; s = get_settings(cid); old = s.get("ui_lang", "fa")
     if old != new_lang:
         old_d, new_d = default_settings(old, ""), default_settings(new_lang, "")
-        for k in ("prompt", "language", "categories", "criteria"):
-            if json.dumps(s.get(k), ensure_ascii=False, sort_keys=True) == json.dumps(old_d.get(k), ensure_ascii=False, sort_keys=True):
-                s[k] = new_d[k]
+        for k in LOCALIZED_KEYS:
+            if _same(s.get(k), old_d.get(k)): s[k] = new_d[k]
     s["ui_lang"] = new_lang; s["last_diag"] = None; s["last_notified_diag"] = ""; save_settings(cid, s); return s
-
 def relocalize_all(uid, new_lang):
     n = 0
     for ch in q("SELECT id FROM channels WHERE admin_id=?", (uid,)):
         try: relocalize_settings(ch["id"], new_lang); n += 1
         except Exception as e: log.warning(f"relocalize {ch['id']}: {e}")
     return n
-
+def save_settings(cid, s): q("UPDATE channels SET settings=? WHERE id=?", (json.dumps(s, ensure_ascii=False), cid), commit=True)
+def update_settings(cid, **kw): s = get_settings(cid); s.update(kw); save_settings(cid, s); return s
+def in_quiet(s):
+    a, b = s.get("quiet_start"), s.get("quiet_end")
+    if a is None or b is None or a == b: return False
+    h = datetime.now(tz_of(s.get("utc_offset"))).hour
+    return (a <= h < b) if a < b else (h >= a or h < b)
+# ============================================================
+# کانال‌ها + لایه‌ی امنیتی (کد قفل)
 def _lock_code(): return f"{random.SystemRandom().randint(0, 999999):06d}"
-gen_lock_code = _lock_code
 def list_channels(uid): return q("SELECT * FROM channels WHERE admin_id=? ORDER BY id", (uid,))
 def get_channel(cid): return q("SELECT * FROM channels WHERE id=?", (cid,), one=True)
 def channel_owned(cid, uid):
     ch = get_channel(cid); return ch if ch and (ch["admin_id"] == uid or is_super(uid)) else None
 def channel_by_chat(chat_id): return q("SELECT * FROM channels WHERE chat_id=?", (chat_id,), one=True)
-
 def add_channel(uid, chat_id, title, username, verified_by, lang="fa"):
     if channel_by_chat(chat_id): return None
     return q("INSERT INTO channels(admin_id,chat_id,title,username,lock_code,verified_by,created_at,settings) VALUES(?,?,?,?,?,?,?,?)",
              (uid, chat_id, title, username or "", _lock_code(), verified_by, now_iso(), json.dumps(default_settings(lang, username), ensure_ascii=False)), commit=True)
-
 def transfer_channel(cid, new_uid, lang="fa"):
     ch = get_channel(cid)
     if not ch: return None
     q("DELETE FROM sources WHERE channel_id=?", (cid,), commit=True); q("DELETE FROM articles WHERE channel_id=? AND status!='published'", (cid,), commit=True)
     q("UPDATE channels SET admin_id=?, verified_by=?, lock_code=?, settings=? WHERE id=?", (new_uid, new_uid, _lock_code(), json.dumps(default_settings(lang, ch["username"]), ensure_ascii=False), cid), commit=True)
     return ch["admin_id"]
-
 def regen_lock(cid): code = _lock_code(); q("UPDATE channels SET lock_code=? WHERE id=?", (code, cid), commit=True); return code
 def reset_channel_link(cid):
+    """بازتولید کد قفل ⇒ پیوند کانال از نظر امنیتی باطل می‌شود: کد تازه صادر می‌شود، صف انتشار (تأیید‌نشده‌ها) پاک می‌شود، اتوماسیون خاموش و وضعیت چرخه صفر می‌شود. منابع و آرشیو منتشر‌شده دست‌نخورده می‌مانند."""
     code = _lock_code(); q("UPDATE channels SET lock_code=? WHERE id=?", (code, cid), commit=True)
     n = q("SELECT COUNT(*) c FROM articles WHERE channel_id=? AND status!='published'", (cid,), one=True)["c"]
     q("DELETE FROM articles WHERE channel_id=? AND status!='published'", (cid,), commit=True)
     update_settings(cid, enabled=False, last_run=None, last_end=None, last_result="", last_diag=None, last_notified_diag="")
     return code, n
-
 def check_lock(cid, code): ch = get_channel(cid); return bool(ch and ch["lock_code"] and str(code).strip() == ch["lock_code"])
 def del_channel(cid, uid):
     q("DELETE FROM sources WHERE channel_id=? AND admin_id=?", (cid, uid), commit=True); q("DELETE FROM articles WHERE channel_id=? AND admin_id=?", (cid, uid), commit=True)
     q("DELETE FROM channels WHERE id=? AND admin_id=?", (cid, uid), commit=True)
-    purge_ch_lock(cid)
-
-def delete_channel(cid, uid=None):
-    if uid is None:
-        ch = get_channel(cid); uid = ch["admin_id"] if ch else None
-    if uid is not None: del_channel(cid, uid)
-
 def update_channel_meta(cid, title=None, username=None):
     if title is not None: q("UPDATE channels SET title=? WHERE id=?", (title, cid), commit=True)
     if username is not None: q("UPDATE channels SET username=? WHERE id=?", (username, cid), commit=True)
-
 # ============================================================
-# منابع
+# منابع (مستقل برای هر کانال)
 def normalize_url(u):
     u = str(u).strip()
     if not u.startswith(("http://", "https://")): u = "https://" + u
     return u.split("#")[0].rstrip("/")
-
 def list_sources(cid, active_only=False): return q("SELECT * FROM sources WHERE channel_id=?" + (" AND active=1" if active_only else "") + " ORDER BY id", (cid,))
 def count_sources(uid): return q("SELECT COUNT(*) c FROM sources WHERE admin_id=?", (uid,), one=True)["c"]
 def add_source(uid, cid, url, title="", api_url="", api_key="", api_note=""):
     url = normalize_url(url)
     if q("SELECT 1 FROM sources WHERE channel_id=? AND url=?", (cid, url), one=True): return None
     return q("INSERT INTO sources(admin_id,channel_id,url,title,api_url,api_key,api_note) VALUES(?,?,?,?,?,?,?)", (uid, cid, url, title, api_url or None, api_key or None, api_note or ""), commit=True)
-
 def get_source(sid): return q("SELECT * FROM sources WHERE id=?", (sid,), one=True)
 def source_of_article(a):
     sid = a["source_id"] if a and "source_id" in a.keys() else None
     return get_source(sid) if sid else None
-
-def del_source(sid, uid=None):
-    if uid is not None: q("DELETE FROM sources WHERE id=? AND admin_id=?", (sid, uid), commit=True)
-    else: q("DELETE FROM sources WHERE id=?", (sid,), commit=True)
-def delete_source(sid, uid=None): del_source(sid, uid)
+def del_source(sid, uid): q("DELETE FROM sources WHERE id=? AND admin_id=?", (sid, uid), commit=True)
 def set_source_active(sid, val, col="active"):
     if col not in ("active", "bot_active"): return None
     q(f"UPDATE sources SET {col}=? WHERE id=?", (1 if val else 0, sid), commit=True); return bool(val)
-
 def toggle_source(sid, uid, col="active"):
+    """col='active' ⇒ منبعِ محتوای کانال · col='bot_active' ⇒ منبعِ محتوای ربات (نسخه‌ی کامل داخل ربات)"""
     if col not in ("active", "bot_active"): col = "active"
     q(f"UPDATE sources SET {col}=1-COALESCE({col},1) WHERE id=? AND admin_id=?", (sid, uid), commit=True); s = get_source(sid); return bool(s and s[col])
-
 def source_bot_ok(sid):
     if not sid: return True
     s = get_source(sid); return bool(s is None or s["bot_active"] is None or s["bot_active"])
-
 def set_source_api(sid, api_url="", api_key="", api_note=""):
+    """ثبت/حذف API یک منبع. خالی‌بودن api_url ⇒ حذف API و برگشت به مسیر عادی RSS/HTML."""
     q("UPDATE sources SET api_url=?, api_key=?, api_note=? WHERE id=?", ((api_url or "").strip() or None, (api_key or "").strip() or None, (api_note or "").strip(), sid), commit=True)
     return get_source(sid)
-
 def source_ok(sid, feed_url=None, etag=None, last_modified=None):
     q("UPDATE sources SET last_fetch=?, fail_count=0, last_error=NULL, etag=?, last_modified=?, feed_url=COALESCE(?, feed_url) WHERE id=?", (now_iso(), etag, last_modified, feed_url, sid), commit=True)
 def source_fail(sid, err): q("UPDATE sources SET last_fetch=?, fail_count=fail_count+1, last_error=? WHERE id=?", (now_iso(), str(err)[:200], sid), commit=True)
-
 # ============================================================
-# مقالات
+# مقالات (مستقل برای هر کانال)
 def article_exists(cid, h): return bool(q("SELECT 1 FROM articles WHERE channel_id=? AND hash=?", (cid, h), one=True))
 def article_insert(uid, cid, h, url, title, source_id, published_at, status="discovered", reason=""):
+    """اگر رکورد از قبل موجود باشد، INSERT OR IGNORE چیزی درج نمی‌کند و lastrowid بی‌اعتبار می‌شود؛ در آن حالت None برمی‌گردانیم تا محتوای تولیدشده هرگز به مقاله‌ی اشتباه نچسبد."""
     with _lock:
         cur = db().execute("INSERT OR IGNORE INTO articles(admin_id,channel_id,hash,url,title,source_id,published_at,created_at,status,reason) VALUES(?,?,?,?,?,?,?,?,?,?)",
                            (uid, cid, h, url, title or "", source_id, published_at, now_iso(), status, reason))
         db().commit(); return cur.lastrowid if cur.rowcount else None
-
 def article_update(aid, **f):
     if not f: return
     q("UPDATE articles SET " + ", ".join(f"{k}=?" for k in f) + " WHERE id=?", (*f.values(), aid), commit=True)
@@ -600,20 +490,15 @@ def articles_by_status(cid, status, limit=50):
     st = ("rejected", "failed") if status == "rejected" else (status,)
     return q(f"SELECT id,title,score,category,created_at,url,reason,status FROM articles WHERE channel_id=? AND status IN ({','.join('?'*len(st))}) ORDER BY id DESC LIMIT ?", (cid, *st, limit))
 def ready_count(cid): return q("SELECT COUNT(*) c FROM articles WHERE channel_id=? AND status='ready'", (cid,), one=True)["c"]
-def delete_article(aid, uid=None):
-    if uid is not None: q("DELETE FROM articles WHERE id=? AND admin_id=?", (aid, uid), commit=True)
-    else: q("DELETE FROM articles WHERE id=?", (aid,), commit=True)
-def article_delete(aid, uid=None): delete_article(aid, uid)
+def delete_article(aid, uid): q("DELETE FROM articles WHERE id=? AND admin_id=?", (aid, uid), commit=True)
 def posted_before(chat_id, h): return bool(q("SELECT 1 FROM posted WHERE channel_id=? AND hash=?", (chat_id, h), one=True))
 def mark_posted(chat_id, h): q("INSERT OR IGNORE INTO posted VALUES(?,?,?)", (chat_id, h, now_iso()), commit=True)
-
 def count_articles(uid=None, hours=24, status=None, cid=None):
     since = (now_utc() - timedelta(hours=hours)).isoformat(); sql, p = "SELECT COUNT(*) c FROM articles WHERE created_at>=?", [since]
     if cid is not None: sql += " AND channel_id=?"; p.append(cid)
     elif uid is not None: sql += " AND admin_id=?"; p.append(uid)
     if status: sql += " AND status=?"; p.append(status)
     return q(sql, tuple(p), one=True)["c"]
-
 def cleanup():
     if (time.time() - float(gget("last_cleanup", 0))) < 3600: return
     ttl = (now_utc() - timedelta(hours=DATA_TTL_HOURS)).isoformat()
@@ -629,142 +514,107 @@ def cleanup():
     try: q("PRAGMA wal_checkpoint(TRUNCATE)")
     except Exception: pass
     gset("last_cleanup", time.time())
-
 # ============================================================
-# پشتیبانی و پرداخت با جدول امن support_map
+# پشتیبانی و درخواست‌های پرداخت
 def support_open(uid): q("INSERT OR REPLACE INTO support(user_id,open,opened_at) VALUES(?,1,?)", (uid, now_iso()), commit=True)
 def support_close(uid): q("UPDATE support SET open=0 WHERE user_id=?", (uid,), commit=True)
 def support_is_open(uid):
     r = q("SELECT open FROM support WHERE user_id=?", (uid,), one=True); return bool(r and r["open"])
-
-def support_map_set(admin_id, msg_id, uid):
-    q("INSERT OR REPLACE INTO support_map(admin_id,message_id,user_id,ts) VALUES(?,?,?,?)", (admin_id, msg_id, uid, now_iso()), commit=True)
-
-def support_map_get(admin_id, msg_id):
-    r = q("SELECT user_id FROM support_map WHERE admin_id=? AND message_id=?", (admin_id, msg_id), one=True)
-    return r["user_id"] if r else None
-
+def support_map_set(msg_key, uid): q("INSERT OR REPLACE INTO support_map VALUES(?,?,?)", (msg_key, uid, now_iso()), commit=True)
+def support_map_get(msg_key):
+    r = q("SELECT user_id FROM support_map WHERE msg_id=?", (msg_key,), one=True); return r["user_id"] if r else None
 def pay_pending_for(uid, pid): return q("SELECT * FROM pay_requests WHERE user_id=? AND plan_id=? AND status='pending'", (uid, pid), one=True)
 def pay_create(uid, pid, receipt_chat=None, receipt_msg=None, note="", discount=None, final_price=None):
     return q("INSERT INTO pay_requests(user_id,plan_id,created_at,receipt_chat,receipt_msg,note,discount,final_price) VALUES(?,?,?,?,?,?,?,?)", (uid, pid, now_iso(), receipt_chat, receipt_msg, (note or "")[:500], discount, final_price), commit=True)
 def pay_pending(): return q("SELECT r.*, u.username, u.name, p.name plan_name, p.price plan_price FROM pay_requests r JOIN users u ON u.id=r.user_id JOIN plans p ON p.id=r.plan_id WHERE r.status='pending' ORDER BY r.id")
 def pay_get(rid): return q("SELECT * FROM pay_requests WHERE id=?", (rid,), one=True)
 def pay_set(rid, status): q("UPDATE pay_requests SET status=?, decided_at=? WHERE id=?", (status, now_iso(), rid), commit=True)
-
 # ============================================================
-# کلاینت HTTP، کش KV و دیپ‌لینک
+# HTTP مشترک، Cloudflare KV، دیپ‌لینک
 _http = None
 UA_BROWSER = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 UA_FEED = "Mozilla/5.0 (compatible; NewsBot/3.0; +https://t.me) FeedFetcher"
-
 def http():
     global _http
     if _http is None:
         _http = httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(25, connect=10), limits=httpx.Limits(max_connections=FETCH_CONCURRENCY + 8, max_keepalive_connections=8),
                                   headers={"User-Agent": UA_BROWSER, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language": "fa,en;q=0.8"})
     return _http
-
 async def fetch(url, **kw):
+    """دانلود با سمافور سراسری (جلوگیری از فشار هم‌زمان). خروجی: Response یا Exception."""
     async with FETCH_SEM: return await http().get(url, **kw)
-
 class FetchError(RuntimeError):
+    """خطای HTTP با کد وضعیت؛ برای پیام اختصاصی ۴۰۳ هنگام افزودن منبع."""
     def __init__(self, status, url=""): super().__init__(f"HTTP {status}"); self.status = int(status); self.url = url
-
 CF_BASE = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/storage/kv/namespaces/{CF_KV_NAMESPACE_ID}/values/"
 async def kv_put(key, value):
     try:
         r = await http().put(CF_BASE + key, content=value.encode(), headers={"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "text/plain"}); return r.status_code == 200
     except Exception as e: log_event("ERROR", f"KV put: {e}"); return False
-
 async def kv_get(key):
     try:
         r = await http().get(CF_BASE + key, headers={"Authorization": f"Bearer {CF_API_TOKEN}"}); return r.text if r.status_code == 200 else None
     except Exception as e: log_event("ERROR", f"KV get: {e}"); return None
-
 async def store_deeplink(admin_id, payload):
+    """payload: {short, full, title, url, show_source, media:{url,kind}|None, ts}"""
     key = secrets.token_urlsafe(6); data = json.dumps(payload, ensure_ascii=False); saved_cf = CF_ENABLED and await kv_put(key, data)
     q("INSERT INTO deeplinks(key,admin_id,created_at,local_json) VALUES(?,?,?,?)", (key, admin_id, now_iso(), None if saved_cf else data), commit=True)
     q("INSERT OR REPLACE INTO kv_cache VALUES(?,?,?)", (key, data, now_iso()), commit=True); return key
-
 async def load_deeplink(key):
-    key = str(key or "").strip()
-    if not key: return None
-    # اول رکورد اصلی deeplinks را بررسی می‌کنیم؛ kv_cache فقط کش است.
-    row = q("SELECT local_json FROM deeplinks WHERE key=?", (key,), one=True)
-    data = row["local_json"] if row and row["local_json"] else None
-    if not data:
-        r = q("SELECT value FROM kv_cache WHERE key=?", (key,), one=True)
-        if r: data = r["value"]
-    if not data and CF_ENABLED:
-        data = await kv_get(key)
-    if not data: return None
-    try:
-        obj = json.loads(data) if isinstance(data, str) else data
-    except Exception as e:
-        log_event("ERROR", f"Deep link JSON invalid ({key}): {e}")
-        return None
-    if isinstance(data, str):
-        q("INSERT OR REPLACE INTO kv_cache VALUES(?,?,?)", (key, data, now_iso()), commit=True)
-    return obj
-
+    r = q("SELECT value FROM kv_cache WHERE key=?", (key,), one=True)
+    if r: return json.loads(r["value"])
+    row = q("SELECT local_json FROM deeplinks WHERE key=?", (key,), one=True); data = row["local_json"] if row and row["local_json"] else (await kv_get(key) if CF_ENABLED else None)
+    if data: q("INSERT OR REPLACE INTO kv_cache VALUES(?,?,?)", (key, data, now_iso()), commit=True); return json.loads(data)
+    return None
 def init_core():
     db(); seed_plans()
     if gget("automation_enabled") is None: gset("automation_enabled", True)
     log.info(f"core v3 آماده | CF KV: {'فعال' if CF_ENABLED else 'محلی'} | مدیر کلان: {SUPER_ADMIN_IDS} | AI×{AI_CONCURRENCY} FETCH×{FETCH_CONCURRENCY} CYCLE×{CYCLE_CONCURRENCY}")
-
-init_db = init_core
-
+# ---------- پایان لایه‌ی هسته‌ی داده ----------
 # ============================================================
-# موتور هوش مصنوعی (چندمدله با Fallback)
+# موتور: مدل‌های AI سازگار با همه، فرمت‌بندی، کشف/استخراج قدرتمند، انتشار، چرخه، زمان‌بند
+# ============================================================
+from urllib.parse import parse_qsl, urlencode
+from telegram.error import BadRequest, RetryAfter
 def hostname(u):
     try: return urlparse(u).netloc.replace("www.", "") or u
     except Exception: return str(u)
-
+# ============================================================
+# مدل‌های هوش مصنوعی — هر سرویسی با Base URL + کلید + نام مدل (نوع خودکار تشخیص داده می‌شود)
 def detect_kind(base_url):
     b = (base_url or "").lower()
     if "anthropic.com" in b: return "anthropic"
     if "generativelanguage.googleapis.com" in b: return "gemini"
-    return "openai"
-
+    return "openai"     # OpenAI-compatible: OpenAI, OpenRouter, Groq, DeepSeek, Together, Mistral, xAI, Ollama, LM Studio, …
 def list_models(active_only=False): return q("SELECT * FROM ai_models" + (" WHERE active=1" if active_only else "") + " ORDER BY priority, id")
 def get_model(mid): return q("SELECT * FROM ai_models WHERE id=?", (mid,), one=True)
 def add_model(base_url, api_key, model, name="", priority=10, temperature=0.5, max_tokens=2500):
     base_url = str(base_url).strip().rstrip("/"); model = str(model).strip(); kind = detect_kind(base_url)
     name = (name or f"{hostname(base_url) or kind}").strip()[:40]
     return q("INSERT INTO ai_models(name,kind,base_url,api_key,model,priority,temperature,max_tokens) VALUES(?,?,?,?,?,?,?,?)", (name, kind, base_url, api_key.strip(), model, priority, temperature, max_tokens), commit=True)
-
 def update_model(mid, **f):
     if "base_url" in f: f["base_url"] = str(f["base_url"]).strip().rstrip("/"); f["kind"] = detect_kind(f["base_url"])
     q("UPDATE ai_models SET " + ", ".join(f"{k}=?" for k in f) + " WHERE id=?", (*f.values(), mid), commit=True)
-
-def delete_model(mid):
-    q("DELETE FROM ai_models WHERE id=?", (mid,), commit=True)
-    purge_model_lock(mid)
-
+def delete_model(mid): q("DELETE FROM ai_models WHERE id=?", (mid,), commit=True)
 async def notify_super(text, kb=None):
     if NOTIFY_SUPER:
         try: await NOTIFY_SUPER(text, kb)
         except Exception as e: log.warning(f"notify super: {e}")
-
 async def notify_user(uid, text, kb=None):
     if NOTIFY_USER:
         try: await NOTIFY_USER(uid, text, kb)
         except Exception as e: log.warning(f"notify user {uid}: {e}")
-
 def _err_text(r):
     try:
         j = r.json(); e = j.get("error"); msg = (e.get("message") if isinstance(e, dict) else e) or j.get("message") or j.get("detail") or r.text
     except Exception: msg = r.text
     return f"HTTP {r.status_code}: {re.sub(r'<[^>]+>', '', str(msg))[:160]}"
-
 def _openai_content(j):
     ch = (j.get("choices") or [{}])[0]; msg = ch.get("message") or ch.get("delta") or {}; c = msg.get("content")
     if not c and ch.get("text"): c = ch["text"]
     if isinstance(c, list): c = "".join(p.get("text", "") for p in c if isinstance(p, dict))
     return c or ""
-
 async def _post(url, **kw): return await http().post(url, timeout=httpx.Timeout(120, connect=15), **kw)
-
 async def _call_model(m, system, user):
     kind = m["kind"] or detect_kind(m["base_url"]); base = (m["base_url"] or "").rstrip("/"); key = m["api_key"] or ""; model = m["model"]; temp = float(m["temperature"] or 0.5); mx = int(m["max_tokens"] or 2500)
     if kind == "anthropic":
@@ -787,21 +637,18 @@ async def _call_model(m, system, user):
     if r.status_code == 404 and not re.search(r"/v\d", base): r = await _post(base + "/v1/chat/completions", headers=headers, json=body)
     if r.status_code >= 400: raise RuntimeError(_err_text(r))
     return _openai_content(r.json())
-
 async def _mark_fail(m, err):
     fc = (m["fail_count"] or 0) + 1; update_model(m["id"], fail_count=fc, last_error=str(err)[:300], last_fail=now_iso())
     if fc >= 2 and m["status"] != "down":
         update_model(m["id"], status="down"); log_event("ERROR", f"مدل «{m['name']}» از کار افتاد: {err}")
         await notify_super(f"🔴 مدل <b>{html.escape(m['name'])}</b> (<code>{html.escape(m['model'])}</code>) از کار افتاد.\n<code>{html.escape(str(err)[:200])}</code>")
-
 async def _mark_ok(m):
     update_model(m["id"], fail_count=0, status="ok", last_ok=now_iso(), ok_count=(m["ok_count"] or 0) + 1)
     if m["status"] == "down": log_event("INFO", f"مدل «{m['name']}» دوباره فعال شد."); await notify_super(f"🟢 مدل <b>{html.escape(m['name'])}</b> دوباره فعال شد.")
-
+# --- حریم خصوصی مدل‌ها: هیچ نام مدل/آدرس/کلیدی به مدیر میانی نمی‌رسد؛ فقط یک کد کوتاه و بی‌خطر
 AI_ERR = {"ai_busy": ("سرویس هوش مصنوعی موقتاً شلوغ است", "AI service is busy right now"), "ai_auth": ("دسترسی سرویس هوش مصنوعی برقرار نشد", "AI service access failed"),
           "ai_timeout": ("سرویس هوش مصنوعی پاسخ نداد", "AI service did not respond"), "ai_empty": ("پاسخ خالی از سرویس هوش مصنوعی", "Empty response from AI service"),
           "ai_none": ("سرویس هوش مصنوعی در دسترس نیست", "AI service unavailable"), "ai_error": ("خطای موقت سرویس هوش مصنوعی", "Temporary AI service error")}
-
 def err_code(e):
     t = str(e or "").lower()
     if "429" in t or "rate limit" in t or "quota" in t or "overload" in t or "busy" in t: return "ai_busy"
@@ -810,20 +657,18 @@ def err_code(e):
     if "empty" in t or "no candidates" in t: return "ai_empty"
     if "no_models" in t or "no model" in t: return "ai_none"
     return "ai_error"
-
 def ai_err_text(code, lang="fa"): return AI_ERR.get(code if code in AI_ERR else "ai_error")[1 if lang == "en" else 0]
-
 _model_locks = {}
 def model_lock(mid):
     if mid not in _model_locks: _model_locks[mid] = asyncio.Lock()
     return _model_locks[mid]
-
 def model_busy(mid): return model_lock(mid).locked()
 def _model_ready(m):
+    """مدلِ سالم، یا مدلِ افتاده‌ای که وقت آزمایش دوباره‌اش رسیده است."""
     if m["status"] != "down": return True
     lf = parse_dt(m["last_fail"]); return bool(not lf or (now_utc() - lf) >= timedelta(minutes=MODEL_PROBE_MIN))
-
 async def ai_chat(system, user, on_queue=None):
+    """خروجی: (text, model_name, err_code) — ابتدا سراغ مدلِ بیکار می‌رود (توزیع بار بین مدل‌ها)؛ اگر همه مشغول بودند درخواست در صف همان مدل می‌ماند و on_queue صدا زده می‌شود تا به مدیر «در صف پردازش» نشان داده شود."""
     models = [m for m in list_models(active_only=True) if _model_ready(m)]
     if not models: log_event("ERROR", "هیچ مدل فعالی در دسترس نیست."); return None, None, "ai_none"
     last, tried, told = "ai_error", set(), False
@@ -842,7 +687,6 @@ async def ai_chat(system, user, on_queue=None):
             if not text or not text.strip(): raise RuntimeError("empty response")
             await _mark_ok(m); return text.strip(), m["name"], None
         except Exception as e: last = err_code(e); await _mark_fail(m, e)
-
 async def test_model(mid):
     m = get_model(mid); t = time.time()
     try:
@@ -851,15 +695,12 @@ async def test_model(mid):
         if not out or not out.strip(): raise RuntimeError("empty response")
         await _mark_ok(m); return True, out.strip()[:100], round(time.time() - t, 1)
     except Exception as e: await _mark_fail(m, e); return False, str(e)[:200], round(time.time() - t, 1)
-
 async def probe_down_models():
     for m in q("SELECT * FROM ai_models WHERE active=1 AND status='down' ORDER BY last_fail LIMIT 1"):
         lf = parse_dt(m["last_fail"])
         if not lf or (now_utc() - lf) >= timedelta(minutes=MODEL_PROBE_MIN): await test_model(m["id"])
-
 def any_model_available(): return any(_model_ready(m) for m in list_models(active_only=True))
 def models_free_count(): return sum(1 for m in list_models(active_only=True) if _model_ready(m) and not model_busy(m["id"]))
-
 def parse_json(text):
     if not text: return None
     t = re.sub(r"```(?:json|JSON)?", "", text).strip(); s, e = t.find("{"), t.rfind("}")
@@ -867,7 +708,7 @@ def parse_json(text):
     body = t[s:e + 1]
     base = [body, re.sub(r",\s*([}\]])", r"\1", body)]
     fixed = []
-    for c in base:
+    for c in base:   # تعمیر خط/تبِ خام داخل رشته‌ها — خطای رایج مدل‌ها در JSON چندخطی
         out, ins, esc = [], False, False
         for ch in c:
             if ins:
@@ -887,14 +728,14 @@ def parse_json(text):
             try: return json.loads(cand, strict=strict)
             except Exception: continue
     return None
-
 # ============================================================
-# پالایش HTML و متن
+# HTML امن تلگرام + فرمت‌بندی
 ALLOWED = {"b", "strong", "i", "em", "u", "s", "del", "code", "pre", "a", "blockquote", "tg-spoiler", "span", "tg-emoji"}
 def sanitize_html(text, premium=False):
+    """Markdown/HTML آزاد → HTML مجاز تلگرام. premium=True اجازه‌ی <tg-emoji> می‌دهد؛ در غیر این‌صورت متن داخلش (ایموجی معمولی) حفظ می‌شود."""
     if not text: return ""
     text = str(text)
-    text = re.sub(r"(?m)^[ \t]*[-–—_=*~•⸻]{3,}[ \t]*$", "", text)
+    text = re.sub(r"(?m)^[ \t]*[-–—_=*~•⸻]{3,}[ \t]*$", "", text)  # جداکننده‌های رباتیک (--- و امثال آن) حذف می‌شوند
     text = re.sub(r"```[a-zA-Z]*\n?", "", text); text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text); text = re.sub(r"__(.+?)__", r"<u>\1</u>", text); text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
     text = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", text); text = re.sub(r"\|\|(.+?)\|\|", r"<tg-spoiler>\1</tg-spoiler>", text)
     text = re.sub(r"^#{1,6}\s*(.+)$", r"<b>\1</b>", text, flags=re.M); text = re.sub(r"^\s*>\s?(.+)$", r"<blockquote>\1</blockquote>", text, flags=re.M); text = re.sub(r"^\s*[-*]\s+", "• ", text, flags=re.M)
@@ -928,19 +769,17 @@ def sanitize_html(text, premium=False):
             stack.append(tag)
     while stack: out.append(f"</{stack.pop()}>")
     return tidy_html("".join(out))
-
 def tidy_html(t):
     t = t.replace("\r", ""); t = re.sub(r"[ \t]+\n", "\n", t); t = re.sub(r"(?<!\n)\n?•", "\n•", t)
     t = re.sub(r"(</b>|</blockquote>)\n(?!\n)(?!•)", r"\1\n\n", t); t = re.sub(r"([.!?؟۔])\n(?!\n)(?!•)(?=\S)", r"\1\n\n", t)
     t = re.sub(r"\n{3,}", "\n\n", t); return t.strip()
-
 def downgrade_html(t):
+    """حذف قابلیت‌های پریمیوم/خاص با حفظ متن و فرمت‌های معمولی (برای تلاش دوباره پس از خطای پارس تلگرام)."""
     t = re.sub(r"</?tg-emoji[^>]*>", "", t or ""); t = re.sub(r"</?tg-spoiler>", "", t); t = t.replace("<blockquote expandable>", "<blockquote>")
     return sanitize_html(t, premium=False)
-
 def strip_tags(t): return html.unescape(re.sub(r"<[^>]+>", "", t or ""))
-
 def salvage_post(raw):
+    """نگهبان نشت JSON — اگر پاسخ مدل قابل تجزیه نباشد، پاکت JSON حذف و فقط متن واقعی پست بازیابی می‌شود؛ هرگز JSON خام منتشر نمی‌شود."""
     if not raw: return ""
     t = re.sub(r"```[a-zA-Z]*\n?", "", str(raw)).strip()
     if not t.startswith("{"): return t
@@ -964,7 +803,7 @@ def salvage_post(raw):
     if end >= 0:
         rest = t[end + 1:].strip()
         if len(strip_tags(rest)) >= 40: return rest
-    if end < 0:
+    if end < 0:   # شیء ناکامل (پاسخ قطع‌شده): متنِ بازِ آخرین کلید بازیابی می‌شود
         m = None
         for mm in re.finditer(r'":\s*"', t): m = mm
         if m:
@@ -972,8 +811,8 @@ def salvage_post(raw):
             if len(strip_tags(rest)) >= 40: return rest
     lines = [ln for ln in t.splitlines() if not re.match(r'^\s*"?[A-Za-z_][A-Za-z_0-9 ]{2,24}"?\s*:', ln) and not re.fullmatch(r'\s*[{}\[\],]*\s*', ln)]
     return "\n".join(lines).strip() or t
-
 def _cut_pos(text, limit):
+    """نقطه‌ی برش امن: پایان پاراگراف، بعد پایان جمله، بعد پایان کلمه — هرگز وسط جمله رها نمی‌شود."""
     cut = text[:limit]; nl = cut.rfind("\n")
     if nl > limit * 0.5: return nl
     pos = -1
@@ -981,22 +820,21 @@ def _cut_pos(text, limit):
     if pos > limit * 0.4: return pos
     sp = cut.rfind(" ")
     return sp if sp > limit * 0.4 else len(cut)
-
 def split_post_html(text, limit, premium=True):
+    """پست را در مرز امن به دو بخش «کانال + ادامه» می‌شکند؛ بخش دوم برای «ادامه در ربات» است و متنِ بخش اول را تکرار نمی‌کند."""
     if len(text) <= limit: return text, ""
     pos = _cut_pos(text, limit); head_raw, rest_raw = text[:pos], text[pos:]
     if rest_raw[:1] not in ("<", "", "\n", " ") and ">" in rest_raw[:80]:
         gt = rest_raw.find(">")
-        if "<" not in rest_raw[:gt]: rest_raw = rest_raw[gt + 1:]
+        if "<" not in rest_raw[:gt]: rest_raw = rest_raw[gt + 1:]  # تکه‌ی نیمه‌تمامِ یک تگ از ابتدای ادامه حذف می‌شود
     head = sanitize_html(re.sub(r"<[^>]*$", "", head_raw), premium=premium).rstrip() + " …"
     rest = sanitize_html(rest_raw, premium=premium).strip()
     return head, rest
-
 def fit_html(text, limit, premium=True):
     if len(text) <= limit: return text, False
     return split_post_html(text, limit, premium)[0], True
-
 def clean_ai_text(t, s=None):
+    """زباله‌های مدل حذف می‌شود: دیکشنری امتیازها («معیار»: ۹، ...) و تکه‌های JSON چسبیده به متن پست — هرگز به کانال یا ربات نمی‌رسد."""
     if not t: return t
     t = str(t).replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", " ")
     names = [str(c.get("name", "")).strip() for c in (s or {}).get("criteria", []) if c.get("name")]
@@ -1006,54 +844,46 @@ def clean_ai_text(t, s=None):
     def rep(m):
         label = m.group(1).strip()
         return "" if any(label and (label in n or n in label) for n in names) else m.group(0)
-    
-    # ایمن‌سازی: حداکثر ۴ بار تکرار حلقه برای پیشگیری از نوسان یا قفل CPU
-    loop_count = 0
     prev = None
-    while prev != t and loop_count < 4:
-        prev = t
-        t = pat.sub(rep, t)
-        loop_count += 1
-
-    t = re.sub(r'(?m)^\s*["”»،,{}\[\].…؛:!؟]+\s*$\n?', "", t)
-    t = re.sub(r'''\[([^\]\n]{1,160})\]\((https?://[^)\s"']{4,})\)''', lambda m: m.group(2) if m.group(1).strip() in m.group(2) else f'<a href="{m.group(2)}">{m.group(1).replace(chr(34), "")}</a>', t)
+    while prev != t: prev = t; t = pat.sub(rep, t)
+    t = re.sub(r'(?m)^\s*["”»،,{}\[\].…؛:!؟]+\s*$\n?', "", t)   # خط‌های زباله‌ی JSON (مثل «",» یا «10.» تنها)
+    t = re.sub(r"\[([^\]\n]{1,160})\]\((https?://[^)\s\"']{4,})\)", lambda m: m.group(2) if m.group(1).strip() in m.group(2) else f'<a href="{m.group(2)}">{m.group(1).replace(chr(34), "")}</a>', t)   # لینک مارک‌داونی → لینک واقعی
     t = re.sub(r"\[([^\]\n]{0,160})\]\(\s*\)", r"\1", t)
-    t = re.sub(r"(?<![\w])['‘’]([\w؀-ۿ][\w؀-ۿ \-]{0,38}[\w؀-ۿ]|[\w؀-ۿ])['‘’](?![\w])", r"\1", t)
+    t = re.sub(r"(?<![\w])['‘’]([\w؀-ۿ][\w؀-ۿ \-]{0,38}[\w؀-ۿ]|[\w؀-ۿ])['‘’](?![\w])", r"\1", t)   # کوتیشن دور واژه‌ها حذف می‌شود
     em = re.compile(r"[\U0001F000-\U0001FAFF]")
     hits = em.findall(t)
     if hits:
         t = em.sub("", t).replace("️", ""); t = re.sub(r'<a href="[^"]*">\s*</a>', " ", t)
-        t = t.rstrip() + " " + hits[-1]
+        t = t.rstrip() + " " + hits[-1]   # فقط یک ایموجی، در همان انتها
     t = re.sub(r"(?m)^[ \t]+|[ \t]+$", "", t); t = re.sub(r"[ \t]{2,}", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     parts = re.split(r"(<pre>.*?</pre>|<code>.*?</code>)", t, flags=re.S)
-    for i in range(0, len(parts), 2): parts[i] = re.sub(r"(?<!\n)\n(?!\n)", "\n\n", parts[i])
+    for i in range(0, len(parts), 2): parts[i] = re.sub(r"(?<!\n)\n(?!\n)", "\n\n", parts[i])   # پاراگراف‌ها همیشه با خط خالی از هم جدا می‌شوند
     t = "".join(parts)
     blocks, seen, keep = t.split("\n\n"), set(), []
     for b in blocks:
         k = re.sub(r"<[^>]+>", " ", b); k = re.sub(r"[\s‌]+", " ", k).strip().lower()
-        if k and k in seen: continue
+        if k and k in seen: continue   # پاراگراف تکراری (متن یکسان) حذف می‌شود
         if k: seen.add(k)
         keep.append(b)
     t = "\n\n".join(keep).strip()
     return t
-
 def strip_source_url(t, url):
+    """قانون ثابت: لینک منبع هرگز نباید داخل متن پست دیده شود — هر اشاره‌ای به دامنه‌ی منبع (لینک خام یا <a>) حذف می‌شود؛ بقیه‌ی لینک‌ها دست‌نخورده می‌مانند."""
     if not t or not url: return t
     host = re.sub(r"^[a-zA-Z]+://(www\.)?", "", str(url)).split("/")[0].strip().lower()
     if not host or "." not in host: return t
     h = re.escape(host)
     t = re.sub(r'<a href="[^"]*' + h + r'[^"]*"[^>]*>.*?</a>', " ", t, flags=re.I | re.S)
-    t = re.sub(r"""https?://[^\s<>"']*""" + h + r"""[^\s<>"']*""", " ", t, flags=re.I)
+    t = re.sub(r"https?://[^\s<>\"']*" + h + r"[^\s<>\"']*", " ", t, flags=re.I)
     t = re.sub(r"(?m)^[ \t]+$", "", t)
     return t
-
 def finish_ok(t):
+    """اگر متن ناگهان وسط جمله قطع شده باشد، نشانه‌ی ادامه (« …») می‌گذارد — جمله‌ی تمام‌شده دست نمی‌خورد."""
     if not t: return t
     e = re.sub(r"(</[a-zA-Z]+>|\s)+$", "", t)
     if e and re.search(r"[\w؀-ۿ،,؛:]$", e): return t.rstrip() + " …"
     return t
-
 def split_html(text, limit=MSG_LIMIT):
     if len(text) <= limit: return [text]
     chunks, cur = [], ""
@@ -1062,31 +892,25 @@ def split_html(text, limit=MSG_LIMIT):
         else: cur = f"{cur}\n{para}" if cur else para
     if cur: chunks.append(sanitize_html(cur, premium=True))
     return chunks
-
 def preview_text(html_text, n=100):
     t = re.sub(r"\s+", " ", strip_tags(html_text).replace("\n", " ")).strip()
     if len(t) <= n: return html.escape(t)
     cut = t[:n]; sp = cut.rfind(" "); return html.escape(cut[:sp] if sp > n * 0.6 else cut) + " …"
-
 def headline_of(html_text):
     first = (html_text or "").strip().split("\n", 1)[0]; return sanitize_html(first, premium=True)[:900]
-
 # ============================================================
-# کشف و استخراج مقاله
+# کشف مقاله — فید (RSS/Atom/RDF) → سایت‌مپ → لینک‌های HTML ؛ آدرس فید پیدا‌شده کش می‌شود
 FEED_ACCEPT = "application/rss+xml, application/atom+xml, application/rdf+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.5"
 FEED_PATHS = ("/feed", "/feed/", "/rss", "/rss/", "/rss.xml", "/feed.xml", "/atom.xml", "/index.xml", "/feeds/posts/default?alt=rss", "/?feed=rss2", "/feed/rss", "/feed/atom", "/rss/all", "/rss/news", "/news/rss", "/news/feed", "/blog/feed", "/fa/rss", "/en/rss", "/feeds")
 SITEMAP_PATHS = ("/news-sitemap.xml", "/sitemap-news.xml", "/sitemap_news.xml", "/post-sitemap.xml", "/sitemap-posts.xml", "/sitemap.xml", "/sitemap_index.xml")
-
 def clean_url(u):
     try:
         p = urlparse(str(u).strip()); qs = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if not k.lower().startswith(("utm_", "fbclid", "gclid", "mc_", "ref", "igshid"))]
         return normalize_url(p._replace(query=urlencode(qs), fragment="").geturl())
     except Exception: return normalize_url(u)
-
 def _struct_dt(st):
     try: return datetime(*st[:6], tzinfo=UTC).isoformat() if st else None
     except Exception: return None
-
 def _entry_dt(e):
     for k in ("published_parsed", "updated_parsed", "created_parsed"):
         d = _struct_dt(e.get(k))
@@ -1095,17 +919,15 @@ def _entry_dt(e):
         d = parse_dt(e.get(k))
         if d: return d.isoformat()
     return None
-
 BAD_MEDIA = re.compile(r"(logo|sprite|placeholder|avatar|profile|icon|favicon|blank|default|noimage|no-image|pixel|spacer|1x1|advert|banner|watermark)", re.I)
 def _bad_media_url(u):
+    """رسانه‌ی نامرتبط (لوگو، آواتار، بنر، پیکسل شفاف…) نباید به‌عنوان تصویر مقاله فرستاده شود."""
     if not u or not str(u).startswith("http"): return True
     p = urlparse(str(u)).path.lower()
     if p.endswith((".svg", ".ico")): return True
     return bool(BAD_MEDIA.search(p))
-
 def _mk_media(u, kind, page=""):
     return None if _bad_media_url(u) else {"url": str(u), "kind": kind, "page": page or ""}
-
 def _entry_media(e, page=""):
     vids = []
     for m in (e.get("media_content") or []) + (e.get("media_thumbnail") or []):
@@ -1128,12 +950,10 @@ def _entry_media(e, page=""):
         got = _mk_media(u, "video", page)
         if got: return got
     return None
-
 def _entry_html(e):
     c = e.get("content")
     if c and isinstance(c, list) and c[0].get("value"): return c[0]["value"]
     return e.get("summary") or e.get("description") or ""
-
 def _feed_items(feed, base, limit):
     items, seen = [], set()
     for e in feed.entries[:limit * 2]:
@@ -1145,7 +965,6 @@ def _feed_items(feed, base, limit):
         seen.add(link); items.append({"url": link, "title": re.sub(r"\s+", " ", strip_tags(e.get("title") or "")).strip(), "published": _entry_dt(e), "html": _entry_html(e), "media": _entry_media(e, link)})
         if len(items) >= limit: break
     return items
-
 def _sitemap_items(xml, limit):
     out, since = [], (now_utc() - timedelta(days=7)).isoformat()
     for m in re.finditer(r"<url>(.*?)</url>", xml, re.S):
@@ -1156,8 +975,8 @@ def _sitemap_items(xml, limit):
         if pub and pub.isoformat() < since: continue
         out.append({"url": clean_url(html.unescape(loc.group(1))), "title": html.unescape(strip_tags(t.group(1))).strip() if t else "", "published": pub.isoformat() if pub else None, "html": "", "media": None})
     out.sort(key=lambda x: x["published"] or "", reverse=True); return out[:limit]
-
 def _parse_any(content, base, limit):
+    """بایت‌های پاسخ → آیتم‌ها (فید یا سایت‌مپ) یا None"""
     head = content[:4096].lower()
     if b"<sitemapindex" in head: return None
     if b"<urlset" in head: return _sitemap_items(content.decode("utf-8", "ignore"), limit) or None
@@ -1165,7 +984,6 @@ def _parse_any(content, base, limit):
     try: f = feedparser.parse(content)
     except Exception: return None
     return _feed_items(f, base, limit) if f.entries else None
-
 async def _get(url, cond=None, feed=False):
     h = {"Accept": FEED_ACCEPT} if feed else {}
     if cond: h.update(cond)
@@ -1178,7 +996,6 @@ async def _get(url, cond=None, feed=False):
                 if r2.status_code == 200: return r2
             except Exception: pass
     return r
-
 def _html_links(soup, base_url, limit):
     base = hostname(base_url); scored, seen = [], set()
     for a in soup.find_all("a", href=True):
@@ -1202,9 +1019,10 @@ def _html_links(soup, base_url, limit):
         if sc < 4: continue
         seen.add(href); scored.append((sc, {"url": href, "title": title[:200], "published": None, "html": "", "media": None}))
     scored.sort(key=lambda x: -x[0]); return [x[1] for x in scored[:limit]]
-
+# --- منابع API (برای سایت‌هایی که مدیر خودش API می‌دهد) — نقشه‌بردار عمومی: هر ساختار JSON را می‌فهمد
 API_ARRAY_KEYS = ("articles", "items", "results", "data", "posts", "news", "response", "docs", "entries", "stories", "hits", "records", "list", "feed")
 def _api_pick_list(j, depth=0):
+    """آرایه‌ی مقالات را در هر ساختار JSON پیدا می‌کند (NewsAPI، GNews، WordPress، Strapi، سرویس‌های سفارشی…)."""
     if isinstance(j, list): return j if (j and isinstance(j[0], dict)) else []
     if not isinstance(j, dict) or depth > 4: return []
     for k in API_ARRAY_KEYS:
@@ -1220,7 +1038,6 @@ def _api_pick_list(j, depth=0):
             got = _api_pick_list(v, depth + 1)
             if got: best = got
     return best
-
 def _api_first(d, *names):
     for n in names:
         v = d.get(n)
@@ -1228,7 +1045,6 @@ def _api_first(d, *names):
         if isinstance(v, list) and v: v = v[0].get("url") or v[0].get("src") or v[0].get("href") if isinstance(v[0], dict) else v[0]
         if isinstance(v, (str, int, float)) and str(v).strip(): return str(v).strip()
     return ""
-
 def _api_items(raw, base, limit):
     try: j = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
     except Exception: return []
@@ -1250,12 +1066,11 @@ def _api_items(raw, base, limit):
         out.append({"url": u, "title": re.sub(r"\s+", " ", title)[:300], "published": pd.isoformat() if pd else None, "html": body if "<" in body else "", "media": media})
         if len(out) >= limit: break
     out.sort(key=lambda x: x["published"] or "", reverse=True); return out
-
 def _has_api(src):
     try: return bool(src["api_url"])
     except Exception: return False
-
 async def _api_discover(src, limit):
+    """کلید API هم داخل آدرس ({key}) و هم در هدرهای رایج فرستاده می‌شود تا با اکثر سرویس‌ها بی‌تنظیمِ اضافه کار کند."""
     api = str(src["api_url"]); key = (src["api_key"] or "").strip()
     url = api
     for ph in ("{key}", "{apikey}", "{api_key}", "{token}", "{APIKEY}"): url = url.replace(ph, key)
@@ -1266,25 +1081,23 @@ async def _api_discover(src, limit):
     items = _api_items(r.text, url, limit)
     if not items: raise RuntimeError("API: no items")
     source_ok(src["id"]); return items, True, "api"
-
 async def discover_source(src, limit=25, use_cache=True):
-    if not isinstance(src, dict):
-        src = {k: src[k] for k in src.keys()}
+    """خروجی: (items, changed, method) — method: api | feed | sitemap | html ؛ changed=False یعنی 304 (بدون تغییر)"""
     cond = {}
-    if src.get("etag"): cond["If-None-Match"] = src["etag"]
-    if src.get("last_modified"): cond["If-Modified-Since"] = src["last_modified"]
+    if src["etag"]: cond["If-None-Match"] = src["etag"]
+    if src["last_modified"]: cond["If-Modified-Since"] = src["last_modified"]
     try:
         if _has_api(src): return await _api_discover(src, limit)
         if src["feed_url"] and use_cache:
             r = await _get(src["feed_url"], cond, feed=True)
-            if r.status_code == 304: source_ok(src["id"], src["feed_url"], src.get("etag"), src.get("last_modified")) if src.get("id") else None; return [], False, "feed"
+            if r.status_code == 304: source_ok(src["id"], src["feed_url"], src["etag"], src["last_modified"]); return [], False, "feed"
             if r.status_code == 200:
                 items = _parse_any(r.content, src["feed_url"], limit)
                 if items: source_ok(src["id"], src["feed_url"], r.headers.get("etag"), r.headers.get("last-modified")); return items, True, "sitemap" if b"<urlset" in r.content[:4096].lower() else "feed"
         r = await _get(src["url"], feed=False)
         if r.status_code != 200: raise FetchError(r.status_code, src["url"])
         items = _parse_any(r.content, src["url"], limit)
-        if items: source_ok(src["id"], src["url"], r.headers.get("etag"), r.headers.get("last-modified")) if src.get("id") else None; return items, True, "feed"
+        if items: source_ok(src["id"], src["url"], r.headers.get("etag"), r.headers.get("last-modified")); return items, True, "feed"
         soup = BeautifulSoup(r.text, "lxml"); p = urlparse(src["url"]); origin = f"{p.scheme}://{p.netloc}"; cands = []
         for tag in soup.find_all("link", attrs={"type": re.compile(r"application/(rss|atom|rdf)\+xml|application/feed\+json", re.I)}):
             if tag.get("href"): cands.append(urljoin(src["url"], tag["href"]))
@@ -1299,11 +1112,7 @@ async def discover_source(src, limit=25, use_cache=True):
             except Exception: continue
             if rr.status_code == 200:
                 items = _parse_any(rr.content, fu, limit)
-                if items:
-                    src["_discovered_feed_url"] = fu
-                    if src.get("id"):
-                        source_ok(src["id"], fu, rr.headers.get("etag"), rr.headers.get("last-modified"))
-                    return items, True, "feed"
+                if items: source_ok(src["id"], fu, rr.headers.get("etag"), rr.headers.get("last-modified")); return items, True, "feed"
         smaps = list(SITEMAP_PATHS)
         try:
             rb = await fetch(origin + "/robots.txt", timeout=10)
@@ -1317,7 +1126,7 @@ async def discover_source(src, limit=25, use_cache=True):
             head = rr.content[:4096].lower()
             if b"<urlset" in head:
                 items = _sitemap_items(rr.content.decode("utf-8", "ignore"), limit)
-                if items: source_ok(src["id"], su) if src.get("id") else None; return items, True, "sitemap"
+                if items: source_ok(src["id"], su); return items, True, "sitemap"
             elif b"<sitemapindex" in head:
                 kids = re.findall(r"<sitemap>.*?<loc>\s*(.*?)\s*</loc>", rr.content.decode("utf-8", "ignore"), re.S)
                 pref = [k for k in kids if re.search(r"news|post|article|blog|\d{4}", k, re.I)] or kids
@@ -1326,17 +1135,17 @@ async def discover_source(src, limit=25, use_cache=True):
                     except Exception: continue
                     if rk.status_code == 200 and b"<urlset" in rk.content[:4096].lower():
                         items = _sitemap_items(rk.content.decode("utf-8", "ignore"), limit)
-                        if items: source_ok(src["id"], html.unescape(ku)) if src.get("id") else None; return items, True, "sitemap"
-        items = _html_links(soup, src["url"], limit); source_ok(src["id"]) if src.get("id") else None; return items, True, "html"
-    except Exception as e: source_fail(src["id"], e) if src.get("id") else None; raise
-
+                        if items: source_ok(src["id"], html.unescape(ku)); return items, True, "sitemap"
+        items = _html_links(soup, src["url"], limit); source_ok(src["id"]); return items, True, "html"
+    except Exception as e: source_fail(src["id"], e); raise
 def _probe_status(e):
+    """کد وضعیت HTTP را از هر خطایی که بالا آمده بیرون می‌کشد (۰ اگر HTTP نبود)."""
     st = getattr(e, "status", None)
     if isinstance(st, int): return st
     r = getattr(e, "response", None); st = getattr(r, "status_code", None)
     return int(st) if isinstance(st, int) else 0
-
 async def probe_source(src, lang="fa", added=False):
+    """تستِ بارگذاریِ منبع؛ خروجی: (ok, متنِ پاپ‌آپ). هر شکستی ⇒ منبع 🔴 خاموش می‌شود و دلیلِ کوتاه اعلام می‌گردد."""
     off = tr(lang, "src_added_off" if added else "src_now_off")
     try:
         items, _, m = await discover_source(src, use_cache=False)
@@ -1347,9 +1156,8 @@ async def probe_source(src, lang="fa", added=False):
         set_source_active(src["id"], False, "active")
         return False, tr(lang, "src_dead") + off
     return True, tr(lang, "src_added", n=len(items), m=m)
-
 # ============================================================
-# استخراج متن مقاله
+# استخراج متن مقاله — trafilatura → بلوک‌های HTML → محتوای فید (در ترد جدا تا حلقه‌ی رویداد مسدود نشود)
 def _ld_image(soup):
     for sc in soup.find_all("script", attrs={"type": re.compile("ld\\+json", re.I)})[:6]:
         try: data = json.loads(sc.string or sc.get_text() or "{}")
@@ -1363,15 +1171,14 @@ def _ld_image(soup):
             if isinstance(c, list) and c: c = c[0].get("url") if isinstance(c[0], dict) else c[0]
             if isinstance(c, str) and c.strip(): return c.strip()
     return ""
-
 def _img_src(tag):
     u = tag.get("src") or tag.get("data-src") or tag.get("data-original") or tag.get("data-lazy-src") or ""
     if not u:
         ss = tag.get("srcset") or tag.get("data-srcset") or ""
         u = ss.split(",")[0].strip().split(" ")[0] if ss else ""
     return u
-
 def _find_media(soup, base):
+    """ویدیو (og:video / <video>) → تصویر (og:image / twitter / link / JSON-LD / بزرگ‌ترین تصویر متن). لوگو و آواتار و پیکسل رد می‌شوند."""
     def meta(*names):
         for n in names:
             t = soup.find("meta", property=n) or soup.find("meta", attrs={"name": n})
@@ -1404,8 +1211,8 @@ def _find_media(soup, base):
         got = _mk_media(img, "animation" if img.lower().split("?")[0].endswith(".gif") else "photo", base)
         if got: return got
     return None
-
 def _soup_text(soup):
+    """کل متن صفحه، نه فقط ابتدای آن: همه‌ی بلوک‌های محتوایی با هم ادغام می‌شوند (پاراگراف، بولت، زیرتیتر) و تکراری‌ها حذف می‌شوند."""
     for t in soup(["script", "style", "noscript", "nav", "header", "footer", "aside", "form", "iframe"]): t.decompose()
     cands = soup.find_all(["article", "main"]) + [soup.find(attrs={"role": "main"})] + soup.find_all(attrs={"itemprop": "articleBody"}) + soup.find_all("div", class_=re.compile(r"(article|post|entry|content|body|story|text|news|detail)", re.I))[:30]
     def blocks(c):
@@ -1429,20 +1236,18 @@ def _soup_text(soup):
     if len(best) >= 400: return best
     alt = "\n\n".join(t for t in blocks(soup) if t)
     return max(best, alt, key=len)
-
 def _next_page_url(soup, base):
+    """صفحه‌ی بعدی مقالات چندصفحه‌ای (فقط rel=next که استاندارد و بی‌خطر است)."""
     t = soup.find("link", rel="next") or soup.find("a", rel="next")
     u = (t.get("href") if t else "") or ""
     if not u: return ""
     u = urljoin(base, u.strip())
     return u if u.startswith("http") and clean_url(u) != clean_url(base) else ""
-
 def _traf(raw, url):
     try: data = trafilatura.extract(raw, url=url, include_comments=False, include_tables=True, include_formatting=False, output_format="json", with_metadata=True, favor_recall=True)
     except Exception: data = None
     try: return json.loads(data) if data else {}
     except Exception: return {}
-
 def _parse_page(raw, url):
     d = _traf(raw, url); soup = BeautifulSoup(raw, "lxml")
     def meta(*names):
@@ -1469,22 +1274,21 @@ def _parse_page(raw, url):
     if len(soup_t) > max(400, len(text) * 1.3): text = soup_t
     if len(text) < 250: text = max(text, soup_t, key=len)
     return {"title": re.sub(r"\s+", " ", title)[:300], "text": text, "published": pub, "media": media, "author": d.get("author"), "site": d.get("sitename"), "next": nxt}
-
 def _html_to_text(h):
     if not h: return ""
     soup = BeautifulSoup(h, "lxml")
     for t in soup(["script", "style", "noscript"]): t.decompose()
     return re.sub(r"\n{3,}", "\n\n", soup.get_text("\n", strip=True))
-
 def _merge_text(a, b):
+    """چسباندن متن صفحه‌ی بعدی بدون تکرار پاراگراف‌ها."""
     seen = {p.strip()[:90] for p in a.split("\n\n") if p.strip()}; out = [a]
     for p in b.split("\n\n"):
         k = p.strip()[:90]
         if len(k) < 20 or k in seen: continue
         seen.add(k); out.append(p.strip())
     return "\n\n".join(out)
-
 async def extract_article(url, fallback_html=""):
+    """کل متن خبر خوانده می‌شود: اگر مقاله چندصفحه‌ای باشد (rel=next) تا MAX_ARTICLE_PAGES صفحه دنبال و به هم دوخته می‌شود."""
     raw = None
     try:
         r = await _get(url, feed=False)
@@ -1510,26 +1314,40 @@ async def extract_article(url, fallback_html=""):
         if len(fb) > len(page["text"]): page["text"] = fb
     if len(page["text"]) < 250: return None
     page["url"] = url; page["pages"] = hops + 1; page["text"] = page["text"][:MAX_ARTICLE_CHARS]; return page
-
 # ============================================================
-# فیلتر هوشمند ضد تبلیغات
+# فیلتر تبلیغ — چندزبانه، منطبق با پرشمارترین زبان‌های کاربران تلگرام
 AD_WORDS_BY_LANG = {
     "fa": ["رپورتاژ", "رپورتاژ آگهی", "تبلیغ", "آگهی", "اسپانسر", "کد تخفیف", "تخفیف ویژه", "همین حالا خرید", "خرید آنلاین", "تماس بگیرید", "شماره تماس", "سفارش دهید", "قیمت مناسب", "ارزان‌ترین", "بهترین قیمت", "فروش ویژه", "ثبت‌نام کنید", "ثبت نام کنید", "لینک خرید", "شرط‌بندی", "شرط بندی", "سایت شرط", "درآمد میلیونی", "وام فوری", "خرید فالوور", "مشاوره رایگان", "پیش‌فروش", "کلیک کنید"],
     "en": ["sponsored", "sponsored content", "advertorial", "promoted post", "affiliate", "buy now", "limited offer", "special offer", "discount code", "coupon code", "order now", "sign up now", "click here", "shop now", "best price", "giveaway", "casino", "betting"],
+    "ru": ["реклама", "рекламный", "спонсор", "спонсируемый", "на правах рекламы", "скидка", "промокод", "купон", "казино", "ставки на спорт", "купить сейчас", "заказать сейчас", "акция"],
+    "hi": ["विज्ञापन", "प्रायोजित", "छूट", "कूपन", "अभी खरीदें", "विशेष ऑफर"],
+    "id": ["iklan", "bersponsor", "disponsori", "promo", "diskon", "kupon", "beli sekarang", "judi", "taruhan"],
+    "pt": ["publicidade", "patrocinado", "patrocinada", "publieditorial", "desconto", "cupom", "compre agora", "oferta especial", "aposta", "cassino"],
+    "es": ["publicidad", "patrocinado", "patrocinada", "publirreportaje", "descuento", "cupón", "compra ahora", "oferta especial", "apuestas", "casino"],
+    "ar": ["إعلان", "ممول", "برعاية", "إعلان ممول", "خصم", "كوبون", "اشتر الآن", "عرض خاص", "كازينو", "مراهنات"],
+    "tr": ["reklam", "sponsorlu", "sponsor", "indirim", "kupon", "hemen satın al", "kampanya", "bahis", "kumar"],
+    "uk": ["реклама", "спонсор", "знижка", "промокод", "купон", "купити зараз", "ставки", "казино"],
+    "uz": ["reklama", "homiy", "chegirma", "kupon", "hozir xarid qiling", "tikish"],
+    "ms": ["iklan", "tajaan", "ditaja", "diskaun", "kupon", "beli sekarang", "pertaruhan"],
+    "vi": ["quảng cáo", "tài trợ", "được tài trợ", "giảm giá", "mã giảm giá", "mua ngay", "cá cược"],
+    "zh": ["广告", "赞助", "赞助内容", "推广", "优惠券", "折扣", "立即购买", "博彩", "赌场"],
+    "de": ["werbung", "gesponsert", "anzeige", "rabatt", "gutschein", "jetzt kaufen", "wetten"],
+    "fr": ["publicité", "sponsorisé", "parrainé", "réduction", "code promo", "achetez maintenant", "paris sportifs", "casino"],
+    "it": ["pubblicità", "sponsorizzato", "sconto", "codice sconto", "acquista ora", "scommesse"],
+    "bn": ["বিজ্ঞাপন", "প্রচারিত", "ছাড়", "কুপন", "এখনই কিনুন"],
+    "th": ["โฆษณา", "ผู้สนับสนุน", "ส่วนลด", "คูปอง", "ซื้อเลย", "พนัน"],
 }
 AD_WORDS = sorted({w for ws in AD_WORDS_BY_LANG.values() for w in ws}, key=len, reverse=True)
-AD_STRONG = ["رپورتاژ", "رپورتاژ آگهی", "sponsored", "sponsored content", "advertorial", "promoted post"]
-
+AD_STRONG = ["رپورتاژ", "رپورتاژ آگهی", "sponsored", "sponsored content", "advertorial", "promoted post", "реклама", "на правах рекламы", "спонсируемый", "patrocinado", "patrocinada", "publirreportaje", "publieditorial", "bersponsor", "disponsori", "إعلان ممول", "برعاية", "sponsorlu", "gesponsert", "sponsorisé", "sponsorizzato", "प्रायोजित", "প্রচারিত", "ผู้สนับสนุน", "tajaan", "ditaja", "homiy", "赞助内容", "được tài trợ"]
 def _wordset_re(words):
-    lat = [re.escape(w) for w in words if re.fullmatch(r"[\x20-\x7f]+", w)]
-    oth = [re.escape(w) for w in words if not re.fullmatch(r"[\x20-\x7f]+", w)]
-    parts = ([r"\b(?:" + "|".join(lat) + r")\b"] if lat else []) + ([r"(?<![\w؀-ۿ])(?:" + "|".join(oth) + r")(?![\w؀-ۿ])"] if oth else [])
+    """کلمات لاتین با مرز واژه (تا «ads» داخل کلمه‌ی دیگر شمرده نشود) و کلمات غیرلاتین به‌صورت زیررشته."""
+    lat = [re.escape(w) for w in words if re.fullmatch(r"[\x20-\x7f]+", w)]; oth = [re.escape(w) for w in words if not re.fullmatch(r"[\x20-\x7f]+", w)]
+    parts = ([r"\b(?:" + "|".join(lat) + r")\b"] if lat else []) + (["(?:" + "|".join(oth) + ")"] if oth else [])
     return re.compile("|".join(parts), re.I) if parts else None
-
 AD_RE = _wordset_re(AD_WORDS); AD_STRONG_RE = _wordset_re(AD_STRONG)
 AD_URL = re.compile(r"/(rpt|reportage|reportaj|sponsored|sponsor|ads?|advert|advertorial|promo|partner|pr-|press-release|reklama)[/-]", re.I)
-
 def heuristic_ad_check(art, strict=False):
+    """فیلتر نرم‌شده: یک کلمه‌ی معمولی به‌تنهایی خبر را رد نمی‌کند؛ فقط نشانه‌های قطعی (کلمات صریح تبلیغاتی، تلفن، انبوه لینک و قیمت) وزن جدی دارند."""
     text, title, url = art["text"], art["title"] or "", art["url"]; low = (title + "\n" + text).lower(); n = max(1, len(text) / 1000); score = 0.0; reasons = []
     if AD_URL.search(url): score += 4; reasons.append("ad-url")
     strong = {m.lower() for m in (AD_STRONG_RE.findall(low) if AD_STRONG_RE else [])}
@@ -1546,12 +1364,11 @@ def heuristic_ad_check(art, strict=False):
     if len(re.findall(r"https?://", text)) / n > 6: score += 2; reasons.append("many-links")
     if len(text) < 300: score += 1.5; reasons.append("short")
     threshold = 6 if strict else 9; return score >= threshold, ", ".join(reasons), round(score, 1)
-
 # ============================================================
-# پرامپت، تولید محتوا و ترکیب
+# پرامپت، تولید و ترکیب نهایی
 def build_prompt(s, art, want_full):
     cats = "\n".join(f"- {c['emoji']} {c['name']}: {c['style']}" for c in s["categories"]) or "- General"; crit = "\n".join(f"- {c['name']} (weight {c['weight']})" for c in s["criteria"])
-    premium = ("\n- Advanced formatting is ON: you MAY also use <u>, <s>, <tg-spoiler> and <blockquote expandable>. Use them tastefully." if s.get("premium_format") else "")
+    premium = ("\n- Advanced formatting is ON: you MAY also use <u>, <s>, <tg-spoiler> (one teaser line) and <blockquote expandable> (extra details). Use them tastefully." if s.get("premium_format") else "")
     system = f"""You are the editor-in-chief and content evaluator of a Telegram channel. Output language: {s['language']}. EVERY word of the output MUST be written in {s['language']}, regardless of any other instruction. Channel topic: {s['topic'] or 'general'}.
 EDITOR INSTRUCTIONS (follow strictly):
 {s['prompt']}
@@ -1560,19 +1377,28 @@ CATEGORIES (choose exactly one and apply its style):
 EVALUATION CRITERIA (score each 0–10, honestly and strictly):
 {crit}
 FORMATTING RULES (mandatory, not optional):
-- HUMAN VOICE: write like a skilled human editor, never like a bot or an AI. Never use divider lines like "---" or "***".
+- HUMAN VOICE: write like a skilled human editor, never like a bot or an AI. Vary sentence length, no meta commentary, no clichéd openings like "In today's world", and NEVER use divider lines like "---" or "***" or "⸻".
+- EMOJI: at most ONE relevant emoji in the whole post, placed on the last line next to the hashtags; no emojis inside paragraphs or bullets.
 - Line 1: headline inside <b>. Then a blank line, then a one-sentence lead.
+- SYMBOLS: wherever a list, step, comparison or highlight helps, start the line with a symbol from this palette (pick 1–2 kinds per post and stay consistent): • ◦ ◆ ◇ ▸ ▹ ➤ ➜ ➥ ➢ → ➝ ⇢ ⟶ ⤷ — each such line is its own paragraph.
 - Only these HTML tags (NO Markdown): <b>, <i>, <u>, <s>, <code>, <pre>, <a href="">, <blockquote>.
-- MANDATORY: both "post" and "full" MUST contain at least one <blockquote> wrapping a key quote or figure.
-- MANDATORY: <b> for key terms, names and numbers.
-- PURE TEXT: "post" and "full" contain only the article itself — never scores or JSON fragments in text fields.
-- "post": an engaging, COMPLETE mini-story — max {s['max_words']} words and at most {max(400, int(s['post_limit']) - 120)} characters{', ending with 2–4 relevant hashtags on the last line' if s['hashtags'] else ''}.
-- "full": {'the EXPANDED bot version: deeper details, background and context (300–700 words, max 2500 characters).' if want_full else 'null'}
-- If the text is an advertisement / advertorial / product-for-sale / betting promotion: is_ad=true.{premium}
-Return ONLY one valid JSON object with exactly this structure:
+- MANDATORY: both "post" and "full" MUST contain at least one <blockquote> wrapping the single most important sentence, quote or number of the news, placed naturally in the middle or near the end — never on line 1, never empty, and never around the whole text.
+- MANDATORY: <b> for key terms, names and numbers (4–8 times per post). <i> only once or twice, for a short nuance or aside. <code> at most once and only for an exact figure/version/ticker/code — never for ordinary words. Never wrap a whole paragraph in <i>, <code> or <pre>.
+- RTL: if the output language reads right-to-left (Persian, Arabic, …), open every paragraph and sentence with a word of that language, then place any English term after it; keep English runs short — long English runs scramble right-to-left text.
+- SITES: only when the story itself recommends a tool, service or website, state its name and its full URL in plain text; NEVER the article's own source or any news site — the source link is added by the system itself, not by you.
+- PURE TEXT: "post" and "full" contain only the article itself — never scores, ratings, field names or JSON fragments; those live only in their own JSON fields.
+- FORMAT CONTRACT: paragraphs are separated by ONE blank line; never end mid-sentence — finish the sentence or compress the story; plain words only (no 'quoted' terms, no [markdown](links)); a sale price, discount or original-price comparison in the story means is_ad=true.
+- VARY THE SUBJECT: name the main person/thing once at first mention, then use pronouns or natural substitutes — never open every paragraph with the same name.
+- UNKNOWN NAMES: a little-known person, company or term gets a one-clause introduction at first mention.
+- NEUTRAL & SOURCE-ONLY: strictly neutral — no judgment, opinion, praise or personal analysis; never add or invent anything beyond the source; never pad to reach the cap — shorter is fine.{premium}
+- "post": an engaging, COMPLETE mini-story — max {s['max_words']} words and at most {max(400, int(s['post_limit']) - 120)} characters; never leave the story half-told: if space is tight, compress the whole story instead of dropping its second half.{', ending with 2–4 relevant hashtags on the last line' if s['hashtags'] else ''}.
+- "full": {'the EXPANDED bot version: everything the post says PLUS the deeper details, background, numbers and context — it must NOT merely repeat the post; start fresh and go deeper. Same format: <b> sub-headings, bullets, at least two <blockquote> highlights (300–700 words, max 2500 characters).' if want_full else 'null'}
+- If the text is an advertisement / advertorial / product-for-sale / betting promotion: is_ad=true.
+- No preamble, never talk about yourself.
+REMINDER: the entire output — title, post, full, hashtags — must be in {s['language']} only.
+Return ONLY one valid JSON object (no code fences) with exactly this structure:
 {{"is_ad": false, "ad_reason": "", "category": "category name", "title": "headline", "scores": {{"criterion name": 0-10}}, "post": "HTML", "full": "HTML or null"}}"""
     user = f"TITLE: {art['title']}\nSOURCE: {art['url']}\nDATE: {art.get('published') or 'unknown'}\n\nARTICLE TEXT:\n{art['text']}"; return system, user
-
 def weighted_score(s, scores):
     tot, acc = 0, 0.0
     for c in s["criteria"]:
@@ -1584,24 +1410,23 @@ def weighted_score(s, scores):
         except Exception: v = 5.0
         tot += w; acc += w * v / 10
     return round(acc / tot * 100, 1) if tot else 0.0
-
 async def generate(s, art, on_queue=None):
+    """خروجی: (json, model_name, error_code) — error_code کلید امن است (هرگز متن خطای مدل یا base url)."""
     want_full = len(art["text"]) > 1200; system, user = build_prompt(s, art, want_full); raw, model, err = await ai_chat(system, user, on_queue=on_queue)
     if not raw: return None, None, err
     j = parse_json(raw)
     if not j or not str(j.get("post") or "").strip(): j = {"is_ad": False, "category": s["categories"][0]["name"] if s["categories"] else "", "title": art["title"], "scores": {}, "post": clean_ai_text(salvage_post(raw), s)[:3000], "full": None}
     j["score"] = weighted_score(s, j.get("scores") or {}) if j.get("scores") else 65.0; return j, model, None
-
 def signature_of(s, ch):
     sig = (s.get("signature") or "").strip()
     if sig.lower() == "@channel": sig = f"@{ch['username']}" if ch and ch["username"] else ""
     return sanitize_html(sig, premium=s.get("premium_format", False)) if sig else ""
-
 def make_tail(s, ch, url):
+    """پایان‌بند پست کانال: فقط امضا — منبع هرگز در کانال نمایش داده نمی‌شود (فقط در «ادامه در ربات»، با اجازه‌ی مدیر)."""
     sig = signature_of(s, ch)
     return ("\n" + sig) if sig else ""
-
 def ensure_quote(t):
+    """اجبارِ quote: اگر مدل بلاک‌کوت نگذاشته باشد، یک پاراگراف مهمِ میانی خودکار داخل <blockquote> گذاشته می‌شود."""
     if not t or "<blockquote" in t.lower(): return t
     parts = str(t).split("\n\n")
     if len(parts) < 2: return t
@@ -1609,24 +1434,24 @@ def ensure_quote(t):
     if not cand: return t
     i = cand[len(cand) // 2] if len(cand) > 1 else cand[0]; parts[i] = f"<blockquote>{parts[i].strip()}</blockquote>"
     return "\n\n".join(parts)
-
 def compose(s, ch, art, gen):
     prem = bool(s.get("premium_format")); post = sanitize_html(ensure_quote(clean_ai_text(salvage_post(gen.get("post") or ""), s)), premium=prem)
     full = clean_ai_text(salvage_post(gen["full"]), s) if gen.get("full") and str(gen["full"]).lower() != "null" else None
     if full: full = finish_ok(fit_html(sanitize_html(ensure_quote(full), premium=prem), BOT_FULL_MAX, prem)[0])
     core = re.sub(r"#[^\s#]+", " ", re.sub(r"<[^>]+>", " ", post)); core = re.sub(r"[\s‌]+", " ", core).strip()
     if len(core) < 120 and full and len(re.sub(r"<[^>]+>", " ", full)) >= 200:
+        # پست تهی/یک‌خطی (فقط ایموجی و امضا): آغاز نسخه‌ی کامل به‌عنوان پست کانال ساخته می‌شود تا کانال هرگز خالی نماند
         txt = re.sub(r"</?[a-z][^>]*>", " ", full); sen = re.split(r"(?<=[.!?؟…])\s+", txt); acc = ""
-        cap_len = max(300, int(s["post_limit"]) - 160)
+        cap = max(300, int(s["post_limit"]) - 160)
         for x in sen:
-            if acc and len(acc) + len(x) + 1 > cap_len: break
+            if acc and len(acc) + len(x) + 1 > cap: break
             acc += (" " if acc else "") + x
         if len(acc) >= 120: post = sanitize_html(ensure_quote(acc + " …"), premium=prem)
     return post + make_tail(s, ch, art["url"]), full
-
 # ============================================================
-# رسانه و انتشار ایمن
+# رسانه و انتشار
 def _media_headers(media):
+    """Referer دامنه‌ی خبر: بسیاری از سایت‌ها بدون آن به تصویر و ویدیو پاسخ ۴۰۳ می‌دهند (علت اصلی «عکس برداشت نمی‌شود»)."""
     h = {"Accept": "image/avif,image/webp,image/*,video/*,*/*;q=0.8"}
     page = (media or {}).get("page") or ""
     try:
@@ -1634,18 +1459,16 @@ def _media_headers(media):
         if p.scheme and p.netloc: h["Referer"] = f"{p.scheme}://{p.netloc}/"
     except Exception: pass
     return h
-
 def _ext_kind(u, fallback="photo"):
     e = os.path.splitext(urlparse(str(u)).path)[1].lower()
     if e in (".mp4", ".m4v", ".mov", ".webm"): return "video"
     if e == ".gif": return "animation"
     if e in (".jpg", ".jpeg", ".png", ".webp", ".bmp"): return "photo"
     return fallback
-
 async def download_media(media):
+    """دانلود جریانی تا سقف MAX_MEDIA_MB (پیش‌فرض ۵۰ مگابایت = سقف آپلود ربات‌های تلگرام). اگر نوبت اول رد شد، یک‌بار با هدر دیگری دوباره تلاش می‌شود."""
     if not media or not media.get("url"): return None
     for hdr in (_media_headers(media), {"User-Agent": UA_FEED, "Accept": "*/*"}):
-        tmp = None
         try:
             async with FETCH_SEM:
                 async with http().stream("GET", media["url"], headers=hdr, timeout=httpx.Timeout(180, connect=15)) as r:
@@ -1653,31 +1476,24 @@ async def download_media(media):
                     ct = r.headers.get("content-type", "").lower()
                     if ct.startswith("text/") or "html" in ct: return None
                     try:
-                        if int(r.headers.get("content-length") or 0) > MAX_MEDIA_BYTES: return None
+                        if int(r.headers.get("content-length") or 0) > MAX_MEDIA_BYTES: log.info(f"media skipped (> {MAX_MEDIA_MB}MB)"); return None
                     except Exception: pass
                     kind = "animation" if "gif" in ct else "photo" if ct.startswith("image/") else "video" if ct.startswith("video/") else _ext_kind(media["url"], media.get("kind") or "document")
                     ext = {"photo": ".jpg", "animation": ".gif", "video": ".mp4"}.get(kind, os.path.splitext(urlparse(media["url"]).path)[1] or ".bin")
                     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext); size = 0
                     async for chunk in r.aiter_bytes(262144):
                         size += len(chunk)
-                        if size > MAX_MEDIA_BYTES:
-                            tmp.close(); os.unlink(tmp.name); return None
+                        if size > MAX_MEDIA_BYTES: tmp.close(); os.unlink(tmp.name); log.info(f"media skipped (> {MAX_MEDIA_MB}MB)"); return None
                         tmp.write(chunk)
                     tmp.close()
-                    if size < 1024:
-                        os.unlink(tmp.name); return None
+                    if size < 1024: os.unlink(tmp.name); return None
                     if kind == "photo" and size > 10 * 1024 * 1024: kind = "document"
                     return tmp.name, kind
-        except Exception as e:
-            if tmp and os.path.exists(tmp.name):
-                try: os.unlink(tmp.name)
-                except Exception: pass
-            log.warning(f"media: {e}")
+        except Exception as e: log.warning(f"media: {e}")
     return None
-
 def _is_parse_err(e): s = str(e).lower(); return "parse" in s or "entit" in s or "tag" in s or "unsupported start" in s
-
 async def _send_media(bot, chat_id, caption, pm, media):
+    """رسانه با کپشن؛ ابتدا با URL، سپس دانلود و آپلود. None ⇒ رسانه قابل ارسال نیست (متن تنها فرستاده می‌شود)."""
     kind = media.get("kind", "photo"); mf = media.get("_file")
     if not mf and kind == "photo":
         try: return await bot.send_photo(chat_id, media["url"], caption=caption, parse_mode=pm)
@@ -1699,8 +1515,8 @@ async def _send_media(bot, chat_id, caption, pm, media):
         log.warning(f"send_{k}: {e}"); return None
     except Exception as e:
         log.warning(f"send_{k}: {e}"); return None
-
 async def send_post(bot, chat_id, text, media=None):
+    """کپشن ≤۱۰۲۴ → رسانه+کپشن · متن بلندتر → رسانه با تیتر و سپس متن · خطای پارس → تنزل تدریجی فرمت (پریمیوم → معمولی → ساده)."""
     variants = [(text, "HTML"), (downgrade_html(text), "HTML"), (strip_tags(text), None)]
     for i, (t, pm) in enumerate(variants):
         try:
@@ -1717,30 +1533,15 @@ async def send_post(bot, chat_id, text, media=None):
             if _is_parse_err(e) and i < len(variants) - 1: continue
             raise
     raise RuntimeError("format")
-
 def msg_link(ch, msg): return f"https://t.me/{ch['username']}/{msg.message_id}" if ch["username"] else f"https://t.me/c/{str(ch['chat_id'])[4:]}/{msg.message_id}"
-
 async def bot_can_post(bot, chat_id):
     try:
         me = await bot.get_chat_member(chat_id, bot.id)
         if me.status == "creator": return True
         return me.status == "administrator" and getattr(me, "can_post_messages", True) is not False
     except Exception: return False
-
-async def user_is_admin(bot, chat_id, uid):
-    try:
-        m = await bot.get_chat_member(chat_id, uid)
-        return m.status in ("creator", "administrator")
-    except Exception: return False
-
 async def publish_article(bot, aid, count_usage=True):
-    global BOT_USERNAME
-    if not BOT_USERNAME:
-        try:
-            me = await bot.get_me()
-            BOT_USERNAME = me.username or ""
-        except Exception as e:
-            log.warning(f"Could not load bot username before publishing: {e}")
+    """خروجی: (ok, link|error_code) — error_code: not_ready | no_channel | bot_not_admin | duplicate | send_failed:<err>"""
     a = get_article(aid)
     if not a or not a["post_html"]: return False, "not_ready"
     ch = get_channel(a["channel_id"]); admin_id = a["admin_id"]
@@ -1751,6 +1552,8 @@ async def publish_article(bot, aid, count_usage=True):
     media = json.loads(a["media"]) if a["media"] and s["include_media"] else None
     tail = make_tail(s, ch, a["url"]); post = re.sub(r'\s*🔗 <a href="[^"]+">Source</a>\s*', "\n", a["post_html"] or ""); post = clean_ai_text(strip_source_url(post, a["url"]), s); body = post[:-len(tail)] if tail and post.endswith(tail) else post; text = post; limit = int(s["post_limit"])
     if len(post) > limit:
+        # ادامه‌ی «بیشتر» همیشه ساخته می‌شود — پستِ کانال هرگز نصفه‌نیمه رها نمی‌شود؛
+        # ادامه یا «نسخه‌ی مفصل» است (اگر تولید شده) یا فقط بخشِ ادامه‌ی خودِ پست — متنِ کانال هرگز دوباره تکرار نمی‌شود.
         cut, rest = split_post_html(body, max(200, limit - len(tail) - 100 - len(BOT_USERNAME)), prem)
         htitle = f"<b>{html.escape(a['title'] or '')}</b>"
         cfull = clean_ai_text(strip_source_url(a["full_html"], a["url"]), s) if source_bot_ok(a["source_id"]) and a["full_html"] else ""
@@ -1765,16 +1568,14 @@ async def publish_article(bot, aid, count_usage=True):
         except Exception as e: article_update(aid, status="failed", reason=f"send: {str(e)[:120]}"); log_event("ERROR", f"ارسال به {ch['title']}: {e}", admin_id); return False, f"send_failed:{str(e)[:120]}"
     finally:
         if media and media.get("_file"):
-            try:
-                if os.path.exists(media["_file"][0]): os.unlink(media["_file"][0])
+            try: os.unlink(media["_file"][0])
             except Exception: pass
     mark_posted(ch["chat_id"], a["hash"]); link = msg_link(ch, msg)
     article_update(aid, status="published", links=json.dumps([link]), reason="")
     if count_usage: usage_inc(admin_id, "posts")
     log_event("INFO", f"منتشر شد در {ch['title']}: {(a['title'] or '')[:60]}", admin_id); return True, link
-
 # ============================================================
-# سیستم تشخیص و گزارش چرخه (Diagnostics)
+# تشخیص مرحله‌ای (Diagnostics) — کوتاه، نمادین، دوزبانه
 DIAG = {
     "busy": ("⏳ چرخه‌ی دیگری روی این کانال در حال اجراست", "⏳ Another cycle is running on this channel"),
     "no_channel": ("❌ کانال یافت نشد", "❌ Channel not found"), "plan_inactive": ("⛔ پلن فعال نیست", "⛔ Plan inactive"), "no_sources": ("⚠️ منبعی ثبت نشده", "⚠️ No source added"),
@@ -1796,7 +1597,6 @@ DIAG = {
     "stage": ("📍 مرحله: {stage}", "📍 Stage: {stage}"),
 }
 STAGES = {"start": ("شروع", "start"), "checks": ("بررسی پلن/کانال/منبع", "checks"), "discover": ("کشف مقالات", "discovery"), "extract": ("استخراج متن", "extraction"), "filter": ("فیلتر", "filtering"), "ai": ("تولید با AI", "AI generation"), "score": ("امتیازدهی", "scoring"), "publish": ("انتشار", "publishing"), "done": ("پایان", "done")}
-
 class Diag:
     def __init__(self): self.items, self.hints, self.stage = [], [], "start"
     def add(self, key, **kw): self.items.append((key, kw))
@@ -1814,32 +1614,28 @@ class Diag:
             except Exception: lines.append(DIAG[k][i])
         return "\n".join(lines)
     def to_json(self): return json.dumps({"items": self.items, "hints": self.hints, "stage": self.stage}, ensure_ascii=False)
-
 def _within_lookback(pub_iso, s):
     if not pub_iso: return bool(s["allow_undated"])
     d = parse_dt(pub_iso); return bool(d and (now_utc() - d) <= timedelta(hours=int(s["lookback_hours"])))
-
 def _pub_err(code, lang):
     if code == "bot_not_admin": return DIAG["bot_not_admin"][1 if lang == "en" else 0]
     if code == "duplicate": return "duplicate" if lang == "en" else "تکراری"
     return code.replace("send_failed:", "")
-
 def article_src_name(aid):
+    """نام منبعِ تولیدکننده‌ی یک مقاله (برای نمایش به مدیر در تست فوری و چرخه‌ی خودکار)."""
     a = get_article(aid); src = source_of_article(a) if a else None
     return ((src["title"] or "").strip() or hostname(src["url"])) if src else ""
-
+# ============================================================
+# چرخه‌ی یک کانال (قفل هر کانال + سقف چرخه‌های هم‌زمان)
 PROG = {"fa": {"start": "شروع…", "src": "بررسی {n} منبع…", "found": "{n} مقاله پیدا شد", "extract": "استخراج {i}/{n}: {t}", "ai": "تولید با AI: {t}", "queue": "⏳ همه‌ی مدل‌ها مشغول‌اند؛ در صف پردازش…", "pub": "انتشار…", "done": "پایان"},
         "en": {"start": "Starting…", "src": "Checking {n} sources…", "found": "{n} articles found", "extract": "Extracting {i}/{n}: {t}", "ai": "Generating with AI: {t}", "queue": "⏳ All models busy; queued…", "pub": "Publishing…", "done": "Done"}}
-
 def _res(D): return {"found": 0, "processed": 0, "accepted": 0, "rejected": 0, "queued": 0, "published": 0, "errors": 0, "links": [], "src": "", "pub": [], "diag": D, "msg": ""}
-
 async def run_channel_cycle(bot, uid, cid, test_mode=False, progress=None):
     lk = ch_lock(cid)
     if lk.locked():
         D = Diag(); D.add("busy"); r = _res(D); r["msg"] = D.render(get_settings(cid)["ui_lang"], False); return r
     async with lk:
         async with CYCLE_SEM: return await _cycle(bot, uid, cid, test_mode, progress)
-
 async def _cycle(bot, uid, cid, test_mode, progress):
     D = Diag(); res = _res(D); s = get_settings(cid); ch = get_channel(cid); lim = admin_limits(uid); lang = s["ui_lang"]; P = PROG[lang if lang in PROG else "fa"]
     async def p(pct, txt):
@@ -1857,7 +1653,7 @@ async def _cycle(bot, uid, cid, test_mode, progress):
     if rem is not None and rem <= 0: D.add("quota_tests" if test_mode else "quota_posts", used=usage_today(uid)[field], cap=lim["daily_tests" if test_mode else "daily_posts"]); D.hint("hint_quota"); return fin()
     if not await bot_can_post(bot, ch["chat_id"]): D.add("bot_not_admin"); D.hint("hint_admin"); return fin()
     target = 1 if test_mode else min(rem if rem is not None else 99, int(s["posts_per_cycle"])); update_settings(cid, last_run=now_iso()); await p(5, P["start"])
-    
+    # --- کشف (منابع به‌صورت هم‌زمان، محدود با FETCH_SEM)
     D.stage = "discover"; await p(10, P["src"].format(n=len(sources)))
     async def one(src):
         name = hostname(src["url"]); lf = parse_dt(src["last_fetch"])
@@ -1897,7 +1693,7 @@ async def _cycle(bot, uid, cid, test_mode, progress):
     res["found"] = len(candidates); await p(40, P["found"].format(n=len(candidates)))
     if not candidates: D.add("none_found"); D.hint("hint_sources"); return fin()
     D.add("found", n=len(candidates))
-
+    # --- پردازش (استخراج ۳تایی هم‌زمان، تولید ترتیبی تا رسیدن به هدف)
     quiet = in_quiet(s); cnt = {"extract": 0, "undated": 0, "ad": 0, "ai_ad": 0, "low": 0}; best = 0.0; details = []; ai_err = None; i = 0; stop = False
     while i < len(candidates) and not stop:
         chunk = candidates[i:i + 3]; i += len(chunk); D.stage = "extract"
@@ -1936,7 +1732,7 @@ async def _cycle(bot, uid, cid, test_mode, progress):
                     res["errors"] += 1; D.add("pub_fail", err=_pub_err(out, lang))
                     if out == "bot_not_admin": D.hint("hint_admin"); stop = True; break
             else: res["queued"] += 1
-
+    # --- جمع‌بندی
     if cnt["extract"]: D.add("extract_fail", n=cnt["extract"])
     if cnt["undated"]: D.add("undated", n=cnt["undated"]); D.hint("hint_undated")
     if cnt["ad"]: D.add("ad", n=cnt["ad"])
@@ -1954,7 +1750,12 @@ async def _cycle(bot, uid, cid, test_mode, progress):
         elif top and cnt["low"] == top: D.hint("hint_score")
         elif top and cnt["extract"] == top: D.hint("hint_extract")
     await p(100, P["done"]); return fin()
-
+async def run_admin_cycle(bot, uid, test_mode=False, progress=None):
+    out = {}
+    for ch in list_channels(uid):
+        try: out[ch["id"]] = await run_channel_cycle(bot, uid, ch["id"], test_mode, progress)
+        except Exception as e: log_event("ERROR", f"چرخه کانال {ch['title']}: {e}", uid)
+    return out
 async def flush_ready(bot, uid, cid, max_n=2):
     s = get_settings(cid)
     if s["mode"] != "auto" or in_quiet(s) or not s["enabled"]: return 0
@@ -1964,7 +1765,8 @@ async def flush_ready(bot, uid, cid, max_n=2):
         ok, _ = await publish_article(bot, a["id"])
         if ok: sent += 1; rem = None if rem is None else rem - 1
     return sent
-
+# ============================================================
+# زمان‌بند هوشمند: عادلانه (قدیمی‌ترین اجرا اول)، سقف چرخه در هر تیک، توقف وقتی هیچ مدلی در دسترس نیست
 _tick_lock = asyncio.Lock()
 async def _plan_notifications():
     for uid, p, exp in activate_next_plans():
@@ -1977,15 +1779,15 @@ async def _plan_notifications():
     for u in q("SELECT * FROM users WHERE plan_id IS NOT NULL AND plan_expires<=? AND next_plan_id IS NULL AND (remind_key IS NULL OR remind_key!='expired') AND banned=0", (now_iso(),)):
         q("UPDATE users SET remind_key='expired' WHERE id=?", (u["id"],), commit=True); lang = u["lang"] or "fa"
         await notify_user(u["id"], ("🔴 <b>پلن شما تمام شد؛ انتشار خودکار متوقف است.</b>" if lang == "fa" else "🔴 <b>Your plan expired; automatic publishing is paused.</b>"), [[("🔄 تمدید / ارتقا" if lang == "fa" else "🔄 Renew / Upgrade", "u:plans")]])
-
 async def _report_failed_cycle(uid, ch, s, res):
+    """چرخه‌ی زمان‌بندی‌شده چیزی منتشر نکرد → یک بار (تا ۲۴ ساعت برای همان الگو) به مدیر اطلاع بده."""
     D = res["diag"]; fp = "|".join(D.keys()); last = (s.get("last_notified_diag") or "").split("@"); last_fp, last_ts = last[0], (parse_dt(last[1]) if len(last) > 1 else None)
     if fp == last_fp and last_ts and (now_utc() - last_ts) < timedelta(hours=24): return
     update_settings(ch["id"], last_notified_diag=f"{fp}@{now_iso()}"); lang = s["ui_lang"]
     head = f"⚠️ <b>{'چرخه بدون انتشار' if lang == 'fa' else 'Cycle published nothing'}</b> · 📢 {html.escape(ch['title'])}\n\n"
     await notify_user(uid, head + html.escape(D.render(lang)), [[("🛠 پنل کانال" if lang == "fa" else "🛠 Channel panel", f"a:ch:{ch['id']}")]])
-
 async def _report_published(uid, ch, s, res):
+    """چرخه‌ی خودکار منتشر کرد → یک پیام کوتاه با نام منبعِ هر پست (یک پیام برای کل چرخه، نه برای هر پست)."""
     lang = s["ui_lang"]; fa = lang != "en"
     head = f"✅ <b>{'منتشر شد' if fa else 'Published'}</b> · 📢 {html.escape(ch['title'])}\n"
     body = "".join(f"\n• {html.escape(t or '—')}" + (f"\n   {tr(lang, 'test_src', name=html.escape(sn))}" if sn else "") for t, sn, _ in res["pub"][:3])
@@ -1993,14 +1795,12 @@ async def _report_published(uid, ch, s, res):
     if res["pub"] and res["pub"][0][2]: kb.append([("🔗 " + ("مشاهده در کانال" if fa else "View in channel"), res["pub"][0][2])])
     kb.append([("🛠 " + ("پنل کانال" if fa else "Channel panel"), f"a:ch:{ch['id']}")])
     await notify_user(uid, head + body, kb)
-
 async def _scheduled(bot, uid, ch, s):
     try:
         res = await run_channel_cycle(bot, uid, ch["id"])
         if res["published"]: await _report_published(uid, ch, s, res)
         elif not res["queued"] and s["mode"] == "auto" and "busy" not in [k for k, _ in res["diag"].items]: await _report_failed_cycle(uid, ch, s, res)
     except Exception as e: log_event("ERROR", f"چرخه {ch['title']}: {e}", uid)
-
 async def scheduler_tick(bot):
     if _tick_lock.locked(): return
     async with _tick_lock:
@@ -2029,7 +1829,8 @@ async def scheduler_tick(bot):
         if not any_model_available(): log_event("WARN", f"{len(due)} کانال در انتظار؛ هیچ مدل AI در دسترس نیست"); return
         due.sort(key=lambda x: x[0]); batch = due[:MAX_CYCLES_PER_TICK]
         gset("last_cycle_start", now_iso()); await asyncio.gather(*[_scheduled(bot, uid, ch, s) for _, uid, ch, s in batch]); gset("last_cycle_end", now_iso())
-
+# ============================================================
+# گزارش (دوزبانه، فشرده)
 def report_text(uid=None, cid=None, lang="fa"):
     fa = lang != "en"; hb = gget("heartbeat"); hb_age = (now_utc() - parse_dt(hb)).total_seconds() if hb else 1e9; hb_icon = "🟢" if hb_age < TICK_SECONDS * 4 else "🔴"
     if cid is None:
@@ -2050,9 +1851,17 @@ def report_text(uid=None, cid=None, lang="fa"):
                    f"⭐ حداقل {s['min_score']} · 🕰 {s['lookback_hours']}h · ⏱ هر {s['interval_minutes']}′ · 🌙 {quiet} · 🌍 {off_label(off)}\n💓 {ago_text(hb, lang)} {hb_icon} · 🕐 چرخه: {fmt_date(s['last_run'], off, True)} → {fmt_date(s['last_end'], off, True)}")
     return (f"📊 <b>Report</b> · 📢 {html.escape(ch['title'])}\n\n{'🟢' if s['enabled'] else '🔴'} automation · {'⚡ auto' if s['mode'] == 'auto' else '📝 review'} · 🧾 {html.escape(pname)}{until}\n🌐 sources {len(list_sources(cid, True))} · 📰 found 24h {c()} · 📥 queue {ready_count(cid)}\n📢 posts today {use['posts']}/{cap(lim['daily_posts'])} · 🧪 tests {use['tests']}/{cap(lim['daily_tests'])}\n♻️ rejected 24h {c('rejected')} · ❌ failed {c('failed')}\n"
             f"⭐ min {s['min_score']} · 🕰 {s['lookback_hours']}h · ⏱ every {s['interval_minutes']}′ · 🌙 {quiet} · 🌍 {off_label(off)}\n💓 {ago_text(hb, lang)} {hb_icon} · 🕐 cycle: {fmt_date(s['last_run'], off, True)} → {fmt_date(s['last_end'], off, True)}")
-
+# ---------- پایان لایه‌ی موتور (چرخه، زمان‌بند، گزارش) ----------
 # ============================================================
-# رابط کاربری تلگرام (UI & Views)
+# رابط کاربری تلگرام (دوزبانه، فشرده)
+# ============================================================
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.constants import ParseMode, ChatType
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
+HTML = ParseMode.HTML
+APP: Application = None
+# ============================================================
+# دیکشنری دوزبانه‌ی رابط کاربری  (fa, en)
 TXT = {
     "back": ("🔙 بازگشت", "🔙 Back"), "home": ("🏠 خانه", "🏠 Home"), "cancel": ("❌ انصراف", "❌ Cancel"), "cancelled": ("↩️ لغو شد", "↩️ Cancelled"),
     "saved": ("✅ ذخیره شد", "✅ Saved"), "deleted": ("🗑 حذف شد", "🗑 Deleted"), "on": ("روشن", "on"), "off": ("خاموش", "off"), "yes": ("✅ بله", "✅ Yes"), "no": ("❌ خیر", "❌ No"),
@@ -2061,6 +1870,7 @@ TXT = {
     "choose_lang": ("🌐 <b>زبان / Language</b>", "🌐 <b>زبان / Language</b>"), "lang_set": ("✅ فارسی", "✅ English"), "banned": ("⛔ دسترسی مسدود است", "⛔ Access blocked"),
     "lang_set_n": (" · {n} کانال هم‌زبان شد", " · {n} channel(s) relocalized"),
     "busy_click": ("⏳ کمی آهسته‌تر", "⏳ Slow down a bit"),
+    # ---- کاربر / پلن
     "plans_btn": ("🧾 شروع", "🧾 Start"), "plans_title": ("🧾 <b>پلن‌ها</b>", "🧾 <b>Plans</b>"), "plans_current": ("🧾 فعلی: <b>{name}</b>{until}", "🧾 Current: <b>{name}</b>{until}"), "until": (" · تا {d}", " · until {d}"),
     "plans_next": ("⏭ بعدی: <b>{name}</b>", "⏭ Next: <b>{name}</b>"), "plans_pick": ("برای دیدن جزئیات و قیمت، پلن را انتخاب کنید:", "Pick a plan to see details and price:"),
     "plan_details": ("⏳ {days} روز · 📢 {posts} پست/روز · 🧪 {tests} تست/روز\n🌐 {src} منبع · 📣 {ch} کانال\n💰 <b>{price}</b>", "⏳ {days} days · 📢 {posts} posts/day · 🧪 {tests} tests/day\n🌐 {src} sources · 📣 {ch} channels\n💰 <b>{price}</b>"),
@@ -2074,6 +1884,7 @@ TXT = {
     "receipt_ok": ("✅ <b>رسید دریافت شد.</b>\nحداکثر تا ۱ ساعت بررسی و نتیجه همین‌جا اعلام می‌شود.", "✅ <b>Receipt received.</b>\nReviewed within 1 hour; you'll be notified here."), "wait_btn": ("🚪 خروج", "🚪 Exit"), "receipt_empty": ("⚠️ تصویر رسید یا توضیح پرداخت را بفرستید", "⚠️ Send the receipt image or a payment note"),
     "pay_approved": ("🎉 پرداخت تأیید شد؛ پلن <b>{name}</b> {when}.\n/create", "🎉 Payment approved; plan <b>{name}</b> {when}.\n/create"), "pay_when_now": ("تا {d} فعال است", "is active until {d}"), "pay_when_queued": ("پس از پلن فعلی ({d}) شروع می‌شود", "starts after the current plan ({d})"),
     "pay_rejected": ("❌ پرداخت تأیید نشد. پیگیری: /man", "❌ Payment not approved. Follow up: /man"),
+    # ---- پنل مدیر
     "no_admin": ("⛔ ابتدا یک پلن فعال کنید", "⛔ Activate a plan first"), "panel": ("🛠 <b>پنل مدیریت</b>", "🛠 <b>Admin panel</b>"), "no_plan": ("بدون پلن", "no plan"),
     "today_line": ("📢 {p}/{pc} پست · 🧪 {t}/{tc} تست · 📣 {c}/{cc} کانال · 🌐 {s}/{sc} منبع", "📢 {p}/{pc} posts · 🧪 {t}/{tc} tests · 📣 {c}/{cc} channels · 🌐 {s}/{sc} sources"),
     "plan_inactive": ("⚠️ <b>پلن فعال نیست</b> → تمدید/ارتقا", "⚠️ <b>Plan inactive</b> → renew/upgrade"), "pick_channel": ("کانال را انتخاب کنید (هر کانال تنظیمات مستقل دارد):", "Pick a channel (each has its own settings):"),
@@ -2089,6 +1900,7 @@ TXT = {
     "ch_owner_moved": ("⚠️ «{title}» با کد معتبر به {who} منتقل شد. اگر شما نبودید: /man", "⚠️ “{title}” was transferred to {who} with a valid code. If this wasn't you: /man"),
     "ch_added": ("✅ «{title}» اضافه شد", "✅ “{title}” added"), "limit_channels": ("⚠️ سقف کانال پلن: {n}", "⚠️ Plan channel limit: {n}"), "limit_sources": ("⚠️ سقف منبع پلن: {n}", "⚠️ Plan source limit: {n}"),
     "limit_posts": ("⚠️ سهمیه‌ی پست امروز تمام شد ({n})", "⚠️ Today's post quota used ({n})"), "limit_tests": ("⚠️ سهمیه‌ی تست امروز تمام شد ({n})", "⚠️ Today's test quota used ({n})"),
+    # ---- پنل کانال
     "ch_panel": ("📣 <b>{title}</b>", "📣 <b>{title}</b>"), "ch_status": ("{i} اتوماسیون {st} · {mode}", "{i} Automation {st} · {mode}"), "auto": ("⚡ خودکار", "⚡ auto"), "review": ("📝 بازبینی", "📝 review"),
     "ch_stats": ("🌐 {s} منبع · 📝 صف {q} · ✅ ۲۴h {p} · ♻️ رد {r} · 🕐 {a}", "🌐 {s} sources · 📝 queue {q} · ✅ 24h {p} · ♻️ rejected {r} · 🕐 {a}"),
     "report": ("📊 گزارش", "📊 Report"), "test": ("🧪 تست فوری", "🧪 Quick test"), "sources": ("🌐 منابع ({n})", "🌐 Sources ({n})"), "content": ("✍️ محتوا", "✍️ Content"), "sched": ("⏰ زمان‌بندی", "⏰ Schedule"),
@@ -2097,76 +1909,81 @@ TXT = {
     "tog_enabled": ("🟢 اتوماسیون روشن شد", "🟢 Automation on"), "tog_disabled": ("🔴 اتوماسیون خاموش شد", "🔴 Automation off"),
     "lock_text": ("🔐 <b>کد قفل «{title}»</b>\n\nاگر کسی بخواهد این کانال را در پنل خود ثبت کند باید این کد را بدهد؛ وگرنه رد می‌شود و به شما خبر می‌رسد.\n\n🔑 <code>{code}</code>\n\n⚠️ محرمانه نگه دارید؛ در صورت لو رفتن بازتولید کنید.", "🔐 <b>Lock code of “{title}”</b>\n\nAnyone trying to register this channel in their panel must enter this code; otherwise it's rejected and you're notified.\n\n🔑 <code>{code}</code>\n\n⚠️ Keep it secret; regenerate if leaked."),
     "lock_regen": ("🔁 بازتولید", "🔁 Regenerate"), "lock_regen_ok": ("✅ کد جدید صادر شد", "✅ New code issued"),
-    "src_title": ("🌐 <b>منابع — {title}</b> · {n}/{cap}\n💡 بهترین نتیجه با سایت‌هایی است که <b>RSS</b> دارند؛ آدرس فید یا خود سایت را بدهید.\nستون اول = کانال · ستون دوم = ربات", "🌐 <b>Sources — {title}</b> · {n}/{cap}\n💡 Best results with sites that have <b>RSS</b>.\nFirst mark = channel · second = bot"),
+    # ---- منابع
+    "src_title": ("🌐 <b>منابع — {title}</b> · {n}/{cap}\n💡 بهترین نتیجه با سایت‌هایی است که <b>RSS</b> دارند؛ آدرس فید یا خود سایت را بدهید (ربات فید/سایت‌مپ را خودش پیدا می‌کند).\nستون اول = محتوای کانال · ستون دوم = محتوای ربات", "🌐 <b>Sources — {title}</b> · {n}/{cap}\n💡 Best results with sites that have <b>RSS</b>; give the feed or the site URL (the bot finds feed/sitemap itself).\nFirst mark = channel content · second = bot content"),
     "src_line": ("\n{i}{b} {host} · 🆕 {n}{err}", "\n{i}{b} {host} · 🆕 {n}{err}"), "src_err": (" · ⚠️×{n}", " · ⚠️×{n}"), "src_add": ("➕ افزودن منبع", "➕ Add source"),
-    "src_add_prompt": ("آدرس منبع را بفرستید:\n<code>https://example.com/feed</code>", "Send the source URL:\n<code>https://example.com/feed</code>"),
+    "src_add_prompt": ("آدرس منبع را بفرستید:\n<code>https://example.com/feed</code>\n\n💡 ترجیحاً سایتی بدهید که <b>RSS</b> دارد (آدرس‌هایی مثل <code>/feed</code> ، <code>/rss</code> ، <code>/atom.xml</code>)؛ اگر آدرس صفحه‌ی اصلی را بدهید ربات خودش فید و سایت‌مپ را می‌جوید.\nℹ️ اگر <code>https://</code> را ننویسید خودکار به ابتدای آدرس اضافه می‌شود.", "Send the source URL:\n<code>https://example.com/feed</code>\n\n💡 Prefer a site that has <b>RSS</b> (paths like <code>/feed</code>, <code>/rss</code>, <code>/atom.xml</code>); if you give the homepage, the bot will look for a feed/sitemap itself.\nℹ️ If you omit <code>https://</code> it is added automatically."),
     "src_bad": ("⚠️ آدرس نامعتبر", "⚠️ Invalid URL"), "src_dup": ("⚠️ منبع تکراری", "⚠️ Duplicate source"), "src_checking": ("🔎 بررسی منبع…", "🔎 Checking source…"),
-    "src_added": ("✅ منبع اضافه شد · {n} مقاله [{m}]", "✅ Source added · {n} articles [{m}]"),
-    "src_403": ("🚫 این سایت به ربات‌ها اجازه‌ی خواندن نمی‌دهد (HTTP 403).", "🚫 This site blocks bots (HTTP 403)."),
-    "src_dead": ("⚠️ تست بارگذاری موفق نبود؛ اگر فید RSS دارد، آدرس فید را مستقیم بدهید.", "⚠️ Load test failed; provide direct RSS URL."),
+    "src_added": ("✅ منبع اضافه شد · {n} مقاله [{m}]", "✅ Source added · {n} articles [{m}]"), "src_added_empty": ("\n⚠️ چیزی پیدا نشد؛ آدرس فید را مستقیم بدهید.", "\n⚠️ Nothing found; give the feed URL directly."),
+    "src_403": ("🚫 این سایت به ربات‌ها اجازه‌ی خواندن نمی‌دهد (HTTP 403)؛ از این سایت (یا سایت‌های مشابه) نمی‌توان محتوایی دریافت کرد.", "🚫 This site blocks bots (HTTP 403); content can't be fetched from this site (or similar sites)."),
+    "src_dead": ("⚠️ تست بارگذاری موفق نبود؛ نمی‌توان از این سایت محتوا تولید کرد. اگر فید RSS دارد، آدرس فید را مستقیم بدهید.", "⚠️ Load test failed; content can't be produced from this site. If it has an RSS feed, give the feed URL directly."),
     "src_added_off": ("\n➕ منبع اضافه شد اما 🔴 خاموش است.", "\n➕ The source was added but is 🔴 off."), "src_now_off": ("\n🔴 منبع خاموش شد.", "\n🔴 The source was turned off."),
     "src_view": ("🌐 <b>{host}</b>\n<code>{url}</code>\n{feed}\n{st} · آخرین بررسی {last} · 🆕 {n} · ⚠️×{f}{err}", "🌐 <b>{host}</b>\n<code>{url}</code>\n{feed}\n{st} · last check {last} · 🆕 {n} · ⚠️×{f}{err}"),
-    "src_feed": ("📡 <code>{u}</code>", "📡 <code>{u}</code>"), "active": ("🟢 فعال", "🟢 active"), "inactive": ("🔴 غیرفعال", "🔴 inactive"), "toggle": ("⏯ روشن/خاموش", "⏯ On/off"), "delete": ("🗑 حذف", "🗑 Delete"),
+    "src_feed": ("📡 <code>{u}</code>", "📡 <code>{u}</code>"), "active": ("🟢 فعال", "?? active"), "inactive": ("🔴 غیرفعال", "🔴 inactive"), "toggle": ("⏯ روشن/خاموش", "⏯ On/off"), "delete": ("🗑 حذف", "🗑 Delete"),
     "src_st": ("{c} کانال · {b} ربات", "{c} channel · {b} bot"), "tog_ch": ("⏯ منبع کانال", "⏯ Channel source"), "tog_bot": ("🤖 منبع ربات", "🤖 Bot source"),
     "src_ch_on": ("🟢 منبع برای کانال روشن شد", "🟢 Source on for channel"), "src_ch_off": ("🔴 منبع برای کانال خاموش شد", "🔴 Source off for channel"),
     "src_bot_on": ("🟢 منبع برای محتوای ربات روشن شد", "🟢 Source on for bot content"), "src_bot_off": ("🔴 منبع برای محتوای ربات خاموش شد", "🔴 Source off for bot content"),
     "src_api": ("🔌 API", "🔌 API"), "src_api_none": ("🔌 API: —", "🔌 API: —"), "src_api_on": ("🔌 API: <code>{u}</code>", "🔌 API: <code>{u}</code>"),
-    "src_api_url": ("آدرس API منبع را بفرستید (خروجی JSON):", "Send source API URL (JSON):"),
-    "src_api_key": ("کلید API را بفرستید (اگر لازم نیست بنویسید <code>-</code>):", "Send API key (or <code>-</code>):"),
-    "src_api_ok": ("✅ API ثبت شد · {n} آیتم خوانده شد", "✅ API saved · {n} items read"), "src_api_bad": ("⚠️ پاسخ API قابل استفاده نبود؛ ثبت شد اما منبع 🔴 خاموش است.", "⚠️ API response wasn't usable."),
+    "src_api_url": ("آدرس API منبع را بفرستید (خروجی JSON):\n<code>https://site.com/wp-json/wp/v2/posts?per_page=20</code>\n\nℹ️ اگر کلید API داخل آدرس می‌آید، جای کلید بنویسید <code>{key}</code> تا ربات آن را جای‌گذاری کند.\nبرای حذف API بنویسید <code>-</code>", "Send the source API URL (JSON output):\n<code>https://site.com/wp-json/wp/v2/posts?per_page=20</code>\n\nℹ️ If the key goes inside the URL, write <code>{key}</code> where the key belongs and the bot will substitute it.\nSend <code>-</code> to remove the API."),
+    "src_api_key": ("کلید API را بفرستید (اگر لازم نیست بنویسید <code>-</code>):", "Send the API key (send <code>-</code> if not needed):"),
+    "src_api_ok": ("✅ API ثبت شد · {n} آیتم خوانده شد", "✅ API saved · {n} items read"), "src_api_bad": ("⚠️ پاسخ API قابل استفاده نبود؛ ثبت شد اما منبع 🔴 خاموش است.", "⚠️ API response wasn't usable; saved but the source is 🔴 off."),
     "src_api_del": ("🗑 API حذف شد", "🗑 API removed"),
     "src_on": ("🟢 منبع روشن شد", "🟢 Source on"), "src_off": ("🔴 منبع خاموش شد", "🔴 Source off"), "src_deleted": ("🗑 منبع حذف شد", "🗑 Source deleted"), "src_recheck": ("🔎 بررسی دوباره", "🔎 Re-check"),
+    # ---- محتوا
     "content_title": ("✍️ <b>محتوا — {title}</b>\n🎯 {topic} · 🗣 {lang}\n📝 <i>{prompt}</i>\n✒️ {sig}", "✍️ <b>Content — {title}</b>\n🎯 {topic} · 🗣 {lang}\n📝 <i>{prompt}</i>\n✒️ {sig}"),
     "general": ("عمومی", "general"), "b_topic": ("🎯 موضوع", "🎯 Topic"), "b_lang": ("🗣 زبان خروجی", "🗣 Output language"), "b_prompt": ("📝 پرامپت", "📝 Prompt"), "b_sig": ("✒️ امضا", "✒️ Signature"),
     "b_cats": ("🗂 دسته‌ها ({n})", "🗂 Categories ({n})"), "b_crits": ("📏 معیارها ({n})", "📏 Criteria ({n})"), "b_min": ("⭐ حداقل امتیاز {n}", "⭐ Min score {n}"), "b_words": ("🔢 کلمات {n}", "🔢 Words {n}"), "b_limit": ("📏 سقف کاراکتر {n}", "📏 Char limit {n}"),
     "b_hashtags": ("#️⃣ هشتگ {i}", "#️⃣ Hashtags {i}"), "b_link": ("🔗 منبع در ربات {i}", "🔗 Source in bot {i}"), "b_media": ("🖼 رسانه {i}", "🖼 Media {i}"), "b_strict": ("🛡 فیلتر سخت {i}", "🛡 Strict filter {i}"), "b_premium": ("💎 فرمت پریمیوم {i}", "💎 Premium format {i}"),
     "tog_hashtags": ("#️⃣ هشتگ", "#️⃣ Hashtags"), "tog_include_link": ("🔗 منبع در ربات", "🔗 Source in bot"), "tog_include_media": ("🖼 رسانه", "🖼 Media"), "tog_strict_ads": ("🛡 فیلتر سخت تبلیغ", "🛡 Strict ad filter"), "tog_premium_format": ("💎 فرمت پریمیوم", "💎 Premium format"), "tog_allow_undated": ("📅 بدون تاریخ", "📅 Undated"),
-    "prem_need_prem": ("💎 این قالب فقط برای مدیرانِ دارای تلگرام پریمیوم فعال می‌شود.", "💎 Only admins with Telegram Premium can enable this."),
-    "prem_on_ok": ("💎 فعال شد. قالب پیشرفته‌ی پریمیوم به پست‌ها اعمال می‌شود.", "💎 Enabled. Premium advanced formatting active."),
-    "togd_hashtags": ("هشتگ‌های مرتبط در انتهای پست اضافه می‌شوند", "Related hashtags added"), "togd_include_link": ("منبع خبر فقط در «ادامه در ربات» نمایش داده می‌شود", "Source shown in bot"), "togd_include_media": ("تصویر یا ویدیو همراه پست ارسال می‌شود", "Media sent with post"), "togd_strict_ads": ("فیلتر سخت‌گیرانه‌تر، تبلیغ‌ها را زودتر رد می‌کند", "Stricter ad filter"), "togd_premium_format": ("قالب پیشرفته‌ی پریمیوم در پست‌ها استفاده می‌شود", "Premium formatting in posts"), "togd_allow_undated": ("مقالاتِ بدون تاریخ هم منتشر می‌شوند", "Undated articles published"),
-    "cats_title": ("🗂 <b>دسته‌ها</b>\nAI برای هر مقاله یکی را انتخاب و با سبک آن می‌نویسد.", "🗂 <b>Categories</b>"), "cat_add": ("➕ دسته", "➕ Category"),
-    "cat_view": ("{e} <b>{name}</b>\n📐 {style}", "{e} <b>{name}</b>\n📐 {style}"), "cat_edit": ("✏️ سبک", "✏️ Style"), "cat_style_prompt": ("سبک نگارش جدید این دسته:", "New writing style:"),
+    "prem_need_prem": ("💎 این قالب فقط برای مدیرانِ دارای تلگرام پریمیوم فعال می‌شود؛ اکانت تلگرام شما پریمیوم نیست.", "💎 Only admins with a Telegram Premium account can enable this; your Telegram account is not Premium."),
+    "prem_on_ok": ("💎 فعال شد. قالب پیشرفته‌ی پریمیوم به پست‌ها اعمال می‌شود.", "💎 Enabled. Premium advanced formatting will be applied to your posts."),
+    "togd_hashtags": ("هشتگ‌های مرتبط در انتهای پست اضافه می‌شوند", "Related hashtags are added at the end of the post"), "togd_include_link": ("منبع خبر فقط در «ادامه در ربات» نمایش داده می‌شود", "The news source is shown only in “continue in bot”"), "togd_include_media": ("تصویر یا ویدیوی خبر همراه پست ارسال می‌شود", "The news photo or video is sent with the post"), "togd_strict_ads": ("فیلتر سخت‌گیرانه‌تر، تبلیغ‌ها را زودتر رد می‌کند", "The stricter filter rejects ad-like articles earlier"), "togd_premium_format": ("قالب پیشرفته‌ی پریمیوم در پست‌ها استفاده می‌شود", "Premium advanced formatting is used in posts"), "togd_allow_undated": ("مقالاتِ بدون تاریخ هم منتشر می‌شوند", "Articles without a publish date are published too"),
+    "cats_title": ("🗂 <b>دسته‌ها</b>\nAI برای هر مقاله یکی را انتخاب و با سبک آن می‌نویسد.", "🗂 <b>Categories</b>\nAI picks one per article and writes in its style."), "cat_add": ("➕ دسته", "➕ Category"),
+    "cat_view": ("{e} <b>{name}</b>\n📐 {style}", "{e} <b>{name}</b>\n📐 {style}"), "cat_edit": ("✏️ سبک", "✏️ Style"), "cat_style_prompt": ("سبک نگارش جدید این دسته:", "New writing style for this category:"),
     "cat_added": ("✅ دسته اضافه شد", "✅ Category added"), "cat_updated": ("✅ سبک بروزرسانی شد", "✅ Style updated"), "cat_min": ("⚠️ حداقل یک دسته لازم است", "⚠️ At least one category required"),
-    "crits_title": ("📏 <b>معیارها</b>\nامتیاز ۰–۱۰۰ · زیر {m} رد می‌شود.", "📏 <b>Criteria</b>"), "crit_add": ("➕ معیار", "➕ Criterion"),
+    "crits_title": ("📏 <b>معیارها</b>\nامتیاز ۰–۱۰۰ · زیر {m} رد می‌شود.", "📏 <b>Criteria</b>\nScore 0–100 · below {m} is rejected."), "crit_add": ("➕ معیار", "➕ Criterion"),
     "crit_line": ("\n• {name} — {w} ({p}%)", "\n• {name} — {w} ({p}%)"), "crit_btn": ("{name} · {w}", "{name} · {w}"), "crit_view": ("📏 <b>{name}</b> · وزن {w}", "📏 <b>{name}</b> · weight {w}"), "crit_w": ("✏️ وزن", "✏️ Weight"),
     "crit_w_prompt": ("وزن جدید (۱–۱۰۰):", "New weight (1–100):"), "crit_added": ("✅ معیار اضافه شد", "✅ Criterion added"), "crit_updated": ("✅ وزن بروزرسانی شد", "✅ Weight updated"), "crit_min": ("⚠️ حداقل یک معیار لازم است", "⚠️ At least one criterion required"),
-    "sched_title": ("⏰ <b>زمان‌بندی — {title}</b>\n⏱ هر {iv}′ · 📦 {ppc} پست/چرخه · 🕰 {lb}h اخیر · 📅 بدون تاریخ {ud}\n🌙 {quiet} · 🌍 {city} {tz} (⌚ {loc} · UTC {utc})\n🔁 {mode}", "⏰ <b>Schedule — {title}</b>"),
+    # ---- زمان‌بندی
+    "sched_title": ("⏰ <b>زمان‌بندی — {title}</b>\n⏱ هر {iv}′ · 📦 {ppc} پست/چرخه · 🕰 {lb}h اخیر · 📅 بدون تاریخ {ud}\n🌙 {quiet} · 🌍 {city} {tz} (⌚ {loc} · UTC {utc})\n🔁 {mode}", "⏰ <b>Schedule — {title}</b>\n⏱ every {iv}′ · 📦 {ppc} posts/cycle · 🕰 last {lb}h · 📅 undated {ud}\n🌙 {quiet} · 🌍 {city} {tz} (⌚ {loc} · UTC {utc})\n🔁 {mode}"),
     "mode_auto": ("⚡ خودکار — انتشار مستقیم", "⚡ auto — publish directly"), "mode_review": ("📝 بازبینی — تأیید دستی در صف", "📝 review — manual approval in queue"), "none": ("—", "—"),
     "b_interval": ("⏱ هر {n}′", "⏱ Every {n}′"), "b_ppc": ("📦 {n} پست/چرخه", "📦 {n}/cycle"), "b_lookback": ("🕰 {n}h", "🕰 {n}h"), "b_undated": ("📅 بدون تاریخ {i}", "📅 Undated {i}"),
     "b_quiet": ("🌙 خاموشی", "🌙 Quiet hours"), "b_tz": ("🌍 منطقه زمانی", "🌍 Time zone"), "b_mode": ("🔁 {m}", "🔁 {m}"),
     "mode_set_auto": ("⚡ خودکار: انتشار مستقیم", "⚡ Auto: publish directly"), "mode_set_review": ("📝 بازبینی: منتظر تأیید در صف", "📝 Review: waits for approval"),
-    "quiet_pick_start": ("🌙 <b>خاموشی</b> · ساعت <b>شروع</b>:", "🌙 <b>Quiet hours</b> · start hour:"), "quiet_pick_end": ("🌙 شروع {h}:00 · ساعت <b>پایان</b>:", "🌙 Start {h}:00 · end hour:"),
+    "quiet_pick_start": ("🌙 <b>خاموشی</b> · ساعت <b>شروع</b> ({tz} · الان {loc}):", "🌙 <b>Quiet hours</b> · <b>start</b> hour ({tz} · now {loc}):"), "quiet_pick_end": ("🌙 شروع {h}:00 · ساعت <b>پایان</b>:", "🌙 Start {h}:00 · <b>end</b> hour:"),
     "quiet_off": ("🚫 بدون خاموشی", "🚫 No quiet hours"), "quiet_set": ("🌙 خاموشی {a}:00 → {b}:00", "🌙 Quiet {a}:00 → {b}:00"), "quiet_cleared": ("🌙 خاموشی حذف شد", "🌙 Quiet hours cleared"),
-    "tz_pick": ("🌍 <b>منطقه زمانی</b> · UTC الان <b>{utc}</b>\nنزدیک‌ترین شهر را انتخاب کنید:", "🌍 <b>Time zone</b>"), "tz_set": ("🌍 {city} {tz} · ⌚ {loc}", "🌍 {city} {tz} · ⌚ {loc}"),
+    "tz_pick": ("🌍 <b>منطقه زمانی</b> · UTC الان <b>{utc}</b>\nنزدیک‌ترین شهر را انتخاب کنید:", "🌍 <b>Time zone</b> · UTC now <b>{utc}</b>\nPick the nearest city:"), "tz_set": ("🌍 {city} {tz} · ⌚ {loc}", "🌍 {city} {tz} · ⌚ {loc}"),
+    # ---- صف / مقاله
     "queue_title": ("📝 <b>صف انتشار — {title}</b> · {n} آماده", "📝 <b>Publish queue — {title}</b> · {n} ready"), "rej_title": ("♻️ <b>ردشده‌های ۲۴h — {title}</b>", "♻️ <b>Rejected 24h — {title}</b>"),
-    "pub_first": ("🚀 انتشار اولین", "🚀 Publish first"), "art_title": ("📝 <b>{title}</b>\n⭐ {score} · 🗂 {cat}\n📌 {st}{reason} · 🌐 {host}\n━━━━━━━━━━━━\n{body}", "📝 <b>{title}</b>"),
+    "pub_first": ("🚀 انتشار اولین", "🚀 Publish first"), "art_title": ("📝 <b>{title}</b>\n⭐ {score} · 🗂 {cat}\n📌 {st}{reason} · 🌐 {host}\n━━━━━━━━━━━━\n{body}", "📝 <b>{title}</b>\n⭐ {score} · 🗂 {cat}\n📌 {st}{reason} · 🌐 {host}\n━━━━━━━━━━━━\n{body}"),
     "art_nobody": ("<i>(محتوایی تولید نشده)</i>", "<i>(no content generated)</i>"), "art_pub": ("🚀 انتشار", "🚀 Publish"), "art_edit": ("✏️ ویرایش", "✏️ Edit"), "art_full": ("📖 نسخه کامل", "📖 Full version"), "art_view": ("👁 مشاهده", "👁 View"),
-    "art_del_arch": ("🗑 حذف از آرشیو", "🗑 Remove from archive"), "art_to_ready": ("♻️ به صف انتشار", "♻️ To publish queue"), "art_edit_prompt": ("متن جدید پست:", "New post text:"),
+    "art_del_arch": ("🗑 حذف از آرشیو", "🗑 Remove from archive"), "art_to_ready": ("♻️ به صف انتشار", "♻️ To publish queue"), "art_edit_prompt": ("متن جدید پست (فرمت تلگرام حفظ می‌شود):", "New post text (Telegram formatting kept):"),
     "art_updated": ("✅ متن بروزرسانی شد", "✅ Text updated"), "art_moved": ("♻️ به صف منتقل شد", "♻️ Moved to queue"), "publishing": ("⏳ انتشار…", "⏳ Publishing…"), "published_ok": ("✅ منتشر شد", "✅ Published"), "pub_failed": ("❌ انتشار: {e}", "❌ Publish: {e}"), "full_head": ("📖 <b>نسخه‌ی کامل</b>\n\n", "📖 <b>Full version</b>\n\n"),
-    "myplan": ("🧾 <b>پلن من: {name}</b>\n{st}{exp}{nxt}\n📢 {p}/{pc} پست · 🧪 {t}/{tc} تست\n🌐 {s}/{sc} منبع · 📣 {c}/{cc} کانال", "🧾 <b>My plan: {name}</b>"),
+    # ---- پلن من / لاگ
+    "myplan": ("🧾 <b>پلن من: {name}</b>\n{st}{exp}{nxt}\n📢 {p}/{pc} پست · 🧪 {t}/{tc} تست (امروز)\n🌐 {s}/{sc} منبع · 📣 {c}/{cc} کانال", "🧾 <b>My plan: {name}</b>\n{st}{exp}{nxt}\n📢 {p}/{pc} posts · 🧪 {t}/{tc} tests (today)\n🌐 {s}/{sc} sources · 📣 {c}/{cc} channels"),
     "st_active": ("🟢 فعال", "🟢 active"), "st_expired": ("🔴 غیرفعال", "🔴 inactive"), "exp_at": (" · تا {d}", " · until {d}"), "upgrade_btn": ("⬆️ ارتقا / تمدید", "⬆️ Upgrade / renew"),
     "logs_title": ("📜 <b>لاگ</b>{lvl}\n\n", "📜 <b>Logs</b>{lvl}\n\n"), "logs_empty": ("— خالی —", "— empty —"), "all": ("همه", "All"), "errors": ("خطاها", "Errors"), "warns": ("هشدارها", "Warnings"),
     "logs_note": ("\n\n<i>۱۰ مورد آخر</i>", "\n\n<i>last 10 entries</i>"),
+    # ---- دلیل کوتاه ردشده‌ها (بدون جزئیات فنی)
     "rj_extract": ("متن قابل استخراج نبود", "no extractable text"), "rj_ad": ("فیلتر تبلیغ", "ad filter"), "rj_ai_ad": ("تبلیغ (تشخیص AI)", "ad (AI)"), "rj_score": ("امتیاز کمتر از حداقل", "below minimum score"),
     "rj_ai": ("سرویس هوش مصنوعی پاسخ نداد", "AI service did not respond"), "rj_send": ("ارسال به کانال ناموفق", "sending to channel failed"), "rj_dup": ("تکراری", "duplicate"),
     "rj_admin": ("ربات ادمین کانال نیست", "bot is not channel admin"), "rj_old": ("قدیمی‌تر از بازه", "older than window"), "rj_undated": ("بدون تاریخ", "undated"), "rj_other": ("نامشخص", "unspecified"),
-    "test_head": ("🧪 <b>تست — {title}</b>", "🧪 <b>Test — {title}</b>"), "preparing": ("آماده‌سازی…", "Preparing…"), "test_wait": ("⏳ تست بعدی تا {n} ثانیه دیگر", "⏳ Next test in {n}s"), "test_busy": ("⏳ چرخه‌ای روی این کانال در حال اجراست", "⏳ A cycle is already running"),
-    "test_ok": ("✅ <b>منتشر شد</b>", "✅ <b>Published</b>"), "test_queued": ("📝 در <b>صف انتشار</b> منتظر تأیید", "📝 Waiting in <b>publish queue</b>"), "test_fail": ("⚠️ <b>چیزی منتشر نشد</b>", "⚠️ <b>Nothing published</b>"),
-    "test_log": ("📋 {d}", "📋 {d}"), "back_panel": ("🔙 پنل کانال", "🔙 Channel panel"),
-    "test_retry_note": ("ℹ️ سهمیه کسر نشد؛ می‌توانید دوباره تست کنید.", "ℹ️ No quota deducted; retry right away."),
+    # ---- تست
+    "test_head": ("🧪 <b>تست — {title}</b>", "🧪 <b>Test — {title}</b>"), "preparing": ("آماده‌سازی…", "Preparing…"), "test_wait": ("⏳ تست بعدی تا {n} ثانیه دیگر", "⏳ Next test in {n}s"), "test_busy": ("⏳ چرخه‌ای روی این کانال در حال اجراست", "⏳ A cycle is already running on this channel"),
+    "test_ok": ("✅ <b>منتشر شد</b>", "✅ <b>Published</b>"), "test_queued": ("📝 در <b>صف انتشار</b> منتظر تأیید (حالت بازبینی)", "📝 Waiting in <b>publish queue</b> (review mode)"), "test_fail": ("⚠️ <b>چیزی منتشر نشد</b>", "⚠️ <b>Nothing published</b>"),
+    "test_log": ("📋 {d}", "📋 {d}"), "test_quota_note": ("ℹ️ سهمیه‌ی تست فقط با انتشار موفق کسر می‌شود", "ℹ️ Test quota is deducted only on success"), "back_panel": ("🔙 پنل کانال", "🔙 Channel panel"),
+    "test_retry_note": ("ℹ️ سهمیه و محدودیت زمانی اعمال نشد؛ می‌توانید همین حالا دوباره تست کنید.", "ℹ️ No quota or cooldown was applied; you can retry right away."),
     "test_src": ("🌐 تولید از منبع: <b>{name}</b>", "🌐 Generated from source: <b>{name}</b>"),
-    "lock_reset_q": ("⚠️ با بازتولید کد قفل، کانال ریست امنیتی می‌شود. ادامه می‌دهید؟", "⚠️ Lock code reset. Continue?"),
-    "lock_reset_ok": ("✅ کد جدید صادر شد · کانال ریست شد", "✅ New code issued · channel reset"),
+    "lock_reset_q": ("⚠️ با بازتولید کد قفل، این کانال از نظر امنیتی <b>ریست</b> می‌شود:\n• کد قفل تازه صادر می‌شود\n• صفِ انتشارِ تأییدنشده پاک می‌شود\n• اتوماسیون خاموش می‌شود\n\nمنابع و پست‌های منتشرشده دست‌نخورده می‌مانند. ادامه می‌دهید؟", "⚠️ Regenerating the lock code <b>resets</b> this channel for security:\n• a new lock code is issued\n• the unapproved publish queue is cleared\n• automation is turned off\n\nSources and already-published posts stay untouched. Continue?"),
+    "lock_reset_ok": ("✅ کد جدید صادر شد · کانال ریست شد ({n} مورد از صف پاک شد) · 🔴 اتوماسیون خاموش شد", "✅ New code issued · channel reset ({n} queued items cleared) · 🔴 automation turned off"),
 }
-
 def tr(lang, key, / , **kw):
     s = TXT[key][1 if lang == "en" else 0]
     try: return s.format(**kw) if kw else s
     except Exception: return s
-
 STATUS = {"discovered": ("🔎 کشف‌شده", "🔎 discovered"), "skipped": ("⏭ خارج از بازه", "⏭ out of window"), "rejected": ("♻️ ردشده", "♻️ rejected"), "failed": ("❌ ناموفق", "❌ failed"), "ready": ("📝 آماده", "📝 ready"), "published": ("✅ منتشرشده", "✅ published")}
-
 def reason_text(reason, lang):
+    """دلیل کوتاه و امن برای مدیر: هیچ نام مدل، Base URL یا متن خطای فنی نشان داده نمی‌شود."""
     r = (reason or "").strip().lower()
     if not r: return ""
     if r.startswith("ai:"): return ai_err_text(r.split(":", 1)[1].strip(), lang)
@@ -2174,28 +1991,27 @@ def reason_text(reason, lang):
         if r.startswith(pre): return tr(lang, key)
     if r.startswith("ai_"): return ai_err_text(r, lang)
     return tr(lang, "rj_other")
-
 INT_FIELDS = {"max_words": (30, 600), "min_score": (0, 100), "post_limit": (300, 4000), "interval_minutes": (MIN_INTERVAL, 1440), "posts_per_cycle": (1, MAX_PPC), "lookback_hours": (1, MAX_LOOKBACK)}
-FIELD_LABEL = {"prompt": ("پرامپت نگارش", "Writing prompt"), "topic": ("موضوع کانال", "Channel topic"), "language": ("زبان خروجی", "Output language"), "signature": ("امضای پایان پست", "Post signature"),
-               "max_words": ("حداکثر کلمات پست", "Max post words"), "min_score": ("حداقل امتیاز", "Min score"), "post_limit": ("سقف کاراکتر پست", "Post char limit"),
-               "interval_minutes": ("فاصله‌ی چرخه (دقیقه)", "Cycle interval (min)"), "posts_per_cycle": ("پست در هر چرخه", "Posts per cycle"), "lookback_hours": ("مقالات چند ساعت اخیر", "Lookback hours")}
+FIELD_LABEL = {"prompt": ("پرامپت نگارش", "Writing prompt"), "topic": ("موضوع کانال", "Channel topic"), "language": ("زبان خروجی (نام زبان را بنویس: Italian، Chinese، فارسی، …)", "Output language (type the language name: Italian, Chinese, English, …)"), "signature": ("امضای پایان پست (@channel = یوزرنیم کانال)", "Post signature (@channel = channel username)"),
+               "max_words": ("حداکثر کلمات پست", "Max post words"), "min_score": ("حداقل امتیاز (۰–۱۰۰)", "Min score (0–100)"), "post_limit": ("سقف کاراکتر پست کانال (پیش‌فرض ۷۰۰)؛ محتوای کامل‌تر → «ادامه در ربات» (۳۰۰–۴۰۰۰)", "Channel post char limit (default 700); longer content → “continue in bot” (300–4000)"),
+               "interval_minutes": (f"فاصله‌ی چرخه (دقیقه، ≥{MIN_INTERVAL})", f"Cycle interval (min, ≥{MIN_INTERVAL})"), "posts_per_cycle": (f"پست در هر چرخه (≤{MAX_PPC})", f"Posts per cycle (≤{MAX_PPC})"), "lookback_hours": (f"مقالات چند ساعت اخیر (≤{MAX_LOOKBACK})", f"Articles from last N hours (≤{MAX_LOOKBACK})")}
 SCHED_FIELDS = ("interval_minutes", "posts_per_cycle", "lookback_hours")
-
 TZ_NAMES = {"tehran": ("🇮🇷 تهران", "🇮🇷 Tehran"), "istanbul": ("🇹🇷 استانبول", "🇹🇷 Istanbul"), "dubai": ("🇦🇪 دبی", "🇦🇪 Dubai"), "kabul": ("🇦🇫 کابل", "🇦🇫 Kabul"), "karachi": ("🇵🇰 کراچی", "🇵🇰 Karachi"), "delhi": ("🇮🇳 دهلی", "🇮🇳 Delhi"),
             "moscow": ("🇷🇺 مسکو", "🇷🇺 Moscow"), "berlin": ("🇩🇪 برلین", "🇩🇪 Berlin"), "london": ("🇬🇧 لندن", "🇬🇧 London"), "beijing": ("🇨🇳 پکن", "🇨🇳 Beijing"), "tokyo": ("🇯🇵 توکیو", "🇯🇵 Tokyo"), "sydney": ("🇦🇺 سیدنی", "🇦🇺 Sydney"),
             "newyork": ("🇺🇸 نیویورک", "🇺🇸 New York"), "losangeles": ("🇺🇸 لس‌آنجلس", "🇺🇸 Los Angeles"), "saopaulo": ("🇧🇷 سائوپائولو", "🇧🇷 São Paulo"), "utc": ("🌐 گرینویچ", "🌐 UTC")}
 def tz_city(off, lang):
     z = next((k for k, o in TZ_ZONES if abs(o - float(off)) < 0.01), None); return TZ_NAMES[z][1 if lang == "en" else 0] if z else ""
-
 WIZ = {
-    "cat_add": [("name", ("نام دسته", "Category name"), "str"), ("emoji", ("یک ایموجی", "One emoji"), "str"), ("style", ("سبک نگارش", "Writing style"), "str")],
+    "cat_add": [("name", ("نام دسته (مثلاً خبری)", "Category name (e.g. News)"), "str"), ("emoji", ("یک ایموجی", "One emoji"), "str"), ("style", ("سبک نگارش (مثلاً: تیتر بولد، سه جمله، دو بولت)", "Writing style (e.g. bold headline, three sentences, two bullets)"), "str")],
     "crit_add": [("name", ("نام معیار", "Criterion name"), "str"), ("weight", ("وزن (۱–۱۰۰)", "Weight (1–100)"), "int")],
     "plan_new": [("name", ("نام (فارسی)", "Name (Persian)"), "str"), ("name_en", ("نام (انگلیسی)", "Name (English)"), "str"), ("days", ("مدت (روز)", "Days"), "int"), ("daily_posts", ("پست روزانه", "Posts/day"), "int"), ("max_sources", ("حداکثر منبع", "Max sources"), "int"), ("max_channels", ("حداکثر کانال", "Max channels"), "int"), ("daily_tests", ("تست روزانه", "Tests/day"), "int"),
-                 ("price", ("قیمت (فارسی)", "Price (Persian)"), "str"), ("price_en", ("قیمت (انگلیسی)", "Price (English)"), "str"), ("description", ("توضیح کوتاه (فارسی)", "Short description (Persian)"), "str"), ("description_en", ("توضیح کوتاه (انگلیسی)", "Short description (English)"), "str")],
-    "model_add": [("base_url", ("Base URL سرویس:", "Service Base URL:"), "str"), ("api_key", ("کلید API", "API key"), "str"), ("model", ("نام مدل", "Model name"), "str")],
-    "disc_add": [("code", ("کد تخفیف", "Discount code"), "str"), ("percent", ("درصد تخفیف (۱–۱۰۰)", "Discount percent"), "int"), ("expires", ("انقضا: روز یا تاریخ YYYY-MM-DD", "Expiry: days or YYYY-MM-DD"), "str"), ("max_uses", ("سقف استفاده (0 = نامحدود)", "Max uses"), "int")],
+                 ("price", ("قیمت (فارسی، مثلاً ۲۰۰,۰۰۰ تومان)", "Price (Persian)"), "str"), ("price_en", ("قیمت (انگلیسی، مثلاً 5 USDT)", "Price (English)"), "str"), ("description", ("توضیح کوتاه (فارسی)", "Short description (Persian)"), "str"), ("description_en", ("توضیح کوتاه (انگلیسی)", "Short description (English)"), "str")],
+    "model_add": [("base_url", ("Base URL سرویس را بفرستید (همان آدرسی که سرویس‌دهنده‌ی شما اعلام کرده است):", "Send the service Base URL (exactly as your provider documents it):"), "str"),
+                  ("api_key", ("کلید API (توکن)", "API key (token)"), "str"), ("model", ("نام مدل", "Model name"), "str")],
+    "disc_add": [("code", ("کد تخفیف (مثلاً SPRING30)", "Discount code (e.g. SPRING30)"), "str"), ("percent", ("درصد تخفیف (۱–۱۰۰)", "Discount percent (1–100)"), "int"), ("expires", ("انقضا: تعداد روز (مثلاً 30) یا تاریخ (2025-12-31)", "Expiry: days (e.g. 30) or date (2025-12-31)"), "str"), ("max_uses", ("حداکثر دفعات استفاده (0 = نامحدود)", "Max uses (0 = unlimited)"), "int")],
 }
-
+# ============================================================
+# ابزار UI
 def B(t, d): return InlineKeyboardButton(t, callback_data=d[:64])
 def U(t, url): return InlineKeyboardButton(t, url=url)
 def esc(x): return html.escape(str(x if x is not None else ""))
@@ -2207,15 +2023,15 @@ def uname(u): return ("@" + u["username"]) if u and u["username"] else (u["name"
 def can_admin(uid): return role_of(uid) in ("admin", "super")
 def L(update): return user_lang(update.effective_user.id) or "fa"
 def cap(v): return "∞" if v is None else v
-def kbm(kb): return InlineKeyboardMarkup([[B(t, d) if not str(d).startswith("http") else U(t, d) for t, d in row] for row in kb]) if kb else None
-
+def kbm(kb):
+    """[[(label, data)]] → InlineKeyboardMarkup (برای notify از هسته)"""
+    return InlineKeyboardMarkup([[B(t, d) if not str(d).startswith("http") else U(t, d) for t, d in row] for row in kb]) if kb else None
 async def popup(update, context, text, alert=False):
     qy = update.callback_query
     if qy:
         try: await qy.answer(text[:200], show_alert=alert); context.user_data["_answered"] = True; return
         except Exception: pass
     context.user_data["notice"] = text
-
 async def render(update, context, text, kb=None, force_new=False):
     notice = context.user_data.pop("notice", None)
     if notice: text = f"{notice}\n\n{text}"
@@ -2230,44 +2046,36 @@ async def render(update, context, text, kb=None, force_new=False):
         except BadRequest as e:
             if "not modified" in str(e).lower(): return
     m = await context.bot.send_message(chat_id, text, reply_markup=markup, parse_mode=HTML, disable_web_page_preview=True); context.user_data["panel"] = m.message_id
-
 async def ask(update, context, prompt, kind, back, **extra):
     lang = L(update); context.user_data["await"] = {"kind": kind, "back": back, **extra}
     await render(update, context, f"✏️ {prompt}\n\n<i>{tr(lang, 'send_value')}</i>", [[B(tr(lang, "cancel"), "c:cancel")]])
-
 async def wiz_start(update, context, wiz, back, **data): context.user_data["await"] = {"kind": "wiz", "wiz": wiz, "step": 0, "data": data, "back": back}; await wiz_prompt(update, context)
 async def wiz_prompt(update, context):
     lang = L(update); st = context.user_data["await"]; steps = WIZ[st["wiz"]]; i = st["step"]
     await render(update, context, f"{tr(lang, 'step', i=i + 1, n=len(steps))} ✏️ {steps[i][1][1 if lang == 'en' else 0]}\n\n<i>{tr(lang, 'send_value')}</i>", [[B(tr(lang, "cancel"), "c:cancel")]])
-
 async def notify_supers(text, kb=None):
     for sid in SUPER_ADMIN_IDS:
         try: await APP.bot.send_message(sid, text, parse_mode=HTML, reply_markup=kbm(kb) if kb and isinstance(kb[0][0], tuple) else (InlineKeyboardMarkup(kb) if kb else None), disable_web_page_preview=True)
         except Exception as e: log.warning(f"notify {sid}: {e}")
-
 async def notify_user_fn(uid, text, kb=None):
     try: await APP.bot.send_message(uid, text, parse_mode=HTML, reply_markup=kbm(kb), disable_web_page_preview=True)
     except Exception as e: log.warning(f"notify user {uid}: {e}")
-
 async def go_home(update, context):
     uid = update.effective_user.id; context.user_data.pop("await", None)
     if not user_lang(uid): return await view_lang(update, context)
     return await (view_super_home if is_super(uid) else view_admin_home if can_admin(uid) else view_user_home)(update, context)
-
 # ============================================================
-# نماهای کاربری، کانال و محتوا
+# انتخاب زبان · منوی کاربر · پلن‌ها (دودویی، قیمت پس از کلیک، کد تخفیف)
 async def view_lang(update, context): await render(update, context, tr("fa", "choose_lang"), [[B("🇮🇷 فارسی", "lang:fa"), B("🇬🇧 English", "lang:en")]])
-
 async def set_language(update, context, lang):
+    """تغییر زبان صفر تا صد: زبانِ رابط، و در همه‌ی کانال‌ها پرامپت پیش‌فرض و متن‌های پیش‌فرضِ محتوا/گزارش هم به زبان تازه بازنویسی می‌شوند (فقط آن‌هایی که مدیر دستی عوض نکرده)."""
     uid = update.effective_user.id; set_lang(uid, lang)
     try: n = relocalize_all(uid, lang)
     except Exception as e: log.warning(f"relocalize_all {uid}: {e}"); n = 0
     await popup(update, context, tr(lang, "lang_set") + (tr(lang, "lang_set_n", n=n) if n else "")); await go_home(update, context)
-
 async def view_user_home(update, context):
     lang = L(update); u = update.effective_user
     await render(update, context, gtext("welcome", lang, name=esc(u.first_name)), [[B(tr(lang, "plans_btn"), "u:plans")]])
-
 async def view_plans(update, context):
     uid = update.effective_user.id; lang = L(update); lim = admin_limits(uid); text = tr(lang, "plans_title") + "\n\n"
     if lim["plan_id"]: text += tr(lang, "plans_current", name=esc(plan_txt(lim["plan"], "name", lang)), until=tr(lang, "until", d=fmt_date(lim["expires"], admin_offset(uid))) if lim["expires"] else "") + "\n"
@@ -2275,15 +2083,12 @@ async def view_plans(update, context):
     text += "\n" + tr(lang, "plans_pick")
     kb = pairs([B(f"{'🎁' if p['is_free'] else '⭐'} {plan_txt(p, 'name', lang)}", f"u:plan:{p['id']}") for p in list_plans()])
     kb.append([B(tr(lang, "back"), "home")]); await render(update, context, text, kb)
-
 def _applied_disc(context, pid):
     code = (context.user_data.get("disc") or {}).get(str(pid)); d, why = disc_valid(code) if code else (None, "")
     return d
-
 def _price_text(p, lang, d):
     price = plan_txt(p, "price", lang) or tr(lang, "free_word")
     return (discount_price(price, d["percent"]), price) if d else (price, None)
-
 async def view_plan(update, context, pid):
     uid = update.effective_user.id; lang = L(update); p = get_plan(pid); u = get_user(uid); lim = admin_limits(uid)
     if not p: await popup(update, context, tr(lang, "plan_notfound")); return await view_plans(update, context)
@@ -2297,13 +2102,11 @@ async def view_plan(update, context, pid):
         if pay_pending_for(uid, pid): kb.append([B(tr(lang, "plan_pending_btn"), "noop")])
         else: kb.append([B(tr(lang, "plan_renew_btn" if lim["plan_id"] == pid and lim["active"] else "plan_req_btn"), f"u:req:{pid}"), B(tr(lang, "disc_remove") if d else tr(lang, "disc_btn"), f"u:disc{'x' if d else ''}:{pid}")])
     kb.append([B(tr(lang, "back"), "u:plans")]); await render(update, context, text, kb)
-
 async def do_free(update, context, pid):
     uid = update.effective_user.id; lang = L(update); u = get_user(uid); p = get_plan(pid)
     if not p or not p["is_free"] or u["free_used"]: await popup(update, context, tr(lang, "free_once"), alert=True); return await view_plans(update, context)
     assign_plan(uid, pid); log_event("INFO", f"پلن رایگان فعال شد برای {uid}", uid); await popup(update, context, tr(lang, "free_done", name=plan_txt(p, "name", lang)), alert=True)
     await notify_supers(f"🎁 {esc(uname(u))} (<code>{uid}</code>) پلن رایگان را فعال کرد."); await view_admin_home(update, context)
-
 async def do_request(update, context, pid):
     uid = update.effective_user.id; lang = L(update); p = get_plan(pid)
     if not p: await popup(update, context, tr(lang, "plan_notfound")); return await view_plans(update, context)
@@ -2311,9 +2114,9 @@ async def do_request(update, context, pid):
     d = _applied_disc(context, pid); new_price, _ = _price_text(p, lang, d)
     context.user_data["await"] = {"kind": "receipt", "pid": pid, "back": f"u:plan:{pid}", "disc": d["code"] if d else None, "final": new_price}
     await render(update, context, gtext("pay", lang, plan=esc(plan_txt(p, "name", lang)), price=esc(new_price)) + tr(lang, "receipt_hint"), [[B(tr(lang, "cancel"), "c:cancel")]])
-
 async def view_receipt_ok(update, context): lang = L(update); await render(update, context, tr(lang, "receipt_ok"), [[B(tr(lang, "wait_btn"), "home")]], force_new=True)
-
+# ============================================================
+# پنل مدیر میانی — صفحه‌ی اصلی و پنل کانال
 async def view_admin_home(update, context):
     uid = update.effective_user.id; lang = L(update); lim = admin_limits(uid); use = usage_today(uid); chs = list_channels(uid)
     pname = "∞" if is_super(uid) else (plan_txt(lim["plan"], "name", lang) or tr(lang, "no_plan"))
@@ -2326,7 +2129,6 @@ async def view_admin_home(update, context):
     kb.append([B(tr(lang, "ch_add"), "a:chadd")]); kb.append([B(tr(lang, "my_plan"), "a:plan")])
     if is_super(uid): kb.append([B(tr(lang, "super_panel"), "s:home")])
     await render(update, context, text, kb)
-
 async def view_channel(update, context, cid):
     uid = update.effective_user.id; lang = L(update); ch = channel_owned(cid, uid)
     if not ch: await popup(update, context, tr(lang, "notfound")); return await view_admin_home(update, context)
@@ -2337,12 +2139,12 @@ async def view_channel(update, context, cid):
           [B(tr(lang, "sched"), f"a:sch:{cid}"), B(tr(lang, "queue", n=ready_count(cid)), f"a:que:{cid}")], [B(tr(lang, "rejected"), f"a:rej:{cid}"), B(tr(lang, "lock"), f"a:lock:{cid}")],
           [B(tr(lang, "logs"), f"a:logs:{cid}"), B(tr(lang, "automation", i="🟢" if on else "🔴"), f"a:tog:{cid}:enabled")], [B(tr(lang, "ch_del"), f"a:chdel:{cid}")], [B(tr(lang, "back"), "a:home")]]
     await render(update, context, text, kb)
-
 async def view_lock(update, context, cid):
     lang = L(update); ch = channel_owned(cid, update.effective_user.id)
     if not ch: return await view_admin_home(update, context)
     await render(update, context, tr(lang, "lock_text", title=esc(ch["title"]), code=ch["lock_code"] or regen_lock(cid)), [[B(tr(lang, "lock_regen"), f"a:lockre:{cid}")], [B(tr(lang, "back"), f"a:ch:{cid}")]])
-
+# ============================================================
+# منابع
 async def view_sources(update, context, cid):
     uid = update.effective_user.id; lang = L(update); ch = channel_owned(cid, uid)
     if not ch: return await view_admin_home(update, context)
@@ -2351,7 +2153,6 @@ async def view_sources(update, context, cid):
         tr(lang, "src_line", i="🟢" if s["active"] else "🔴", b="🤖" if (s["bot_active"] is None or s["bot_active"]) else "🚫", host=esc(hostname(s["url"])) + (" 🔌" if _has_api(s) else ""), n=s["found_total"], err=tr(lang, "src_err", n=s["fail_count"]) if s["fail_count"] else "") for s in srcs)
     kb = pairs([B(f"{'🟢' if s['active'] else '🔴'} {hostname(s['url'])[:22]}", f"a:srcv:{s['id']}") for s in srcs]) + [[B(tr(lang, "src_add"), f"a:srca:{cid}")], [B(tr(lang, "back"), f"a:ch:{cid}")]]
     await render(update, context, text, kb)
-
 async def view_source(update, context, sid):
     lang = L(update); s = get_source(sid)
     if not s or (s["admin_id"] != update.effective_user.id and not is_super(update.effective_user.id)): return await view_admin_home(update, context)
@@ -2362,7 +2163,8 @@ async def view_source(update, context, sid):
     kb = [[B(tr(lang, "src_recheck"), f"a:srcr:{sid}")], [B(("🟢 " if s["active"] else "🔴 ") + tr(lang, "tog_ch"), f"a:srct:{sid}"), B(("🟢 " if bot_on else "🔴 ") + tr(lang, "tog_bot"), f"a:srctb:{sid}")],
           [B(tr(lang, "src_api"), f"a:srcapi:{sid}")] + ([B(tr(lang, "src_api_del"), f"a:srcapix:{sid}")] if _has_api(s) else []), [B(tr(lang, "delete"), f"a:srcd:{sid}")], [B(tr(lang, "back"), f"a:src:{s['channel_id']}")]]
     await render(update, context, text, kb)
-
+# ============================================================
+# محتوا، دسته‌ها، معیارها
 async def view_content(update, context, cid):
     uid = update.effective_user.id; lang = L(update); ch = channel_owned(cid, uid)
     if not ch: return await view_admin_home(update, context)
@@ -2373,29 +2175,25 @@ async def view_content(update, context, cid):
           [B(tr(lang, "b_limit", n=s["post_limit"]), f"a:set:{cid}:post_limit"), B(tr(lang, "b_hashtags", i=onoff(s["hashtags"])), f"a:tog:{cid}:hashtags")], [B(tr(lang, "b_link", i=onoff(s["include_link"])), f"a:tog:{cid}:include_link"), B(tr(lang, "b_media", i=onoff(s["include_media"])), f"a:tog:{cid}:include_media")],
           [B(tr(lang, "b_strict", i=onoff(s["strict_ads"])), f"a:tog:{cid}:strict_ads"), B(tr(lang, "b_premium", i=onoff(s["premium_format"])), f"a:tog:{cid}:premium_format")], [B(tr(lang, "back"), f"a:ch:{cid}")]]
     await render(update, context, text, kb)
-
 async def view_cats(update, context, cid):
     lang = L(update); s = get_settings(cid)
     text = tr(lang, "cats_title") + "\n" + "".join(f"\n{c['emoji']} <b>{esc(c['name'])}</b>: {esc(c['style'][:70])}" for c in s["categories"])
     kb = pairs([B(f"{c['emoji']} {c['name'][:18]}", f"a:catv:{cid}:{i}") for i, c in enumerate(s["categories"])]) + [[B(tr(lang, "cat_add"), f"a:cata:{cid}")], [B(tr(lang, "back"), f"a:con:{cid}")]]; await render(update, context, text, kb)
-
 async def view_cat(update, context, cid, i):
     lang = L(update); s = get_settings(cid); c = s["categories"][i] if i < len(s["categories"]) else None
     if not c: return await view_cats(update, context, cid)
     await render(update, context, tr(lang, "cat_view", e=c["emoji"], name=esc(c["name"]), style=esc(c["style"])), [[B(tr(lang, "cat_edit"), f"a:cats:{cid}:{i}"), B(tr(lang, "delete"), f"a:catd:{cid}:{i}")], [B(tr(lang, "back"), f"a:cat:{cid}")]])
-
 async def view_crits(update, context, cid):
     lang = L(update); s = get_settings(cid); tot = sum(float(c["weight"]) for c in s["criteria"]) or 1
     text = tr(lang, "crits_title", m=s["min_score"]) + "\n" + "".join(tr(lang, "crit_line", name=esc(c["name"]), w=c["weight"], p=f"{float(c['weight']) / tot * 100:.0f}") for c in s["criteria"])
     kb = pairs([B(tr(lang, "crit_btn", name=c["name"][:16], w=c["weight"]), f"a:criv:{cid}:{i}") for i, c in enumerate(s["criteria"])]) + [[B(tr(lang, "crit_add"), f"a:cria:{cid}")], [B(tr(lang, "back"), f"a:con:{cid}")]]; await render(update, context, text, kb)
-
 async def view_crit(update, context, cid, i):
     lang = L(update); s = get_settings(cid); c = s["criteria"][i] if i < len(s["criteria"]) else None
     if not c: return await view_crits(update, context, cid)
     await render(update, context, tr(lang, "crit_view", name=esc(c["name"]), w=c["weight"]), [[B(tr(lang, "crit_w"), f"a:criw:{cid}:{i}"), B(tr(lang, "delete"), f"a:crid:{cid}:{i}")], [B(tr(lang, "back"), f"a:cri:{cid}")]])
-
+# ============================================================
+# زمان‌بندی، خاموشی، منطقه‌ی زمانی شهری
 def hour_grid(prefix): return [[B(f"{h:02d}", f"{prefix}:{h}") for h in range(r, r + 6)] for r in range(0, 24, 6)]
-
 async def view_sched(update, context, cid):
     uid = update.effective_user.id; lang = L(update); ch = channel_owned(cid, uid)
     if not ch: return await view_admin_home(update, context)
@@ -2404,16 +2202,15 @@ async def view_sched(update, context, cid):
     kb = [[B(tr(lang, "b_interval", n=s["interval_minutes"]), f"a:set:{cid}:interval_minutes"), B(tr(lang, "b_ppc", n=s["posts_per_cycle"]), f"a:set:{cid}:posts_per_cycle")], [B(tr(lang, "b_lookback", n=s["lookback_hours"]), f"a:set:{cid}:lookback_hours"), B(tr(lang, "b_undated", i=onoff(s["allow_undated"])), f"a:tog:{cid}:allow_undated")],
           [B(tr(lang, "b_quiet"), f"a:quiet:{cid}"), B(tr(lang, "b_tz"), f"a:tz:{cid}")], [B(tr(lang, "b_mode", m=tr(lang, "auto" if s["mode"] == "auto" else "review")), f"a:mode:{cid}")], [B(tr(lang, "back"), f"a:ch:{cid}")]]
     await render(update, context, text, kb)
-
 async def view_quiet(update, context, cid):
     lang = L(update); s = get_settings(cid)
-    await render(update, context, tr(lang, "quiet_pick_start"), hour_grid(f"a:qs:{cid}") + [[B(tr(lang, "quiet_off"), f"a:qoff:{cid}")], [B(tr(lang, "back"), f"a:sch:{cid}")]])
-
+    await render(update, context, tr(lang, "quiet_pick_start", tz=off_label(s["utc_offset"]), loc=local_clock(s["utc_offset"])), hour_grid(f"a:qs:{cid}") + [[B(tr(lang, "quiet_off"), f"a:qoff:{cid}")], [B(tr(lang, "back"), f"a:sch:{cid}")]])
 async def view_tz(update, context, cid):
     lang = L(update); s = get_settings(cid); cur = float(s["utc_offset"]); i = 1 if lang == "en" else 0
     rows = pairs([B(("✅ " if abs(o - cur) < 0.01 else "") + f"{TZ_NAMES[z][i]} {off_label(o)}", f"a:tzs:{cid}:{k}") for k, (z, o) in enumerate(TZ_ZONES)])
     await render(update, context, tr(lang, "tz_pick", utc=utc_clock()), rows + [[B(tr(lang, "back"), f"a:sch:{cid}")]])
-
+# ============================================================
+# صف انتشار و مقالات
 async def view_queue(update, context, cid, status="ready"):
     uid = update.effective_user.id; lang = L(update); ch = channel_owned(cid, uid)
     if not ch: return await view_admin_home(update, context)
@@ -2423,7 +2220,6 @@ async def view_queue(update, context, cid, status="ready"):
     kb = [[B(f"{'⭐' + str(a['score']) if a['score'] else '•'} {(a['title'] or hostname(a['url']))[:35]}", f"a:art:{a['id']}")] for a in arts]
     if status == "ready" and arts: kb.append([B(tr(lang, "pub_first"), f"a:pub:{arts[0]['id']}")])
     kb.append([B(tr(lang, "back"), f"a:ch:{cid}")]); await render(update, context, text, kb)
-
 async def view_article(update, context, aid):
     uid = update.effective_user.id; lang = L(update); a = get_article(aid)
     if not a or (a["admin_id"] != uid and not is_super(uid)): await popup(update, context, tr(lang, "notfound")); return await view_admin_home(update, context)
@@ -2444,21 +2240,21 @@ async def view_article(update, context, aid):
         if a["post_html"]: row.insert(0, B(tr(lang, "art_to_ready"), f"a:artr:{aid}"))
         kb.append(row)
     kb.append([B(tr(lang, "back"), f"a:que:{cid}" if a["status"] in ("ready", "published") else f"a:rej:{cid}")]); await render(update, context, text, kb)
-
+# ============================================================
+# پلن من، لاگ، تست فوری (با محدودیت نرخ)
 async def view_my_plan(update, context):
     uid = update.effective_user.id; lang = L(update); lim = admin_limits(uid); use = usage_today(uid)
     pname = "∞" if is_super(uid) else (plan_txt(lim["plan"], "name", lang) or tr(lang, "no_plan"))
     text = tr(lang, "myplan", name=esc(pname), st=tr(lang, "st_active" if lim["active"] else "st_expired"), exp=tr(lang, "exp_at", d=fmt_date(lim["expires"], admin_offset(uid), True)) if lim["expires"] else "", nxt=("\n" + tr(lang, "plans_next", name=esc(plan_txt(lim["next_plan"], "name", lang)))) if lim["next_plan"] else "",
               p=use["posts"], pc=cap(lim["daily_posts"]), t=use["tests"], tc=cap(lim["daily_tests"]), s=count_sources(uid), sc=cap(lim["max_sources"]), c=len(list_channels(uid)), cc=cap(lim["max_channels"]))
     await render(update, context, text, [[B(tr(lang, "upgrade_btn"), "u:plans")], [B(tr(lang, "back"), "a:home")]])
-
 async def view_logs(update, context, admin_id=None, level=None, back="a:home", refresh="a:logs"):
+    """مدیران فقط ۱۰ مورد آخر را می‌بینند (پیام‌ها پیش از ثبت از نام مدل و Base URL پاک شده‌اند)؛ سوپرادمین ۲۰ مورد."""
     lang = L(update); n = 10 if admin_id else 20; rows = recent_logs(n, admin_id=admin_id, level=level)
     text = tr(lang, "logs_title", lvl=f" · {level}" if level else "") + ("\n".join(f"{'🔴' if r['level'] == 'ERROR' else '🟡' if r['level'] == 'WARN' else '🔵'} <code>{r['ts'][11:16]}</code> {esc(r['msg'][:100])}" for r in rows) or tr(lang, "logs_empty"))
     if admin_id: text += tr(lang, "logs_note")
     kb = [[B(tr(lang, "refresh"), refresh)], [B(tr(lang, "back"), back)]] if admin_id else [[B(tr(lang, "all"), "s:logs:all"), B(tr(lang, "errors"), "s:logs:ERROR"), B(tr(lang, "warns"), "s:logs:WARN")], [B(tr(lang, "back"), back)]]
     await render(update, context, text, kb)
-
 async def run_test(update, context, cid):
     uid = update.effective_user.id; lang = L(update); ch = channel_owned(cid, uid); qy = update.callback_query
     if not ch: return await view_admin_home(update, context)
@@ -2479,758 +2275,673 @@ async def run_test(update, context, cid):
     except Exception as e:
         log_event("ERROR", f"تست کانال {ch['title']}: {e}", uid); d = Diag(); d.add("ai_fail", err=ai_err_text(err_code(e), lang)); res = {"published": 0, "queued": 0, "links": [], "diag": d, "src": ""}
     ok = bool(res["published"] or res.get("queued"))
-    if ok: rate_mark(f"test:{cid}")
-    else: rate_clear(f"test:{cid}")
+    if ok: rate_mark(f"test:{cid}")            # محدودیت زمانی فقط پس از تستِ موفق اعمال می‌شود
+    else: rate_clear(f"test:{cid}")            # تستِ ناموفق ⇒ بدون محدودیت، بلافاصله دوباره قابل اجراست
     diag = esc(res["diag"].render(lang)); kb = []
     src = (res.get("src") or "").strip(); src_line = ("\n" + tr(lang, "test_src", name=esc(src[:60]))) if src else ""
     if res["published"]: text = f"{tr(lang, 'test_ok')}{src_line}\n\n{tr(lang, 'test_log', d=diag)}"; kb.append([U(f"{tr(lang, 'art_view')} {i + 1}", l) for i, l in enumerate(res["links"][:3])])
     elif res.get("queued"): text = f"{tr(lang, 'test_queued')}{src_line}\n\n{tr(lang, 'test_log', d=diag)}"; kb.append([B(tr(lang, "queue", n=ready_count(cid)), f"a:que:{cid}")])
     else: text = f"{tr(lang, 'test_fail')}{src_line}\n\n{tr(lang, 'test_log', d=diag)}\n\n{tr(lang, 'test_retry_note')}"; kb.append([B(tr(lang, "rejected"), f"a:rej:{cid}"), B(tr(lang, "sched"), f"a:sch:{cid}")])
     kb.append([B(tr(lang, "back_panel"), f"a:ch:{cid}")]); await render(update, context, text, kb)
-
+# ---------- پایان پنل مدیر میانی ----------
 # ============================================================
-# پنل مدیریت کلان (Super Admin Views)
+# پنل مدیر کلان، dispatch (با محدودکننده‌ی نرخ)، ورودی‌ها، پشتیبانی، دیپ‌لینک، main
+# ============================================================
+TXT.update({
+    "s_title": ("👑 <b>مدیر کلان</b>\n🤖 مدل‌ها {m} ({ms}) · 👥 مدیران {a} / کاربران {u}\n🛎 پرداخت معلق {p} · 🎟 کد تخفیف {dc} · ⚖️ صف {due}\n💓 {hb}", "👑 <b>Super admin</b>\n🤖 models {m} ({ms}) · 👥 admins {a} / users {u}\n🛎 pending payments {p} · 🎟 discount codes {dc} · ⚖️ queue {due}\n💓 {hb}"),
+    "s_all_ok": ("سالم", "healthy"), "s_down": ("{n} خراب 🔴", "{n} down 🔴"), "s_report": ("📊 گزارش", "📊 Report"), "s_logs": ("📜 لاگ", "📜 Logs"), "s_plans": ("🧾 پلن‌ها", "🧾 Plans"), "s_users": ("👥 کاربران", "👥 Users"),
+    "s_models": ("🤖 مدل‌ها", "🤖 Models"), "s_pays": ("🛎 پرداخت‌ها ({n})", "🛎 Payments ({n})"), "s_discs": ("🎟 کدهای تخفیف", "🎟 Discount codes"), "s_bc": ("📣 همگانی", "📣 Broadcast"), "s_texts": ("📝 متن‌ها", "📝 Texts"),
+    "s_admins": ("🧑‍💼 مدیران", "🧑‍💼 Admins"), "s_auto": ("{i} اتوماسیون کل", "{i} Global automation"), "s_me": ("👤 پنل من", "👤 My panel"), "s_auto_on": ("🟢 اتوماسیون کل روشن شد", "🟢 Global automation on"), "s_auto_off": ("🔴 اتوماسیون کل خاموش شد", "🔴 Global automation off"),
+    "s_plans_title": ("🧾 <b>پلن‌ها</b>", "🧾 <b>Plans</b>"), "s_plan_new": ("➕ پلن", "➕ Plan"), "s_plan_created": ("✅ «{name}» ساخته شد", "✅ “{name}” created"), "s_plan_deleted": ("🗑 پلن حذف شد", "🗑 Plan deleted"),
+    "s_plan_view": ("🧾 <b>{name}</b> / {name_en} {free} {st}\n{desc}\n{desc_en}\n⏳ {days}d · 📢 {posts}/d · 🧪 {tests}/d · 🌐 {src} · 📣 {ch}\n💰 {price} / {price_en}\n👥 {n} کاربر", "🧾 <b>{name}</b> / {name_en} {free} {st}\n{desc}\n{desc_en}\n⏳ {days}d · 📢 {posts}/d · 🧪 {tests}/d · 🌐 {src} · 📣 {ch}\n💰 {price} / {price_en}\n👥 {n} users"),
+    "s_plan_free_set": ("🎁 رایگان شود", "🎁 Make free"), "s_plan_free_done": ("🎁 پلن رایگان تنظیم شد", "🎁 Free plan set"), "s_plan_del": ("🗑 حذف پلن", "🗑 Delete plan"), "s_field_prompt": ("مقدار جدید «{f}»:", "New value for “{f}”:"),
+    "s_discs_title": ("🎟 <b>کدهای تخفیف</b>", "🎟 <b>Discount codes</b>"), "s_disc_new": ("➕ کد", "➕ Code"), "s_disc_line": ("\n{i} <code>{code}</code> −{p}% · تا {exp} · {used}/{max}", "\n{i} <code>{code}</code> −{p}% · until {exp} · {used}/{max}"),
+    "s_disc_view": ("🎟 <code>{code}</code> {st}\n−{p}% · انقضا {exp} · استفاده {used}/{max}", "🎟 <code>{code}</code> {st}\n−{p}% · expires {exp} · used {used}/{max}"), "s_disc_created": ("✅ کد {code} ساخته شد", "✅ Code {code} created"), "s_disc_dup": ("⚠️ کد تکراری یا نامعتبر", "⚠️ Duplicate or invalid code"),
+    "s_disc_exp_bad": ("⚠️ انقضا: عدد روز یا تاریخ YYYY-MM-DD", "⚠️ Expiry: days number or YYYY-MM-DD"), "s_disc_p": ("✏️ درصد", "✏️ Percent"), "s_disc_e": ("✏️ انقضا", "✏️ Expiry"), "s_disc_m": ("✏️ سقف استفاده", "✏️ Max uses"), "s_disc_del": ("🗑 حذف کد", "🗑 Delete code"), "unlimited": ("∞", "∞"),
+    "s_users_title": ("👥 <b>{what}</b> ({n}) · {p}/{pp}", "👥 <b>{what}</b> ({n}) · {p}/{pp}"), "s_users_w": ("کاربران", "Users"), "s_admins_w": ("مدیران", "Admins"), "s_prev": ("⬅️", "⬅️"), "s_next": ("➡️", "➡️"),
+    "s_user_view": ("👤 <b>{name}</b> · <code>{id}</code> · {role} · {ban} · {lang} {prem}\n🧾 {plan} {act}{exp}{nxt}\n📢 امروز {p} پست · {t} تست · 📣 {c} کانال · 🌐 {s} منبع\n📰 ۲۴h: {d} کشف · {pub} منتشر · 🎁 رایگان {free}\n🕐 عضویت {join} · آخرین {seen}", "👤 <b>{name}</b> · <code>{id}</code> · {role} · {ban} · {lang} {prem}\n🧾 {plan} {act}{exp}{nxt}\n📢 today {p} posts · {t} tests · 📣 {c} channels · 🌐 {s} sources\n📰 24h: {d} found · {pub} published · 🎁 free {free}\n🕐 joined {join} · seen {seen}"),
+    "s_ban_y": ("⛔ مسدود", "⛔ banned"), "s_ban_n": ("✅ آزاد", "✅ active"), "s_uplan": ("🧾 تعیین پلن", "🧾 Assign plan"), "s_urevoke": ("❌ لغو پلن", "❌ Revoke plan"), "s_uban": ("⛔ مسدود/آزاد", "⛔ Ban/unban"), "s_umsg": ("✉️ پیام", "✉️ Message"),
+    "s_ureport": ("📊 کانال‌ها", "📊 Channels"), "s_ufree": ("🔁 ریست رایگان", "🔁 Reset free"), "s_utests": ("🧪 ریست تست", "🧪 Reset tests"), "s_uposts": ("📢 ریست پست", "📢 Reset posts"),
+    "s_plan_pick": ("🧾 پلن این کاربر:", "🧾 Plan for this user:"), "s_assigned": ("✅ پلن تا {d} فعال شد", "✅ Plan active until {d}"), "s_assigned_q": ("⏭ پلن بعدی (پس از {d})", "⏭ Queued as next (after {d})"),
+    "s_revoked": ("❌ پلن لغو شد", "❌ Plan revoked"), "s_banned": ("⛔ مسدود شد", "⛔ Banned"), "s_unbanned": ("✅ آزاد شد", "✅ Unbanned"), "s_free_reset": ("🔁 سهمیه‌ی رایگان ریست شد", "🔁 Free quota reset"), "s_tests_reset": ("🧪 تست امروز ریست شد", "🧪 Tests reset"), "s_posts_reset": ("📢 پست امروز ریست شد", "📢 Posts reset"),
+    "s_no_channels": ("کانالی ندارد", "No channels"), "s_pick_channel": ("📢 کانال:", "📢 Channel:"),
+    "s_models_title": ("🤖 <b>مدل‌ها</b>\nبه ترتیب اولویت؛ با خرابی یکی، بعدی استفاده می‌شود. هر سرویس سازگار با OpenAI / Anthropic / Gemini پشتیبانی می‌شود.", "🤖 <b>Models</b>\nUsed in priority order; on failure the next is used. Any OpenAI-compatible / Anthropic / Gemini service is supported."), "s_model_add": ("➕ مدل", "➕ Model"), "s_models_test": ("🧪 تست همه", "🧪 Test all"),
+    "s_model_view": ("🤖 <b>{name}</b> · {kind}\n<code>{model}</code>\n🔗 <code>{base}</code>\n🔑 <code>{key}</code>\n⚙️ اولویت {pr} · دما {temp} · توکن {mx}\n{st} · ✅ {ok} · ⚠️×{fc}\n🕐 موفق {lo} · خطا {lf}{err}", "🤖 <b>{name}</b> · {kind}\n<code>{model}</code>\n🔗 <code>{base}</code>\n🔑 <code>{key}</code>\n⚙️ priority {pr} · temp {temp} · tokens {mx}\n{st} · ✅ {ok} · ⚠️×{fc}\n🕐 ok {lo} · error {lf}{err}"),
+    "s_m_off": ("⏸ خاموش", "⏸ off"), "s_m_ok": ("🟢 سالم", "🟢 healthy"), "s_m_down": ("🔴 خراب", "🔴 down"), "s_model_test": ("🧪 تست", "🧪 Test"), "s_model_del": ("🗑 حذف مدل", "🗑 Delete model"),
+    "s_model_testing": ("🧪 در حال تست…", "🧪 Testing…"), "s_model_res": ("{i} {t}s: {out}", "{i} {t}s: {out}"), "s_model_added": ("✅ مدل «{name}» اضافه شد · {res}", "✅ Model “{name}” added · {res}"), "s_model_need": ("⚠️ Base URL و نام مدل الزامی است", "⚠️ Base URL and model name are required"), "s_model_on": ("🟢 مدل روشن شد", "🟢 Model on"), "s_model_off": ("⏸ مدل خاموش شد", "⏸ Model off"),
+    "s_pays_title": ("🛎 <b>پرداخت‌های معلق</b>", "🛎 <b>Pending payments</b>"), "s_pay_none": ("— خالی —", "— none —"), "s_pay_line": ("\n• #{id} {who} → <b>{plan}</b> · {price} · {t}", "\n• #{id} {who} → <b>{plan}</b> · {price} · {t}"), "s_pay_rc": ("📎 #{id}", "📎 #{id}"),
+    "s_pay_ok": ("✅ تأیید", "✅ Approve"), "s_pay_no": ("❌ رد", "❌ Reject"), "s_pay_done_ok": ("✅ تأیید شد؛ پلن فعال/رزرو شد", "✅ Approved; plan activated/queued"), "s_pay_done_no": ("❌ رد شد", "❌ Rejected"), "s_pay_seen": ("⚠️ قبلاً بررسی شده", "⚠️ Already handled"),
+    "s_pay_new": ("🛎 <b>پرداخت #{id}</b>\n👤 {who} (<code>{uid}</code>)\n🧾 <b>{plan}</b> · 💰 {price}{disc}{note}", "🛎 <b>Payment #{id}</b>\n👤 {who} (<code>{uid}</code>)\n🧾 <b>{plan}</b> · 💰 {price}{disc}{note}"),
+    "s_bc_prompt": ("پیام همگانی (متن/عکس/ویدیو؛ فرمت حفظ می‌شود):", "Broadcast message (text/photo/video; formatting kept):"), "s_bc_confirm": ("📣 ارسال به <b>{n}</b> کاربر؟", "📣 Send to <b>{n}</b> users?"), "s_bc_go": ("✅ ارسال", "✅ Send"), "s_bc_sending": ("📣 ارسال به {n} کاربر…", "📣 Sending to {n} users…"), "s_bc_done": ("📣 موفق {ok} · ناموفق {fail}", "📣 ok {ok} · failed {fail}"),
+    "s_texts_title": ("📝 <b>متن‌ها</b> (فارسی/انگلیسی) · جای‌گذارها: welcome {{name}} · pay {{plan}} {{price}}", "📝 <b>Texts</b> (fa/en) · placeholders: welcome {{name}} · pay {{plan}} {{price}}"), "s_text_prompt": ("متن جدید «{k}» ({lg}):", "New “{k}” text ({lg}):"), "s_text_saved": ("✅ متن ذخیره شد", "✅ Text saved"), "s_text_reset_done": ("↩️ پیش‌فرض شد", "↩️ Reset to default"),
+    "s_umsg_prompt": ("پیام برای این کاربر:", "Message to this user:"), "s_umsg_sent": ("✅ ارسال شد", "✅ Sent"), "s_umsg_head": ("📩 <b>پیام مدیریت:</b>\n\n", "📩 <b>Admin message:</b>\n\n"),
+    "sup_open": ("💬 <b>پشتیبانی</b>\nهر پیامی بفرستید مستقیم به مدیر می‌رسد و پاسخ همین‌جا می‌آید.", "💬 <b>Support</b>\nAny message goes straight to the admin; replies arrive here."), "sup_close": ("❌ پایان گفتگو", "❌ End chat"), "sup_closed": ("✅ گفتگو پایان یافت", "✅ Chat ended"),
+    "sup_reply_head": ("💬 <b>پاسخ پشتیبانی:</b>\n", "💬 <b>Support reply:</b>\n"), "sup_sent": ("✅ ارسال شد", "✅ Sent"), "sup_fail": ("❌ ارسال نشد: {e}", "❌ Not sent: {e}"), "sup_received": ("✅", "✅"),
+    "dl_notfound": ("⚠️ محتوا یافت نشد یا منقضی شده", "⚠️ Content not found or expired"), "dl_source": ("🔗 Source", "🔗 Source"),
+})
+PLAN_FIELDS = [("name", "نام (فا)", "Name (fa)"), ("name_en", "نام (en)", "Name (en)"), ("days", "مدت (روز)", "Days"), ("daily_posts", "پست/روز", "Posts/day"), ("max_sources", "منابع", "Sources"), ("max_channels", "کانال‌ها", "Channels"), ("daily_tests", "تست/روز", "Tests/day"), ("price", "قیمت (فا)", "Price (fa)"), ("price_en", "قیمت (en)", "Price (en)"), ("description", "توضیح (فا)", "Description (fa)"), ("description_en", "توضیح (en)", "Description (en)")]
+MODEL_FIELDS = [("model", "نام مدل", "Model"), ("base_url", "Base URL", "Base URL"), ("api_key", "کلید API", "API key"), ("name", "نام نمایشی", "Display name"), ("priority", "اولویت", "Priority"), ("temperature", "دما (0–2)", "Temperature (0–2)"), ("max_tokens", "حداکثر توکن", "Max tokens")]
+TEXT_KEYS = ["welcome", "help", "about", "pay"]
+def fl(fields, key, lang): return next((f[2] if lang == "en" else f[1] for f in fields if f[0] == key), key)
+# ============================================================
+# پنل مدیر کلان
 async def view_super_home(update, context):
-    uid = update.effective_user.id
-    if not is_super(uid): return await view_user_home(update, context)
-    roles = {r["role"]: r["c"] for r in count_users()}; models = list_models(); ok = sum(1 for m in models if m["active"] and m["status"] == "ok")
-    auto = gget("automation_enabled", True); npay = len(pay_pending())
-    text = (f"👑 <b>مدیریت کلان</b>\n\n{'🟢' if auto else '🔴'} اتوماسیون · 👥 کاربران {sum(roles.values())} (مدیر {roles.get('admin', 0)})\n"
-            f"📢 کانال‌ها {q('SELECT COUNT(*) c FROM channels', one=True)['c']} · 🤖 مدل‌ها {ok}/{len(models)}\n"
-            f"🧾 پلن‌ها {len(list_plans())} · 🛎 پرداخت‌ها {npay} · 🎟 تخفیف‌ها {len(disc_list())}")
-    kb = [[B("📊 گزارش کامل", "s:rep"), B("👥 کاربران", "s:users:0")],
-          [B(f"🛎 پرداخت‌ها ({npay})", "s:pays"), B("🧾 پلن‌ها", "s:plans")],
-          [B(f"🤖 مدل‌های AI ({len(models)})", "s:models"), B("🎟 کدهای تخفیف", "s:discs")],
-          [B("📢 پیام همگانی", "s:bcast"), B("⚙️ متن‌ها و تنظیمات", "s:texts")],
-          [B("📜 لاگ کل سیستم", "s:logs:all"), B(f"{'🔴 توقف' if auto else '🟢 شروع'} اتوماسیون", "s:togauto")],
-          [B("🛠 پنل مدیریت من", "a:home")]]
+    lang = L(update); models = list_models(); down = sum(1 for m in models if m["active"] and m["status"] == "down"); auto = gget("automation_enabled", True); n_pay = len(pay_pending())
+    text = tr(lang, "s_title", m=len(models), ms=tr(lang, "s_all_ok") if not down else tr(lang, "s_down", n=down), a=len(list_users("admin")), u=len(list_users()), p=n_pay, dc=len(disc_list()), due=gget("load_due", 0), hb=ago_text(gget("heartbeat"), lang))
+    kb = [[B(tr(lang, "s_report"), "s:report"), B(tr(lang, "s_logs"), "s:logs:all")], [B(tr(lang, "s_plans"), "s:plans"), B(tr(lang, "s_discs"), "s:discs")], [B(tr(lang, "s_users"), "s:users:0"), B(tr(lang, "s_admins"), "s:admins:0")],
+          [B(tr(lang, "s_models"), "s:models"), B(tr(lang, "s_pays", n=n_pay), "s:pays")], [B(tr(lang, "s_bc"), "s:bc"), B(tr(lang, "s_texts"), "s:texts")], [B(tr(lang, "s_auto", i="🟢" if auto else "🔴"), "s:auto"), B(tr(lang, "s_me"), "a:home")]]
     await render(update, context, text, kb)
-
-async def view_super_users(update, context, page=0):
-    page = int(page); users = list_users(limit=10, offset=page * 10); total = q("SELECT COUNT(*) c FROM users", one=True)["c"]
-    text = f"👥 <b>کاربران</b> ({total} کل)\nصفحه {page + 1} از {max(1, (total + 9) // 10)}\n"
-    btns = []
-    for u in users:
-        p = get_plan(u["plan_id"]) if u["plan_id"] else None
-        pname = f" · {plan_txt(p, 'name', 'fa')}" if p else ""
-        btns.append([B(f"{'🚫 ' if u['banned'] else ''}{uname(u)[:20]}{pname}", f"s:u:{u['id']}")])
-    nav = []
-    if page > 0: nav.append(B("⬅️ قبلی", f"s:users:{page - 1}"))
-    if (page + 1) * 10 < total: nav.append(B("بعدی ➡️", f"s:users:{page + 1}"))
-    if nav: btns.append(nav)
-    btns.append([B("🔙 بازگشت", "s:home")]); await render(update, context, text, btns)
-
-async def view_super_user(update, context, uid):
-    u = get_user(uid)
-    if not u: return await view_super_users(update, context)
-    p = get_plan(u["plan_id"]) if u["plan_id"] else None; np = get_plan(u["next_plan_id"]) if u["next_plan_id"] else None
-    text = (f"👤 <b>{esc(uname(u))}</b> (<code>{uid}</code>)\nنقش: <b>{u['role']}</b> · زبان: {u['lang'] or '—'}\n"
-            f"پلن: <b>{esc(plan_txt(p, 'name', 'fa')) if p else 'بدون پلن'}</b>" + (f" تا {fmt_date(u['plan_expires'], DEFAULT_UTC_OFFSET)}" if u['plan_expires'] else "") + "\n" +
-            (f"پلن بعدی: <b>{esc(plan_txt(np, 'name', 'fa'))}</b>\n" if np else "") +
-            f"کانال‌ها: {len(list_channels(uid))} · منابع: {count_sources(uid)}\nثبت: {fmt_date(u['created_at'], DEFAULT_UTC_OFFSET)}\nوضعیت: {'🚫 مسدود' if u['banned'] else '🟢 فعال'}")
-    kb = [[B("🧾 تخصیص پلن", f"s:usetp:{uid}"), B("🚫 لغو پلن", f"s:uclrp:{uid}")],
-          [B("🟢 رفع انسداد" if u["banned"] else "🚫 مسدود کردن", f"s:uban:{uid}")],
-          [B("👑 ارتقا به کلان" if u["role"] != "super" else "👤 تنزل از کلان", f"s:urole:{uid}")],
-          [B("🔙 بازگشت", "s:users:0")]]
+async def view_s_plans(update, context):
+    lang = L(update); plans = list_plans(active_only=False)
+    text = tr(lang, "s_plans_title") + "\n" + "".join(f"\n{'🟢' if p['active'] else '🔴'}{'🎁' if p['is_free'] else ''} <b>{esc(plan_txt(p, 'name', lang))}</b> · {p['days']}d · {p['daily_posts']}p · {p['max_sources']}s · {p['max_channels']}c · {esc(plan_txt(p, 'price', lang))}" for p in plans)
+    kb = pairs([B(f"{'🟢' if p['active'] else '🔴'} {plan_txt(p, 'name', lang)[:20]}", f"s:plan:{p['id']}") for p in plans]) + [[B(tr(lang, "s_plan_new"), "s:plan_new")], [B(tr(lang, "back"), "s:home")]]; await render(update, context, text, kb)
+async def view_s_plan(update, context, pid):
+    lang = L(update); p = get_plan(pid)
+    if not p: return await view_s_plans(update, context)
+    n = q("SELECT COUNT(*) c FROM users WHERE plan_id=?", (pid,), one=True)["c"]
+    text = tr(lang, "s_plan_view", name=esc(p["name"]), name_en=esc(p["name_en"] or "—"), free="🎁" if p["is_free"] else "", st="🟢" if p["active"] else "🔴", desc=esc(p["description"]), desc_en=esc(p["description_en"] or ""), days=p["days"], posts=p["daily_posts"], tests=p["daily_tests"], src=p["max_sources"], ch=p["max_channels"], price=esc(p["price"]), price_en=esc(p["price_en"] or "—"), n=n)
+    kb = pairs([B(f"✏️ {f[2] if lang == 'en' else f[1]}", f"s:plan_e:{pid}:{f[0]}") for f in PLAN_FIELDS]) + [[B(tr(lang, "toggle"), f"s:plan_t:{pid}"), B(tr(lang, "s_plan_free_set"), f"s:plan_free:{pid}")], [B(tr(lang, "s_plan_del"), f"s:plan_d:{pid}")], [B(tr(lang, "back"), "s:plans")]]
     await render(update, context, text, kb)
-
-async def view_super_plans(update, context):
-    plans = list_plans()
-    text = "🧾 <b>مدیریت پلن‌ها</b>\nبرای مشاهده یا ویرایش، یک پلن را انتخاب کنید:"
-    kb = [[B(f"{'🎁' if p['is_free'] else '⭐'} {p['name']} ({p['days']} روز)", f"s:plan:{p['id']}")] for p in plans]
-    kb.append([B("➕ پلن جدید", "s:plana")]); kb.append([B("🔙 بازگشت", "s:home")]); await render(update, context, text, kb)
-
-async def view_super_plan(update, context, pid):
-    p = get_plan(pid)
-    if not p: return await view_super_plans(update, context)
-    text = (f"🧾 <b>{esc(p['name'])}</b> ({esc(p['name_en'] or '')})\n{esc(p['description'] or '')}\n\n"
-            f"مدت: {p['days']} روز · قیمت: {esc(p['price'] or 'رایگان')}\n"
-            f"پست روزانه: {p['daily_posts']} · تست روزانه: {p['daily_tests']}\n"
-            f"سقف منابع: {p['max_sources']} · سقف کانال‌ها: {p['max_channels']}\nوضعیت: {'🎁 رایگان' if p['is_free'] else '💳 پولی'}")
-    kb = [[B("✏️ تغییر قیمت", f"s:plpr:{pid}"), B("✏️ مدت (روز)", f"s:pldy:{pid}")],
-          [B("🗑 حذف پلن", f"s:pldel:{pid}")], [B("🔙 بازگشت", "s:plans")]]
+def _disc_st(d, lang):
+    _, why = disc_valid(d["code"]); return {"ok": "🟢", "inactive": "⏸", "expired": "⌛", "exhausted": "🔚"}.get(why, "🔴")
+async def view_s_discs(update, context):
+    lang = L(update); ds = disc_list()
+    text = tr(lang, "s_discs_title") + "".join(tr(lang, "s_disc_line", i=_disc_st(d, lang), code=esc(d["code"]), p=d["percent"], exp=fmt_date(d["expires"]) if d["expires"] else "∞", used=d["used"], max=d["max_uses"] or "∞") for d in ds)
+    kb = pairs([B(f"{_disc_st(d, lang)} {d['code'][:18]} −{d['percent']}%", f"s:disc:{d['code']}") for d in ds]) + [[B(tr(lang, "s_disc_new"), "s:disc_new")], [B(tr(lang, "back"), "s:home")]]; await render(update, context, text, kb)
+async def view_s_disc(update, context, code):
+    lang = L(update); d = disc_get(code)
+    if not d: return await view_s_discs(update, context)
+    text = tr(lang, "s_disc_view", code=esc(d["code"]), st=_disc_st(d, lang), p=d["percent"], exp=fmt_date(d["expires"], DEFAULT_UTC_OFFSET, True) if d["expires"] else "∞", used=d["used"], max=d["max_uses"] or "∞")
+    kb = [[B(tr(lang, "s_disc_p"), f"s:disc_e:{code}:percent"), B(tr(lang, "s_disc_e"), f"s:disc_e:{code}:expires")], [B(tr(lang, "s_disc_m"), f"s:disc_e:{code}:max_uses"), B(tr(lang, "toggle"), f"s:disc_t:{code}")], [B(tr(lang, "s_disc_del"), f"s:disc_d:{code}")], [B(tr(lang, "back"), "s:discs")]]
     await render(update, context, text, kb)
-
-async def view_super_models(update, context):
-    models = list_models()
-    text = "🤖 <b>مدل‌های هوش مصنوعی</b>\nترتیب اولویت به صورت آبشاری (Fallback) است:\n"
-    btns = []
-    for i, m in enumerate(models):
-        st = "🟢" if m["status"] == "ok" else "🔴"
-        btns.append([B(f"{i + 1}. {st} {m['model'][:25]}", f"s:mview:{m['id']}")])
-    btns.append([B("➕ افزودن مدل جدید", "s:madd")]); btns.append([B("🔙 بازگشت", "s:home")]); await render(update, context, text, btns)
-
-async def view_super_model(update, context, mid):
-    m = get_model(mid)
-    if not m: return await view_super_models(update, context)
-    text = (f"🤖 <b>{esc(m['model'])}</b>\n"
-            f"Base URL: <code>{esc(m['base_url'])}</code>\n"
-            f"وضعیت: {'🟢 فعال' if m['active'] else '⚪ خاموش'} ({m['status']})\n"
-            f"خطای آخر: <code>{esc((m['last_error'] or '')[:150])}</code>\n"
-            f"بررسی آخر: {ago_text(m['last_check'], 'fa')}")
-    kb = [[B("🔄 تست فوری", f"s:mtest:{mid}"), B("⏯ فعال/غیرفعال", f"s:mtog:{mid}")],
-          [B("⬆️ اولویت بالاتر", f"s:mup:{mid}"), B("⬇️ اولویت پایین‌تر", f"s:mdn:{mid}")],
-          [B("🗑 حذف مدل", f"s:mdel:{mid}")], [B("🔙 بازگشت", "s:models")]]
+async def view_s_users(update, context, page=0, role=None):
+    lang = L(update); users = list_users(role); per = 10; pages = max(1, (len(users) + per - 1) // per); page = max(0, min(page, pages - 1)); chunk = users[page * per:(page + 1) * per]; pre = "admins" if role else "users"
+    def ic(u): return "⛔" if u["banned"] else {"user": "👤", "admin": "🧑‍💼"}.get(u["role"], "👑")
+    text = tr(lang, "s_users_title", what=tr(lang, "s_admins_w" if role else "s_users_w"), n=len(users), p=page + 1, pp=pages) + "\n" + "".join(f"\n{ic(u)} {esc(uname(u))} · {esc(plan_txt(admin_limits(u['id'])['plan'], 'name', lang) or tr(lang, 'no_plan'))}{' 🟢' if admin_limits(u['id'])['active'] else ''}" for u in chunk)
+    kb = pairs([B(f"{ic(u)} {uname(u)[:22]}", f"s:user:{u['id']}") for u in chunk]); nav = []
+    if page > 0: nav.append(B(tr(lang, "s_prev"), f"s:{pre}:{page - 1}"))
+    if page + 1 < pages: nav.append(B(tr(lang, "s_next"), f"s:{pre}:{page + 1}"))
+    if nav: kb.append(nav)
+    kb.append([B(tr(lang, "back"), "s:home")]); await render(update, context, text, kb)
+async def view_s_user(update, context, tid):
+    lang = L(update); u = get_user(tid)
+    if not u: return await view_s_users(update, context)
+    lim = admin_limits(tid); use = usage_today(tid); off = admin_offset(tid)
+    text = tr(lang, "s_user_view", name=esc(uname(u)), id=tid, role=u["role"], ban=tr(lang, "s_ban_y" if u["banned"] else "s_ban_n"), lang=u["lang"] or "—", prem="💎" if u["premium"] else "", plan=esc(plan_txt(lim["plan"], "name", lang) or tr(lang, "no_plan")), act="🟢" if lim["active"] else "🔴", exp=tr(lang, "until", d=fmt_date(lim["expires"], off)) if lim["expires"] else "",
+              nxt=("\n" + tr(lang, "plans_next", name=esc(plan_txt(lim["next_plan"], "name", lang)))) if lim["next_plan"] else "", p=use["posts"], t=use["tests"], c=len(list_channels(tid)), s=count_sources(tid), d=count_articles(tid, 24), pub=count_articles(tid, 24, "published"), free=onoff(u["free_used"]), join=(u["created_at"] or "")[:10], seen=ago_text(u["last_seen"], lang))
+    kb = [[B(tr(lang, "s_uplan"), f"s:uplan:{tid}"), B(tr(lang, "s_urevoke"), f"s:urevoke:{tid}")], [B(tr(lang, "s_uban"), f"s:uban:{tid}"), B(tr(lang, "s_umsg"), f"s:umsg:{tid}")], [B(tr(lang, "s_ureport"), f"s:ureport:{tid}"), B(tr(lang, "s_ufree"), f"s:ufree:{tid}")], [B(tr(lang, "s_utests"), f"s:utests:{tid}"), B(tr(lang, "s_uposts"), f"s:uposts:{tid}")], [B(tr(lang, "back"), "s:users:0")]]
     await render(update, context, text, kb)
-
-async def view_super_discs(update, context):
-    discs = disc_list()
-    text = f"🎟 <b>کدهای تخفیف</b> ({len(discs)})\n\n" + "".join(
-        f"• <code>{esc(d['code'])}</code>: −{d['percent']}% (مصرف {d['used_count']}/{d['max_uses'] or '∞'})\n" for d in discs[:15])
-    kb = [[B("➕ کد جدید", "s:disca")], [B("🔙 بازگشت", "s:home")]]
+def _mic(m): return "⏸" if not m["active"] else "🟢" if m["status"] == "ok" else "🔴"
+async def view_s_models(update, context):
+    lang = L(update); ms = list_models()
+    text = tr(lang, "s_models_title") + "\n" + "".join(f"\n{_mic(m)} <b>{esc(m['name'])}</b> · <code>{esc(m['model'])}</code> · p{m['priority']} · ✅{m['ok_count']}" for m in ms)
+    kb = pairs([B(f"{_mic(m)} {m['name'][:20]} (p{m['priority']})", f"s:model:{m['id']}") for m in ms]) + [[B(tr(lang, "s_model_add"), "s:model_add"), B(tr(lang, "s_models_test"), "s:models_test")], [B(tr(lang, "back"), "s:home")]]; await render(update, context, text, kb)
+async def view_s_model(update, context, mid):
+    lang = L(update); m = get_model(mid)
+    if not m: return await view_s_models(update, context)
+    key = m["api_key"] or ""; masked = (key[:5] + "…" + key[-4:]) if len(key) > 12 else "—"
+    text = tr(lang, "s_model_view", name=esc(m["name"]), kind=m["kind"], model=esc(m["model"]), base=esc(m["base_url"]), key=esc(masked), pr=m["priority"], temp=m["temperature"], mx=m["max_tokens"], st=tr(lang, "s_m_off" if not m["active"] else "s_m_ok" if m["status"] == "ok" else "s_m_down"), ok=m["ok_count"], fc=m["fail_count"], lo=ago_text(m["last_ok"], lang), lf=ago_text(m["last_fail"], lang), err=f"\n<code>{esc((m['last_error'] or '')[:150])}</code>" if m["last_error"] else "")
+    kb = [[B(tr(lang, "s_model_test"), f"s:model_test:{mid}"), B(tr(lang, "toggle"), f"s:model_t:{mid}")]] + pairs([B(f"✏️ {f[2] if lang == 'en' else f[1]}", f"s:model_e:{mid}:{f[0]}") for f in MODEL_FIELDS]) + [[B(tr(lang, "s_model_del"), f"s:model_d:{mid}")], [B(tr(lang, "back"), "s:models")]]
     await render(update, context, text, kb)
-
-async def view_super_pays(update, context):
-    pays = pay_pending()
-    text = f"🛎 <b>درخواست‌های پرداخت معلق</b> ({len(pays)})\n"
-    btns = []
-    for py in pays:
-        u = get_user(py["user_id"]); p = get_plan(py["plan_id"])
-        btns.append([B(f"{uname(u)[:15]} · {plan_txt(p, 'name', 'fa') if p else '—'}", f"s:payv:{py['id']}")])
-    btns.append([B("🔙 بازگشت", "s:home")]); await render(update, context, text, btns)
-
-async def view_super_pay(update, context, pid):
-    py = q("SELECT * FROM payments WHERE id=?", (pid,), one=True)
-    if not py: return await view_super_pays(update, context)
-    u = get_user(py["user_id"]); p = get_plan(py["plan_id"])
-    text = (f"🛎 <b>رسید پرداخت #{py['id']}</b>\n"
-            f"کاربر: {esc(uname(u))} (<code>{py['user_id']}</code>)\n"
-            f"پلن: <b>{esc(plan_txt(p, 'name', 'fa') if p else '—')}</b>\n"
-            f"کد تخفیف: <code>{esc(py['discount_code'] or '—')}</code>\n"
-            f"مبلغ نهایی: <b>{esc(py['final_price'] or '—')}</b>\n"
-            f"زمان ارسال: {fmt_date(py['created_at'], DEFAULT_UTC_OFFSET, True)}")
-    kb = [[B("✅ تأیید پرداخت", f"s:payok:{pid}"), B("❌ رد پرداخت", f"s:payno:{pid}")], [B("🔙 بازگشت", "s:pays")]]
-    if py["receipt_file_id"]:
-        try: await update.effective_chat.send_photo(py["receipt_file_id"], caption=text, reply_markup=kbm(kb), parse_mode=HTML); return
-        except Exception as e: log.warning(f"send receipt photo: {e}")
-    await render(update, context, text + f"\n\nیادداشت/متن:\n<code>{esc(py['receipt_text'] or '—')}</code>", kb)
-
-async def view_super_texts(update, context):
-    text = "⚙️ <b>تنظیمات و پیام‌های سیستمی</b>\nبرای ویرایش هر پیام، کلید مربوطه را انتخاب کنید:"
-    kb = [[B("📝 متن خوش‌آمدگویی", "s:tedit:welcome"), B("💳 راهنمای کارت/پرداخت", "s:tedit:pay")],
-          [B("📞 پشتیبانی /man", "s:tedit:support"), B("🔙 بازگشت", "s:home")]]
-    await render(update, context, text, kb)
-
+async def view_s_pays(update, context):
+    lang = L(update); ps = pay_pending()
+    text = tr(lang, "s_pays_title") + ("".join(tr(lang, "s_pay_line", id=r["id"], who=esc(("@" + r["username"]) if r["username"] else (r["name"] or r["user_id"])), plan=esc(r["plan_name"]), price=esc(r["final_price"] or r["plan_price"]), t=r["created_at"][5:16]) for r in ps) or "\n" + tr(lang, "s_pay_none"))
+    kb = [[B(tr(lang, "s_pay_rc", id=r["id"]), f"s:pay_rc:{r['id']}"), B(tr(lang, "s_pay_ok"), f"s:pay_ok:{r['id']}:l"), B(tr(lang, "s_pay_no"), f"s:pay_no:{r['id']}:l")] for r in ps] + [[B(tr(lang, "back"), "s:home")]]; await render(update, context, text, kb)
+async def view_s_texts(update, context):
+    lang = L(update); text = tr(lang, "s_texts_title") + "\n"
+    for k in TEXT_KEYS: text += f"\n<b>{k}</b>\n🇮🇷 <i>{esc(strip_tags(gtext(k, 'fa'))[:60])}…</i>\n🇬🇧 <i>{esc(strip_tags(gtext(k, 'en'))[:60])}…</i>"
+    kb = [[B(f"✏️ {k} 🇮🇷", f"s:txt:{k}:fa"), B(f"✏️ {k} 🇬🇧", f"s:txt:{k}:en"), B("↩️🇮🇷", f"s:txtr:{k}:fa"), B("↩️🇬🇧", f"s:txtr:{k}:en")] for k in TEXT_KEYS] + [[B(tr(lang, "back"), "s:home")]]; await render(update, context, text, kb)
+async def decide_pay(update, context, rid, approve, from_list):
+    lang = L(update); r = pay_get(rid)
+    if not r or r["status"] != "pending": await popup(update, context, tr(lang, "s_pay_seen")); return await view_s_pays(update, context) if from_list else None
+    ul = user_lang(r["user_id"]) or "fa"; p = get_plan(r["plan_id"])
+    if approve:
+        exp, queued = assign_plan(r["user_id"], r["plan_id"]); pay_set(rid, "approved")
+        if r["discount"]: disc_use(r["discount"])
+        await notify_user_fn(r["user_id"], tr(ul, "pay_approved", name=esc(plan_txt(p, "name", ul)), when=tr(ul, "pay_when_queued" if queued else "pay_when_now", d=fmt_date(exp, admin_offset(r["user_id"]))))); await popup(update, context, tr(lang, "s_pay_done_ok"))
+    else: pay_set(rid, "rejected"); await notify_user_fn(r["user_id"], tr(ul, "pay_rejected")); await popup(update, context, tr(lang, "s_pay_done_no"))
+    log_event("INFO", f"پرداخت #{rid} {'تأیید' if approve else 'رد'} شد", update.effective_user.id)
+    if from_list: return await view_s_pays(update, context)
+    try: await update.callback_query.edit_message_reply_markup(None)
+    except Exception: pass
 # ============================================================
-# پردازش رویدادهای تلگرام (Handlers & Dispatchers)
-async def on_callback(update, context):
-    qy = update.callback_query; data = qy.data; uid = update.effective_user.id; lang = L(update)
-    if is_banned(uid): return await popup(update, context, tr(lang, "banned"), alert=True)
-    if not rate_free(f"cb:{uid}", 0.3): return await popup(update, context, tr(lang, "busy_click"))
-    rate_mark(f"cb:{uid}")
-
-    if data == "noop":
-        try: await qy.answer()
+# dispatch
+async def dispatch(update, context, data):
+    uid = update.effective_user.id; lang = L(update); p = data.split(":"); a = p[0]; b = p[1] if len(p) > 1 else ""; c = p[2] if len(p) > 2 else ""; d = p[3] if len(p) > 3 else ""; ud = context.user_data
+    if data == "noop": return
+    if a == "lang": return await set_language(update, context, b)
+    if not user_lang(uid): return await view_lang(update, context)
+    if data == "home": return await go_home(update, context)
+    if data == "c:cancel": st = ud.pop("await", None); await popup(update, context, tr(lang, "cancelled")); return await dispatch(update, context, (st or {}).get("back", "home"))
+    # ---------------- کاربر
+    if a == "u":
+        if b == "plans": return await view_plans(update, context)
+        if b == "plan": return await view_plan(update, context, int(c))
+        if b == "free": return await do_free(update, context, int(c))
+        if b == "req": return await do_request(update, context, int(c))
+        if b == "disc": return await ask(update, context, tr(lang, "disc_prompt"), "disc", f"u:plan:{c}", pid=int(c))
+        if b == "discx": ud.setdefault("disc", {}).pop(c, None); return await view_plan(update, context, int(c))
+        if b == "man_close": support_close(uid); return await render(update, context, tr(lang, "sup_closed"), [[B(tr(lang, "home"), "home")]])
+        return await go_home(update, context)
+    # ---------------- مدیر میانی
+    if a == "a":
+        if not can_admin(uid): await popup(update, context, tr(lang, "no_admin"), alert=True); return await view_plans(update, context)
+        lim = admin_limits(uid)
+        if b == "home": return await view_admin_home(update, context)
+        if b == "plan": return await view_my_plan(update, context)
+        if b == "logs":
+            if c.lstrip("-").isdigit() and channel_owned(int(c), uid): return await view_logs(update, context, admin_id=uid, back=f"a:ch:{c}", refresh=f"a:logs:{c}")
+            return await view_logs(update, context, admin_id=uid)
+        if b == "chadd":
+            if lim["max_channels"] is not None and len(list_channels(uid)) >= lim["max_channels"]: await popup(update, context, tr(lang, "limit_channels", n=lim["max_channels"]), alert=True); return await view_admin_home(update, context)
+            return await ask(update, context, tr(lang, "ch_add_prompt"), "ch_add", "a:home")
+        if b in ("srcv", "srct", "srctb", "srcd", "srcr", "srcapi", "srcapix"):
+            sid = int(c); s = get_source(sid)
+            if not s or (s["admin_id"] != uid and not is_super(uid)): await popup(update, context, tr(lang, "notfound")); return await view_admin_home(update, context)
+            if b == "srcv": return await view_source(update, context, sid)
+            if b == "srct": on = toggle_source(sid, s["admin_id"], "active"); await popup(update, context, tr(lang, "src_ch_on" if on else "src_ch_off")); return await view_source(update, context, sid)
+            if b == "srctb": on = toggle_source(sid, s["admin_id"], "bot_active"); await popup(update, context, tr(lang, "src_bot_on" if on else "src_bot_off")); return await view_source(update, context, sid)
+            if b == "srcapi": return await ask(update, context, tr(lang, "src_api_url"), "src_api_url", f"a:srcv:{sid}", sid=sid)
+            if b == "srcapix": set_source_api(sid, "", "", ""); await popup(update, context, tr(lang, "src_api_del")); return await view_source(update, context, sid)
+            if b == "srcr":
+                if not is_super(uid) and not rate_free(f"srcr:{sid}", 60): await popup(update, context, tr(lang, "test_wait", n=rate_left(f"srcr:{sid}", 60)), alert=True); return await view_source(update, context, sid)
+                await render(update, context, tr(lang, "src_checking"))
+                ok, msg = await probe_source(s, lang)
+                if ok: rate_mark(f"srcr:{sid}")
+                else: rate_clear(f"srcr:{sid}")
+                await popup(update, context, msg, alert=True); return await view_source(update, context, sid)
+            del_source(sid, s["admin_id"]); await popup(update, context, tr(lang, "src_deleted")); return await view_sources(update, context, s["channel_id"])
+        if b in ("art", "arte", "artd", "artr", "artf", "pub"):
+            aid = int(c); art = get_article(aid)
+            if not art or (art["admin_id"] != uid and not is_super(uid)): await popup(update, context, tr(lang, "notfound")); return await view_admin_home(update, context)
+            cid = art["channel_id"]
+            if b == "art": return await view_article(update, context, aid)
+            if b == "arte": return await ask(update, context, tr(lang, "art_edit_prompt"), "art_edit", f"a:art:{aid}", aid=aid)
+            if b == "artd": delete_article(aid, art["admin_id"]); await popup(update, context, tr(lang, "deleted")); return await view_queue(update, context, cid, "ready" if art["status"] in ("ready", "published") else "rejected")
+            if b == "artr": article_update(aid, status="ready", reason=""); await popup(update, context, tr(lang, "art_moved")); return await view_article(update, context, aid)
+            if b == "artf":
+                if art["full_html"]:
+                    fv = art["full_html"]
+                    if len(fv) > BOT_FULL_MAX: fv, _ = fit_html(fv, BOT_FULL_MAX, True)
+                    for chunk in split_html(tr(lang, "full_head") + fv): await context.bot.send_message(uid, chunk, parse_mode=HTML, disable_web_page_preview=True)
+                return await view_article(update, context, aid)
+            if b == "pub":
+                rem = remaining(uid, "posts")
+                if rem is not None and rem <= 0: await popup(update, context, tr(lang, "limit_posts", n=lim["daily_posts"]), alert=True); return await view_queue(update, context, cid)
+                if ch_lock(cid).locked(): await popup(update, context, tr(lang, "test_busy"), alert=True); return await view_queue(update, context, cid)
+                await render(update, context, tr(lang, "publishing"))
+                async with ch_lock(cid): ok, out = await publish_article(context.bot, aid)
+                await popup(update, context, tr(lang, "published_ok") if ok else tr(lang, "pub_failed", e=_pub_err(out, lang)), alert=not ok); return await view_queue(update, context, cid)
+        cid = int(c) if c.lstrip("-").isdigit() else 0; ch = channel_owned(cid, uid)
+        if not ch: await popup(update, context, tr(lang, "notfound")); return await view_admin_home(update, context)
+        s = get_settings(cid)
+        if b == "ch": return await view_channel(update, context, cid)
+        if b == "rep": return await render(update, context, report_text(uid, cid, lang), [[B(tr(lang, "refresh"), f"a:rep:{cid}")], [B(tr(lang, "back"), f"a:ch:{cid}")]])
+        if b == "test": return await run_test(update, context, cid)
+        if b == "lock": return await view_lock(update, context, cid)
+        if b == "lockre": return await render(update, context, tr(lang, "lock_reset_q"), [[B(tr(lang, "yes"), f"a:lockre2:{cid}"), B(tr(lang, "no"), f"a:lock:{cid}")]])
+        if b == "lockre2":
+            code, n = reset_channel_link(cid); log_event("WARN", f"ریست امنیتی کانال {ch['title']}", uid)
+            await popup(update, context, tr(lang, "lock_reset_ok", n=n), alert=True); return await view_lock(update, context, cid)
+        if b == "chdel": return await render(update, context, tr(lang, "ch_del_q", title=esc(ch["title"])), [[B(tr(lang, "yes"), f"a:chdel2:{cid}"), B(tr(lang, "no"), f"a:ch:{cid}")]])
+        if b == "chdel2": del_channel(cid, ch["admin_id"]); await popup(update, context, tr(lang, "ch_deleted")); return await view_admin_home(update, context)
+        if b == "tog":
+            new = not s.get(d); update_settings(cid, **{d: new})
+            if d == "enabled": await popup(update, context, tr(lang, "tog_enabled" if new else "tog_disabled")); return await view_channel(update, context, cid)
+            if d == "premium_format" and new and not getattr(update.effective_user, "is_premium", False):
+                update_settings(cid, premium_format=False); await popup(update, context, tr(lang, "prem_need_prem"), alert=True)
+            elif d == "premium_format" and new: await popup(update, context, tr(lang, "prem_on_ok"), alert=True)
+            else: await popup(update, context, f"{tr(lang, 'tog_' + d)}: {'✅' if new else '⛔'}\n{tr(lang, 'togd_' + d)}")
+            return await (view_sched if d == "allow_undated" else view_content)(update, context, cid)
+        if b == "set": return await ask(update, context, f"{FIELD_LABEL[d][1 if lang == 'en' else 0]}\n<code>{esc(strip_tags(str(s.get(d)))[:3500])}</code>", "field", f"a:sch:{cid}" if d in SCHED_FIELDS else f"a:con:{cid}", cid=cid, field=d)
+        if b == "mode": new = "review" if s["mode"] == "auto" else "auto"; update_settings(cid, mode=new); await popup(update, context, tr(lang, "mode_set_auto" if new == "auto" else "mode_set_review")); return await view_sched(update, context, cid)
+        if b == "sch": return await view_sched(update, context, cid)
+        if b == "quiet": return await view_quiet(update, context, cid)
+        if b == "qs": ud["qs"] = int(d); return await render(update, context, tr(lang, "quiet_pick_end", h=f"{int(d):02d}"), hour_grid(f"a:qe:{cid}") + [[B(tr(lang, "back"), f"a:quiet:{cid}")]])
+        if b == "qe": a0 = ud.pop("qs", 0); update_settings(cid, quiet_start=a0, quiet_end=int(d)); await popup(update, context, tr(lang, "quiet_set", a=f"{a0:02d}", b=f"{int(d):02d}")); return await view_sched(update, context, cid)
+        if b == "qoff": update_settings(cid, quiet_start=None, quiet_end=None); await popup(update, context, tr(lang, "quiet_cleared")); return await view_sched(update, context, cid)
+        if b == "tz": return await view_tz(update, context, cid)
+        if b == "tzs": z, off = TZ_ZONES[int(d)]; update_settings(cid, utc_offset=off); await popup(update, context, tr(lang, "tz_set", city=tz_city(off, lang), tz=off_label(off), loc=local_clock(off))); return await view_sched(update, context, cid)
+        if b == "con": return await view_content(update, context, cid)
+        if b == "cat": return await view_cats(update, context, cid)
+        if b == "cata": return await wiz_start(update, context, "cat_add", f"a:cat:{cid}", cid=cid)
+        if b == "catv": return await view_cat(update, context, cid, int(d))
+        if b == "cats": return await ask(update, context, tr(lang, "cat_style_prompt"), "cat_style", f"a:cat:{cid}", cid=cid, idx=int(d))
+        if b == "catd":
+            cats = s["categories"]; i = int(d)
+            if i < len(cats) and len(cats) > 1: cats.pop(i); update_settings(cid, categories=cats); await popup(update, context, tr(lang, "deleted"))
+            else: await popup(update, context, tr(lang, "cat_min"), alert=True)
+            return await view_cats(update, context, cid)
+        if b == "cri": return await view_crits(update, context, cid)
+        if b == "cria": return await wiz_start(update, context, "crit_add", f"a:cri:{cid}", cid=cid)
+        if b == "criv": return await view_crit(update, context, cid, int(d))
+        if b == "criw": return await ask(update, context, tr(lang, "crit_w_prompt"), "crit_weight", f"a:cri:{cid}", cid=cid, idx=int(d))
+        if b == "crid":
+            cr = s["criteria"]; i = int(d)
+            if i < len(cr) and len(cr) > 1: cr.pop(i); update_settings(cid, criteria=cr); await popup(update, context, tr(lang, "deleted"))
+            else: await popup(update, context, tr(lang, "crit_min"), alert=True)
+            return await view_crits(update, context, cid)
+        if b == "src": return await view_sources(update, context, cid)
+        if b == "srca":
+            if lim["max_sources"] is not None and count_sources(uid) >= lim["max_sources"]: await popup(update, context, tr(lang, "limit_sources", n=lim["max_sources"]), alert=True); return await view_sources(update, context, cid)
+            return await ask(update, context, tr(lang, "src_add_prompt"), "src_add", f"a:src:{cid}", cid=cid)
+        if b == "que": return await view_queue(update, context, cid, "ready")
+        if b == "rej": return await view_queue(update, context, cid, "rejected")
+        return await view_channel(update, context, cid)
+    # ---------------- مدیر کلان
+    if a == "s":
+        if not is_super(uid): return
+        if b == "home": return await view_super_home(update, context)
+        if b == "report": return await render(update, context, report_text(None, None, lang), [[B(tr(lang, "refresh"), "s:report")], [B(tr(lang, "back"), "s:home")]])
+        if b == "logs": return await view_logs(update, context, level=None if c == "all" else c, back="s:home")
+        if b == "auto": new = not gget("automation_enabled", True); gset("automation_enabled", new); await popup(update, context, tr(lang, "s_auto_on" if new else "s_auto_off")); return await view_super_home(update, context)
+        if b == "texts": return await view_s_texts(update, context)
+        if b == "txt": return await ask(update, context, tr(lang, "s_text_prompt", k=c, lg=d), "gtext", "s:texts", key=c, lg=d)
+        if b == "txtr": gtext_set(c, d, ""); await popup(update, context, tr(lang, "s_text_reset_done")); return await view_s_texts(update, context)
+        if b == "bc": return await ask(update, context, tr(lang, "s_bc_prompt"), "bc", "s:home")
+        if b == "bc_go":
+            src = ud.pop("bc_src", None)
+            if not src: return await view_super_home(update, context)
+            users = list_users(); ok = fail = 0; await render(update, context, tr(lang, "s_bc_sending", n=len(users)))
+            for u in users:
+                try: await context.bot.copy_message(u["id"], src[0], src[1]); ok += 1
+                except RetryAfter as e: await asyncio.sleep(float(e.retry_after) + 1); fail += 1
+                except Exception: fail += 1
+                await asyncio.sleep(.06)
+            await popup(update, context, tr(lang, "s_bc_done", ok=ok, fail=fail)); return await view_super_home(update, context)
+        if b == "plans": return await view_s_plans(update, context)
+        if b == "plan": return await view_s_plan(update, context, int(c))
+        if b == "plan_new": return await wiz_start(update, context, "plan_new", "s:plans")
+        if b == "plan_e": return await ask(update, context, tr(lang, "s_field_prompt", f=fl(PLAN_FIELDS, d, lang)), "plan_field", f"s:plan:{c}", pid=int(c), field=d)
+        if b == "plan_t": pl = get_plan(int(c)); update_plan(int(c), active=0 if pl["active"] else 1); await popup(update, context, tr(lang, "saved")); return await view_s_plan(update, context, int(c))
+        if b == "plan_free": q("UPDATE plans SET is_free=0", commit=True); update_plan(int(c), is_free=1); await popup(update, context, tr(lang, "s_plan_free_done")); return await view_s_plan(update, context, int(c))
+        if b == "plan_d": delete_plan(int(c)); await popup(update, context, tr(lang, "s_plan_deleted")); return await view_s_plans(update, context)
+        if b == "discs": return await view_s_discs(update, context)
+        if b == "disc_new": return await wiz_start(update, context, "disc_add", "s:discs")
+        if b == "disc": return await view_s_disc(update, context, c)
+        if b == "disc_e": return await ask(update, context, tr(lang, "s_field_prompt", f=d), "disc_field", f"s:disc:{c}", code=c, field=d)
+        if b == "disc_t": dd = disc_get(c); disc_update(c, active=0 if dd and dd["active"] else 1); await popup(update, context, tr(lang, "saved")); return await view_s_disc(update, context, c)
+        if b == "disc_d": disc_delete(c); await popup(update, context, tr(lang, "deleted")); return await view_s_discs(update, context)
+        if b == "users": return await view_s_users(update, context, int(c or 0))
+        if b == "admins": return await view_s_users(update, context, int(c or 0), role="admin")
+        if b == "user": return await view_s_user(update, context, int(c))
+        tid = int(c) if c.lstrip("-").isdigit() else 0
+        if b == "uplan": return await render(update, context, tr(lang, "s_plan_pick"), pairs([B(f"{plan_txt(pl, 'name', lang)} ({pl['days']}d)", f"s:uassign:{tid}:{pl['id']}") for pl in list_plans(False)]) + [[B(tr(lang, "back"), f"s:user:{tid}")]])
+        if b == "uassign":
+            exp, queued = assign_plan(tid, int(d)); pl = get_plan(int(d)); ul = user_lang(tid) or "fa"; ds = fmt_date(exp, admin_offset(tid))
+            await notify_user_fn(tid, tr(ul, "pay_approved", name=esc(plan_txt(pl, "name", ul)), when=tr(ul, "pay_when_queued" if queued else "pay_when_now", d=ds)))
+            await popup(update, context, tr(lang, "s_assigned_q" if queued else "s_assigned", d=ds)); return await view_s_user(update, context, tid)
+        if b == "urevoke": revoke_plan(tid); await popup(update, context, tr(lang, "s_revoked")); return await view_s_user(update, context, tid)
+        if b == "uban": q("UPDATE users SET banned=1-banned WHERE id=?", (tid,), commit=True); await popup(update, context, tr(lang, "s_banned" if get_user(tid)["banned"] else "s_unbanned")); return await view_s_user(update, context, tid)
+        if b == "ufree": q("UPDATE users SET free_used=0 WHERE id=?", (tid,), commit=True); await popup(update, context, tr(lang, "s_free_reset")); return await view_s_user(update, context, tid)
+        if b == "utests": usage_reset(tid, "tests"); await popup(update, context, tr(lang, "s_tests_reset")); return await view_s_user(update, context, tid)
+        if b == "uposts": usage_reset(tid, "posts"); await popup(update, context, tr(lang, "s_posts_reset")); return await view_s_user(update, context, tid)
+        if b == "umsg": return await ask(update, context, tr(lang, "s_umsg_prompt"), "umsg", f"s:user:{tid}", target=tid)
+        if b == "ureport":
+            chs = list_channels(tid)
+            if not chs: await popup(update, context, tr(lang, "s_no_channels")); return await view_s_user(update, context, tid)
+            return await render(update, context, tr(lang, "s_pick_channel"), pairs([B(f"📣 {x['title'][:22]}", f"s:urep:{tid}:{x['id']}") for x in chs]) + [[B(tr(lang, "back"), f"s:user:{tid}")]])
+        if b == "urep": return await render(update, context, report_text(tid, int(d), lang), [[B(tr(lang, "back"), f"s:ureport:{tid}")]])
+        if b == "models": return await view_s_models(update, context)
+        if b == "model": return await view_s_model(update, context, int(c))
+        if b == "model_add": return await wiz_start(update, context, "model_add", "s:models")
+        if b == "model_t": m = get_model(int(c)); update_model(int(c), active=0 if m["active"] else 1, status="ok", fail_count=0); await popup(update, context, tr(lang, "s_model_off" if m["active"] else "s_model_on")); return await view_s_model(update, context, int(c))
+        if b == "model_d": delete_model(int(c)); await popup(update, context, tr(lang, "deleted")); return await view_s_models(update, context)
+        if b == "model_e": return await ask(update, context, tr(lang, "s_field_prompt", f=fl(MODEL_FIELDS, d, lang)), "model_field", f"s:model:{c}", mid=int(c), field=d)
+        if b == "model_test":
+            await render(update, context, tr(lang, "s_model_testing")); ok, out, t = await test_model(int(c)); await popup(update, context, tr(lang, "s_model_res", i="✅" if ok else "❌", t=t, out=out[:120]), alert=True); return await view_s_model(update, context, int(c))
+        if b == "models_test":
+            await render(update, context, tr(lang, "s_model_testing")); res = []
+            for m in list_models(): ok, out, t = await test_model(m["id"]); res.append(f"{'✅' if ok else '❌'} {esc(m['name'])} ({t}s)" + ("" if ok else f": {esc(out[:60])}"))
+            ud["notice"] = "\n".join(res) or "—"; return await view_s_models(update, context)
+        if b == "pays": return await view_s_pays(update, context)
+        if b == "pay_rc":
+            r = pay_get(int(c))
+            if r and r["receipt_msg"]:
+                try: await context.bot.copy_message(uid, r["receipt_chat"], r["receipt_msg"])
+                except Exception as e: await popup(update, context, str(e)[:100])
+            return await view_s_pays(update, context)
+        if b in ("pay_ok", "pay_no"): return await decide_pay(update, context, int(c), b == "pay_ok", d == "l")
+        return await view_super_home(update, context)
+    return await go_home(update, context)
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    qy = update.callback_query; u = update.effective_user; context.user_data["_answered"] = False
+    if not rate_ok(f"cb:{u.id}", CB_RATE):
+        try: await qy.answer(tr(user_lang(u.id) or "fa", "busy_click"))
         except Exception: pass
         return
-    if data == "home": return await go_home(update, context)
-    if data.startswith("lang:"): return await set_language(update, context, data.split(":")[1])
-
-    # User flows
-    if data == "u:plans": return await view_plans(update, context)
-    if data.startswith("u:plan:"): return await view_plan(update, context, int(data.split(":")[2]))
-    if data.startswith("u:free:"): return await do_free(update, context, int(data.split(":")[2]))
-    if data.startswith("u:req:"): return await do_request(update, context, int(data.split(":")[2]))
-    if data.startswith("u:disc:"):
-        pid = int(data.split(":")[2]); context.user_data["disc_pid"] = pid
-        return await ask(update, context, tr(lang, "disc_prompt"), "disc", f"u:plan:{pid}")
-    if data.startswith("u:discx:"):
-        pid = int(data.split(":")[2])
-        if "disc" in context.user_data: context.user_data["disc"].pop(str(pid), None)
-        return await view_plan(update, context, pid)
-
-    # Admin home & channel flows
-    if data == "a:home": return await view_admin_home(update, context)
-    if data == "a:chadd":
-        lim = admin_limits(uid); chs = list_channels(uid)
-        if lim["max_channels"] is not None and len(chs) >= lim["max_channels"]:
-            return await popup(update, context, tr(lang, "limit_channels", n=lim["max_channels"]), alert=True)
-        return await ask(update, context, tr(lang, "ch_add_prompt"), "ch_add", "a:home")
-    if data.startswith("a:ch:"): return await view_channel(update, context, int(data.split(":")[2]))
-    if data.startswith("a:rep:"):
-        cid = int(data.split(":")[2]); text = report_text(uid, cid, lang)
-        return await render(update, context, text, [[B(tr(lang, "back"), f"a:ch:{cid}")]])
-    if data.startswith("a:test:"): return await run_test(update, context, int(data.split(":")[2]))
-    if data == "a:plan": return await view_my_plan(update, context)
-    if data.startswith("a:logs:"):
-        cid = int(data.split(":")[2])
-        return await view_logs(update, context, admin_id=uid, back=f"a:ch:{cid}", refresh=f"a:logs:{cid}")
-    if data == "a:logs": return await view_logs(update, context, admin_id=uid, back="a:home", refresh="a:logs")
-
-    # Lock code
-    if data.startswith("a:lock:"): return await view_lock(update, context, int(data.split(":")[2]))
-    if data.startswith("a:lockre:"):
-        cid = int(data.split(":")[2]); regen_lock(cid); await popup(update, context, tr(lang, "lock_regen_ok"))
-        return await view_lock(update, context, cid)
-
-    # Channel delete & toggles
-    if data.startswith("a:chdel:"):
-        cid = int(data.split(":")[2]); ch = get_channel(cid)
-        if not ch or ch["admin_id"] != uid: return await view_admin_home(update, context)
-        return await render(update, context, tr(lang, "ch_del_q", title=esc(ch["title"])),
-                            [[B(tr(lang, "yes"), f"a:chdelok:{cid}"), B(tr(lang, "no"), f"a:ch:{cid}")]])
-    if data.startswith("a:chdelok:"):
-        cid = int(data.split(":")[2]); delete_channel(cid); await popup(update, context, tr(lang, "ch_deleted"))
-        return await view_admin_home(update, context)
-    if data.startswith("a:tog:"):
-        parts = data.split(":"); cid = int(parts[2]); field = parts[3]
-        val = toggle_setting(cid, field)
-        await popup(update, context, tr(lang, f"tog_{field}" if f"tog_{field}" in TXT else ("on" if val else "off")))
-        return await view_channel(update, context, cid) if field == "enabled" else await view_content(update, context, cid)
-
-    # Content & subviews
-    if data.startswith("a:con:"): return await view_content(update, context, int(data.split(":")[2]))
-    if data.startswith("a:set:"):
-        parts = data.split(":"); cid = int(parts[2]); field = parts[3]
-        return await ask(update, context, FIELD_LABEL.get(field, (field, field))[1 if lang == "en" else 0],
-                         "set", f"a:con:{cid}" if field not in SCHED_FIELDS else f"a:sch:{cid}", cid=cid, field=field)
-    if data.startswith("a:cat:"): return await view_cats(update, context, int(data.split(":")[2]))
-    if data.startswith("a:catv:"):
-        parts = data.split(":"); return await view_cat(update, context, int(parts[2]), int(parts[3]))
-    if data.startswith("a:cata:"):
-        return await wiz_start(update, context, "cat_add", f"a:cat:{data.split(':')[2]}", cid=int(data.split(":")[2]))
-    if data.startswith("a:catd:"):
-        parts = data.split(":"); cid = int(parts[2]); i = int(parts[3])
-        s = get_settings(cid); cats = list(s["categories"])
-        if len(cats) <= 1: await popup(update, context, tr(lang, "cat_min"), alert=True); return await view_cats(update, context, cid)
-        cats.pop(i); update_settings(cid, categories=cats); await popup(update, context, tr(lang, "deleted"))
-        return await view_cats(update, context, cid)
-    if data.startswith("a:cats:"):
-        parts = data.split(":"); cid = int(parts[2]); i = int(parts[3])
-        return await ask(update, context, tr(lang, "cat_style_prompt"), "cat_style", f"a:catv:{cid}:{i}", cid=cid, i=i)
-
-    # Criteria
-    if data.startswith("a:cri:"): return await view_crits(update, context, int(data.split(":")[2]))
-    if data.startswith("a:criv:"):
-        parts = data.split(":"); return await view_crit(update, context, int(parts[2]), int(parts[3]))
-    if data.startswith("a:cria:"):
-        return await wiz_start(update, context, "crit_add", f"a:cri:{data.split(':')[2]}", cid=int(data.split(":")[2]))
-    if data.startswith("a:crid:"):
-        parts = data.split(":"); cid = int(parts[2]); i = int(parts[3])
-        s = get_settings(cid); crits = list(s["criteria"])
-        if len(crits) <= 1: await popup(update, context, tr(lang, "crit_min"), alert=True); return await view_crits(update, context, cid)
-        crits.pop(i); update_settings(cid, criteria=crits); await popup(update, context, tr(lang, "deleted"))
-        return await view_crits(update, context, cid)
-    if data.startswith("a:criw:"):
-        parts = data.split(":"); cid = int(parts[2]); i = int(parts[3])
-        return await ask(update, context, tr(lang, "crit_w_prompt"), "crit_weight", f"a:criv:{cid}:{i}", cid=cid, i=i)
-
-    # Schedule & quiet & tz
-    if data.startswith("a:sch:"): return await view_sched(update, context, int(data.split(":")[2]))
-    if data.startswith("a:mode:"):
-        cid = int(data.split(":")[2]); s = get_settings(cid); new_mode = "review" if s["mode"] == "auto" else "auto"
-        update_settings(cid, mode=new_mode); await popup(update, context, tr(lang, f"mode_set_{new_mode}"))
-        return await view_sched(update, context, cid)
-    if data.startswith("a:quiet:"): return await view_quiet(update, context, int(data.split(":")[2]))
-    if data.startswith("a:qoff:"):
-        cid = int(data.split(":")[2]); update_settings(cid, quiet_start=None, quiet_end=None)
-        await popup(update, context, tr(lang, "quiet_cleared")); return await view_sched(update, context, cid)
-    if data.startswith("a:qs:"):
-        parts = data.split(":"); cid = int(parts[2]); sh = int(parts[3])
-        context.user_data["quiet_start"] = sh
-        return await render(update, context, tr(lang, "quiet_pick_end", h=sh),
-                            hour_grid(f"a:qe:{cid}") + [[B(tr(lang, "back"), f"a:quiet:{cid}")]])
-    if data.startswith("a:qe:"):
-        parts = data.split(":"); cid = int(parts[2]); eh = int(parts[3]); sh = context.user_data.get("quiet_start", 0)
-        update_settings(cid, quiet_start=sh, quiet_end=eh)
-        await popup(update, context, tr(lang, "quiet_set", a=sh, b=eh)); return await view_sched(update, context, cid)
-    if data.startswith("a:tz:"): return await view_tz(update, context, int(data.split(":")[2]))
-    if data.startswith("a:tzs:"):
-        parts = data.split(":"); cid = int(parts[2]); idx = int(parts[3]); _, off = TZ_ZONES[idx]
-        update_settings(cid, utc_offset=off); await popup(update, context, tr(lang, "tz_set", city=tz_city(off, lang), tz=off_label(off), loc=local_clock(off)))
-        return await view_sched(update, context, cid)
-
-    # Queue & articles
-    if data.startswith("a:que:"): return await view_queue(update, context, int(data.split(":")[2]), "ready")
-    if data.startswith("a:rej:"): return await view_queue(update, context, int(data.split(":")[2]), "rejected")
-    if data.startswith("a:art:"): return await view_article(update, context, int(data.split(":")[2]))
-    if data.startswith("a:arte:"):
-        aid = int(data.split(":")[2]); return await ask(update, context, tr(lang, "art_edit_prompt"), "art_edit", f"a:art:{aid}", aid=aid)
-    if data.startswith("a:artd:"):
-        aid = int(data.split(":")[2]); a = get_article(aid); cid = a["channel_id"] if a else 0
-        article_delete(aid); await popup(update, context, tr(lang, "deleted"))
-        return await view_queue(update, context, cid, "ready")
-    if data.startswith("a:artr:"):
-        aid = int(data.split(":")[2]); article_update(aid, status="ready", reason=""); await popup(update, context, tr(lang, "art_moved"))
-        return await view_article(update, context, aid)
-    if data.startswith("a:artf:"):
-        aid = int(data.split(":")[2]); a = get_article(aid)
-        if not a or not a["full_html"]: return await popup(update, context, tr(lang, "empty"))
-        body, _ = fit_html(a["full_html"], 3800)
-        return await render(update, context, tr(lang, "full_head") + body, [[B(tr(lang, "back"), f"a:art:{aid}")]])
-    if data.startswith("a:pub:"):
-        aid = int(data.split(":")[2]); a = get_article(aid)
-        if not a: return await view_admin_home(update, context)
-        await popup(update, context, tr(lang, "publishing"))
-        ok, out = await publish_article(context.bot, aid, count_usage=True)
-        if ok: await popup(update, context, tr(lang, "published_ok"), alert=True); return await view_article(update, context, aid)
-        await popup(update, context, tr(lang, "pub_failed", e=_pub_err(out, lang)), alert=True)
-        return await view_article(update, context, aid)
-
-    # Sources
-    if data.startswith("a:src:"): return await view_sources(update, context, int(data.split(":")[2]))
-    if data.startswith("a:srca:"):
-        cid = int(data.split(":")[2]); lim = admin_limits(uid); cur = count_sources(uid)
-        if lim["max_sources"] is not None and cur >= lim["max_sources"]:
-            return await popup(update, context, tr(lang, "limit_sources", n=lim["max_sources"]), alert=True)
-        return await ask(update, context, tr(lang, "src_add_prompt"), "src_add", f"a:src:{cid}", cid=cid)
-    if data.startswith("a:srcv:"): return await view_source(update, context, int(data.split(":")[2]))
-    if data.startswith("a:srct:"):
-        sid = int(data.split(":")[2]); s = get_source(sid)
-        if s:
-            act = 0 if s["active"] else 1; q("UPDATE sources SET active=? WHERE id=?", (act, sid), commit=True)
-            await popup(update, context, tr(lang, "src_on" if act else "src_off"))
-        return await view_source(update, context, sid)
-    if data.startswith("a:srctb:"):
-        sid = int(data.split(":")[2]); s = get_source(sid)
-        if s:
-            cur = s["bot_active"] if s["bot_active"] is not None else 1; new_v = 0 if cur else 1
-            q("UPDATE sources SET bot_active=? WHERE id=?", (new_v, sid), commit=True)
-            await popup(update, context, tr(lang, "src_bot_on" if new_v else "src_bot_off"))
-        return await view_source(update, context, sid)
-    if data.startswith("a:srcapi:"):
-        sid = int(data.split(":")[2]); return await ask(update, context, tr(lang, "src_api_url"), "src_api_url", f"a:srcv:{sid}", sid=sid)
-    if data.startswith("a:srcapix:"):
-        sid = int(data.split(":")[2]); q("UPDATE sources SET api_url=NULL, api_key=NULL WHERE id=?", (sid,), commit=True)
-        await popup(update, context, tr(lang, "src_api_del")); return await view_source(update, context, sid)
-    if data.startswith("a:srcd:"):
-        sid = int(data.split(":")[2]); s = get_source(sid); cid = s["channel_id"] if s else 0
-        delete_source(sid); await popup(update, context, tr(lang, "src_deleted"))
-        return await view_sources(update, context, cid)
-    if data.startswith("a:srcr:"):
-        sid = int(data.split(":")[2]); s = get_source(sid)
-        if s:
-            try: items, _, m = await discover_source(s, use_cache=False); await popup(update, context, f"✅ {len(items)} items [{m}]", alert=True)
-            except Exception as e: await popup(update, context, f"❌ {e}", alert=True)
-        return await view_source(update, context, sid)
-
-    # Super admin callbacks
-    if is_super(uid):
-        if data == "s:home": return await view_super_home(update, context)
-        if data == "s:rep":
-            text = report_text(None, None, "fa")
-            return await render(update, context, text, [[B("🔙 بازگشت", "s:home")]])
-        if data.startswith("s:users:"): return await view_super_users(update, context, int(data.split(":")[2]))
-        if data.startswith("s:u:"): return await view_super_user(update, context, int(data.split(":")[2]))
-        if data.startswith("s:uban:"):
-            target = int(data.split(":")[2]); u = get_user(target)
-            if u: q("UPDATE users SET banned=? WHERE id=?", (0 if u["banned"] else 1, target), commit=True)
-            return await view_super_user(update, context, target)
-        if data.startswith("s:urole:"):
-            target = int(data.split(":")[2]); u = get_user(target)
-            if u: q("UPDATE users SET role=? WHERE id=?", ("super" if u["role"] != "super" else "admin", target), commit=True)
-            return await view_super_user(update, context, target)
-        if data.startswith("s:uclrp:"):
-            target = int(data.split(":")[2]); q("UPDATE users SET plan_id=NULL, plan_expires=NULL, next_plan_id=NULL WHERE id=?", (target,), commit=True)
-            return await view_super_user(update, context, target)
-        if data.startswith("s:usetp:"):
-            target = int(data.split(":")[2]); plans = list_plans()
-            kb = [[B(p["name"], f"s:usetpok:{target}:{p['id']}")] for p in plans] + [[B("🔙 بازگشت", f"s:u:{target}")]]
-            return await render(update, context, "پلن مورد نظر را انتخاب کنید:", kb)
-        if data.startswith("s:usetpok:"):
-            parts = data.split(":"); target = int(parts[2]); pid = int(parts[3])
-            assign_plan(target, pid); await popup(update, context, "✅ پلن اعمال شد")
-            return await view_super_user(update, context, target)
-        if data == "s:plans": return await view_super_plans(update, context)
-        if data.startswith("s:plan:"): return await view_super_plan(update, context, int(data.split(":")[2]))
-        if data == "s:plana": return await wiz_start(update, context, "plan_new", "s:plans")
-        if data.startswith("s:pldel:"):
-            pid = int(data.split(":")[2]); q("DELETE FROM plans WHERE id=?", (pid,), commit=True)
-            await popup(update, context, "🗑 پلن حذف شد"); return await view_super_plans(update, context)
-        if data.startswith("s:plpr:"):
-            pid = int(data.split(":")[2]); return await ask(update, context, "قیمت جدید پلن:", "pl_price", f"s:plan:{pid}", pid=pid)
-        if data.startswith("s:pldy:"):
-            pid = int(data.split(":")[2]); return await ask(update, context, "تعداد روزهای پلن:", "pl_days", f"s:plan:{pid}", pid=pid)
-        if data == "s:models": return await view_super_models(update, context)
-        if data.startswith("s:mview:"): return await view_super_model(update, context, int(data.split(":")[2]))
-        if data == "s:madd": return await wiz_start(update, context, "model_add", "s:models")
-        if data.startswith("s:mtog:"):
-            mid = int(data.split(":")[2]); m = get_model(mid)
-            if m: q("UPDATE ai_models SET active=? WHERE id=?", (0 if m["active"] else 1, mid), commit=True)
-            return await view_super_model(update, context, mid)
-        if data.startswith("s:mdel:"):
-            mid = int(data.split(":")[2]); q("DELETE FROM ai_models WHERE id=?", (mid,), commit=True)
-            await popup(update, context, "🗑 مدل حذف شد"); return await view_super_models(update, context)
-        if data.startswith("s:mtest:"):
-            mid = int(data.split(":")[2]); m = get_model(mid)
-            if m:
-                ok, err = await test_model(m["base_url"], m["api_key"], m["model"])
-                q("UPDATE ai_models SET status=?, last_error=?, last_check=? WHERE id=?", ("ok" if ok else "down", "" if ok else err, now_iso(), mid), commit=True)
-                await popup(update, context, "✅ مدل با موفقیت تست شد" if ok else f"❌ خطا: {err}", alert=True)
-            return await view_super_model(update, context, mid)
-        if data.startswith("s:mup:"):
-            mid = int(data.split(":")[2]); m = get_model(mid)
-            if m and m["priority"] > 1:
-                other = q("SELECT * FROM ai_models WHERE priority=?", (m["priority"] - 1,), one=True)
-                if other: q("UPDATE ai_models SET priority=? WHERE id=?", (m["priority"], other["id"]), commit=True)
-                q("UPDATE ai_models SET priority=? WHERE id=?", (m["priority"] - 1, mid), commit=True)
-            return await view_super_models(update, context)
-        if data.startswith("s:mdn:"):
-            mid = int(data.split(":")[2]); m = get_model(mid)
-            if m:
-                other = q("SELECT * FROM ai_models WHERE priority=?", (m["priority"] + 1,), one=True)
-                if other: q("UPDATE ai_models SET priority=? WHERE id=?", (m["priority"], other["id"]), commit=True)
-                q("UPDATE ai_models SET priority=? WHERE id=?", (m["priority"] + 1, mid), commit=True)
-            return await view_super_models(update, context)
-        if data == "s:discs": return await view_super_discs(update, context)
-        if data == "s:disca": return await wiz_start(update, context, "disc_add", "s:discs")
-        if data == "s:pays": return await view_super_pays(update, context)
-        if data.startswith("s:payv:"): return await view_super_pay(update, context, int(data.split(":")[2]))
-        if data.startswith("s:payok:"):
-            pid = int(data.split(":")[2]); py = q("SELECT * FROM payments WHERE id=?", (pid,), one=True)
-            if py:
-                q("UPDATE payments SET status='approved' WHERE id=?", (pid,), commit=True)
-                exp = assign_plan(py["user_id"], py["plan_id"])
-                p = get_plan(py["plan_id"]); u = get_user(py["user_id"]); lang = u["lang"] or "fa"
-                d = fmt_date(exp, admin_offset(py["user_id"]))
-                await notify_user_fn(py["user_id"], tr(lang, "pay_approved", name=esc(plan_txt(p, "name", lang)), when=tr(lang, "pay_when_now", d=d)))
-                await popup(update, context, "✅ پرداخت تأیید و پلن فعال شد")
-            return await view_super_pays(update, context)
-        if data.startswith("s:payno:"):
-            pid = int(data.split(":")[2]); py = q("SELECT * FROM payments WHERE id=?", (pid,), one=True)
-            if py:
-                q("UPDATE payments SET status='rejected' WHERE id=?", (pid,), commit=True)
-                u = get_user(py["user_id"]); lang = u["lang"] or "fa"
-                await notify_user_fn(py["user_id"], tr(lang, "pay_rejected"))
-                await popup(update, context, "❌ پرداخت رد شد")
-            return await view_super_pays(update, context)
-        if data == "s:texts": return await view_super_texts(update, context)
-        if data.startswith("s:tedit:"):
-            key = data.split(":")[2]; return await ask(update, context, f"متن جدید برای {key}:", "text_edit", "s:texts", text_key=key)
-        if data == "s:bcast": return await ask(update, context, "پیام همگانی را بفرستید:", "broadcast", "s:home")
-        if data.startswith("s:logs:"):
-            lvl = data.split(":")[2]; lvl = None if lvl == "all" else lvl
-            return await view_logs(update, context, admin_id=None, level=lvl, back="s:home")
-        if data == "s:togauto":
-            cur = gget("automation_enabled", True); gset("automation_enabled", not cur)
-            await popup(update, context, "🟢 اتوماسیون فعال شد" if not cur else "🔴 اتوماسیون متوقف شد")
-            return await view_super_home(update, context)
-
-    if data == "c:cancel":
-        context.user_data.pop("await", None)
-        await popup(update, context, tr(lang, "cancelled"))
-        return await go_home(update, context)
-
+    ensure_user(u.id, u.username, u.full_name, premium=getattr(u, "is_premium", None))
+    if get_user(u.id)["banned"] and not is_super(u.id): return await qy.answer(tr(L(update), "banned"), show_alert=True)
+    try: await dispatch(update, context, qy.data)
+    except Exception as e:
+        log_event("ERROR", f"callback {qy.data}: {e}", u.id)
+        try: await qy.answer(tr(L(update), "error", e=str(e)[:150]), show_alert=True); context.user_data["_answered"] = True
+        except Exception: pass
+    if not context.user_data.get("_answered"):
+        try: await qy.answer()
+        except Exception: pass
 # ============================================================
-# مدیریت پیام‌های ورودی کاربر (Message & Wizard Processing)
-def forwarded_channel(msg):
-    origin = getattr(msg, "forward_origin", None)
-    if not origin or getattr(origin, "type", None) != "channel":
-        return None
-    return getattr(origin, "chat", None)
-
-# ============================================================
-# مدیریت پیام‌های ورودی کاربر (Message & Wizard Processing)
-async def on_message(update, context):
-    if not update.message: return
-    uid = update.effective_user.id; msg = update.message; text = (msg.text or "").strip(); lang = L(update)
-    user_upsert(uid, uname=update.effective_user.username, name=update.effective_user.full_name)
-    if is_banned(uid): return await msg.reply_text(tr(lang, "banned"))
-
-    st = context.user_data.get("await")
-    if not st:
-        # Check if user forwarded a channel post without being in await mode
-        if forwarded_channel(msg):
-            context.user_data["await"] = {"kind": "ch_add", "back": "a:home"}
-            st = context.user_data["await"]
-        else:
-            return
-
-    kind = st.get("kind")
-
-    # Wizard handling
+# ورودی‌های متنی (ویزاردها، فیلدها، منبع، افزودن کانال + کد قفل، کد تخفیف، رسید …)
+async def handle_input(update, context, st):
+    msg = update.message; uid = update.effective_user.id; lang = L(update); ud = context.user_data; kind = st["kind"]; back = st["back"]
+    text = (msg.text or msg.caption or "").strip(); text_html = (msg.text_html or msg.caption_html or "").strip()
+    if kind not in ("bc", "receipt"):
+        try: await msg.delete()
+        except Exception: pass
+    def done(notice=None):
+        ud.pop("await", None)
+        if notice: ud["notice"] = notice
+    # ---- ویزاردها
     if kind == "wiz":
-        wiz = st["wiz"]; step = st["step"]; steps = WIZ[wiz]; key, _, ktype = steps[step]
-        val = text
-        if ktype == "int":
+        steps = WIZ[st["wiz"]]; key, _, typ = steps[st["step"]]
+        if not text: await popup(update, context, tr(lang, "empty")); return await wiz_prompt(update, context)
+        if typ == "int":
             try: val = to_int(text)
-            except Exception: return await msg.reply_text(tr(lang, "need_int"))
+            except Exception: await popup(update, context, tr(lang, "need_int")); return await wiz_prompt(update, context)
+        else: val = text
         st["data"][key] = val; st["step"] += 1
         if st["step"] < len(steps): return await wiz_prompt(update, context)
-
-        # Wizard complete
-        context.user_data.pop("await", None); d = st["data"]
-        if wiz == "cat_add":
-            cid = d["cid"]; s = get_settings(cid); cats = list(s["categories"])
-            cats.append({"name": str(d["name"]), "emoji": str(d["emoji"]), "style": str(d["style"])})
-            update_settings(cid, categories=cats); await popup(update, context, tr(lang, "cat_added"))
-            return await view_cats(update, context, cid)
-        elif wiz == "crit_add":
-            cid = d["cid"]; s = get_settings(cid); crits = list(s["criteria"])
-            crits.append({"name": str(d["name"]), "weight": int(d["weight"])})
-            update_settings(cid, criteria=crits); await popup(update, context, tr(lang, "crit_added"))
-            return await view_crits(update, context, cid)
-        elif wiz == "plan_new":
-            q("INSERT INTO plans(name,name_en,days,daily_posts,max_sources,max_channels,daily_tests,price,price_en,description,description_en,is_free) VALUES(?,?,?,?,?,?,?,?,?,?,?,0)",
-              (d["name"], d["name_en"], d["days"], d["daily_posts"], d["max_sources"], d["max_channels"], d["daily_tests"], d["price"], d["price_en"], d["description"], d["description_en"]), commit=True)
-            await popup(update, context, "✅ پلن جدید اضافه شد"); return await view_super_plans(update, context)
-        elif wiz == "model_add":
-            prio = (q("SELECT MAX(priority) m FROM ai_models", one=True)["m"] or 0) + 1
-            q("INSERT INTO ai_models(base_url,api_key,model,active,priority,status) VALUES(?,?,?,1,?,'ok')", (d["base_url"], d["api_key"], d["model"], prio), commit=True)
-            await popup(update, context, "✅ مدل اضافه شد"); return await view_super_models(update, context)
-        elif wiz == "disc_add":
-            exp_val = str(d["expires"]).strip()
-            if exp_val.isdigit(): exp_date = (now_utc() + timedelta(days=int(exp_val))).isoformat()
-            else: exp_date = exp_val + "T23:59:59Z"
-            q("INSERT INTO discounts(code,percent,expires_at,max_uses,used_count) VALUES(?,?,?,?,0)", (d["code"].upper(), d["percent"], exp_date, d["max_uses"]), commit=True)
-            await popup(update, context, "✅ کد تخفیف اضافه شد"); return await view_super_discs(update, context)
-
-    # Receipt submission
-    if kind == "receipt":
-        pid = st["pid"]; file_id = msg.photo[-1].file_id if msg.photo else None
-        q("INSERT INTO payments(user_id,plan_id,receipt_file_id,receipt_text,discount_code,final_price,status,created_at) VALUES(?,?,?,?,?,?, 'pending', ?)",
-          (uid, pid, file_id, text, st.get("disc"), st.get("final"), now_iso()), commit=True)
-        context.user_data.pop("await", None)
-        await notify_supers(f"🛎 <b>رسید پرداخت جدید</b> از {uname(get_user(uid))} برای پلن #{pid}")
-        return await view_receipt_ok(update, context)
-
-    # Add source
-    if kind == "src_add":
-        cid = st["cid"]; url = text.strip()
-        if not (url.startswith("http://") or url.startswith("https://")): return await msg.reply_text(tr(lang, "src_bad"))
-        if q("SELECT id FROM sources WHERE channel_id=? AND url=?", (cid, url), one=True): return await msg.reply_text(tr(lang, "src_dup"))
-        m_check = await msg.reply_text(tr(lang, "src_checking"))
-        try:
-            probe = {"id": None, "url": normalize_url(url), "feed_url": None, "api_url": None, "api_key": None, "etag": None, "last_modified": None}
-            items, _, method = await discover_source(probe, use_cache=False)
-            feed_url = probe.get("_discovered_feed_url") or (probe.get("feed_url") if method == "feed" else None)
-            sid = q("INSERT INTO sources(admin_id,channel_id,url,feed_url,active,bot_active,last_fetch,found_total,fail_count) VALUES(?,?,?,?,1,1,?,?,0)",
-                    (uid, cid, probe["url"], feed_url, now_iso(), len(items)), commit=True)
-            context.user_data.pop("await", None)
-            try: await m_check.delete()
-            except Exception: pass
-            await popup(update, context, tr(lang, "src_added", n=len(items), m=method))
-            return await view_sources(update, context, cid)
-        except Exception as e:
-            try: await m_check.delete()
-            except Exception: pass
-            err_str = str(e)
-            if "403" in err_str: return await msg.reply_text(tr(lang, "src_403"))
-            return await msg.reply_text(tr(lang, "src_dead"))
-
-    # Source API
-    if kind == "src_api_url":
-        st["api_url"] = text.strip(); st["kind"] = "src_api_key"
-        return await msg.reply_text(tr(lang, "src_api_key"), parse_mode=HTML)
-    if kind == "src_api_key":
-        sid = st["sid"]; a_key = None if text.strip() in ("-", "") else text.strip()
-        q("UPDATE sources SET api_url=?, api_key=? WHERE id=?", (st["api_url"], a_key, sid), commit=True)
-        context.user_data.pop("await", None); await popup(update, context, tr(lang, "src_api_ok", n=0))
-        return await view_source(update, context, sid)
-
-    # Channel add
-    if kind == "ch_add":
-        chat_id, ch_title, ch_user = None, None, None
-        ch = forwarded_channel(msg)
-        if ch:
-            chat_id = ch.id; ch_title = ch.title; ch_user = ch.username
-        elif text:
-            target = text.strip()
-            if not (target.startswith("@") or target.startswith("-100")): target = "@" + target
-            try:
-                c = await context.bot.get_chat(target)
-                if c.type == "channel": chat_id = c.id; ch_title = c.title; ch_user = c.username
-            except Exception as e: return await msg.reply_text(tr(lang, "ch_no_access", e=e))
-        if not chat_id: return await msg.reply_text(tr(lang, "ch_need_fwd"))
-        if not await bot_can_post(context.bot, chat_id): return await msg.reply_text(tr(lang, "ch_bot_not_admin"))
-        if not await user_is_admin(context.bot, chat_id, uid): return await msg.reply_text(tr(lang, "ch_user_not_admin"))
-
-        existing = q("SELECT * FROM channels WHERE chat_id=?", (chat_id,), one=True)
-        if existing:
-            if existing["admin_id"] == uid: return await msg.reply_text(tr(lang, "ch_exists_mine"))
-            # Locked channel transfer
-            st["kind"] = "ch_lock_code"; st["target_cid"] = existing["id"]; st["target_title"] = ch_title or existing["title"]
-            return await msg.reply_text(tr(lang, "ch_locked"), parse_mode=HTML)
-
-        cid = q("INSERT INTO channels(admin_id,chat_id,title,username,created_at,lock_code) VALUES(?,?,?,?,?,?)",
-                (uid, chat_id, ch_title or "Channel", ch_user, now_iso(), gen_lock_code()), commit=True)
-        init_settings(cid, lang)
-        context.user_data.pop("await", None); await popup(update, context, tr(lang, "ch_added", title=ch_title or "Channel"))
-        return await view_channel(update, context, cid)
-
-    # Channel lock code verification for transfer
-    if kind == "ch_lock_code":
-        code = text.strip(); target_cid = st["target_cid"]
-        ch = q("SELECT * FROM channels WHERE id=?", (target_cid,), one=True)
-        if not ch or ch["lock_code"] != code:
-            if ch: await notify_user_fn(ch["admin_id"], tr(user_lang(ch["admin_id"]) or "fa", "ch_owner_alert", who=uname(get_user(uid)), title=ch["title"]))
-            return await msg.reply_text(tr(lang, "ch_lock_bad"))
-        # Successful transfer
-        old_admin = ch["admin_id"]
-        q("UPDATE channels SET admin_id=?, lock_code=? WHERE id=?", (uid, gen_lock_code(), target_cid), commit=True)
-        init_settings(target_cid, lang)
-        await notify_user_fn(old_admin, tr(user_lang(old_admin) or "fa", "ch_owner_moved", who=uname(get_user(uid)), title=ch["title"]))
-        context.user_data.pop("await", None); await popup(update, context, tr(lang, "ch_lock_ok", title=ch["title"]))
-        return await view_channel(update, context, target_cid)
-
-    # Settings field update
-    if kind == "set":
-        cid = st["cid"]; field = st["field"]; val = text
-        if field in INT_FIELDS:
-            lo, hi = INT_FIELDS[field]
-            try:
-                n = to_int(text)
-                if not (lo <= n <= hi): return await msg.reply_text(tr(lang, "range", lo=lo, hi=hi))
-                val = n
-            except Exception: return await msg.reply_text(tr(lang, "need_int"))
-        update_settings(cid, **{field: val})
-        context.user_data.pop("await", None); await popup(update, context, tr(lang, "saved"))
-        return await view_content(update, context, cid) if field not in SCHED_FIELDS else await view_sched(update, context, cid)
-
-    # Category style update
+        dta = st["data"]
+        if st["wiz"] == "cat_add": s = get_settings(dta["cid"]); s["categories"].append({"name": dta["name"][:40], "emoji": dta["emoji"][:4], "style": dta["style"][:400]}); save_settings(dta["cid"], s); done(tr(lang, "cat_added"))
+        elif st["wiz"] == "crit_add": s = get_settings(dta["cid"]); s["criteria"].append({"name": dta["name"][:40], "weight": max(1, min(100, dta["weight"]))}); save_settings(dta["cid"], s); done(tr(lang, "crit_added"))
+        elif st["wiz"] == "plan_new": create_plan(**dta); done(tr(lang, "s_plan_created", name=esc(dta["name"])))
+        elif st["wiz"] == "model_add":
+            base_url, model = dta["base_url"].strip(), dta["model"].strip()
+            if not base_url.startswith("http") or not model: done(tr(lang, "s_model_need")); return await dispatch(update, context, back)
+            mid = add_model(base_url, dta["api_key"], model); ok, out, t = await test_model(mid); name = get_model(mid)["name"]
+            done(tr(lang, "s_model_added", name=esc(name), res=("✅" if ok else "❌ " + esc(out[:80])) + f" ({t}s)"))
+        elif st["wiz"] == "disc_add":
+            exp = parse_expiry(dta["expires"])
+            if not exp: done(tr(lang, "s_disc_exp_bad")); return await dispatch(update, context, back)
+            code = disc_create(dta["code"][:24], dta["percent"], exp, dta["max_uses"]); done(tr(lang, "s_disc_created", code=code) if code else tr(lang, "s_disc_dup"))
+        return await dispatch(update, context, back)
+    # ---- فیلد تنظیمات کانال
+    if kind == "field":
+        f = st["field"]; cid = st["cid"]; label = FIELD_LABEL[f][1 if lang == "en" else 0]
+        if not text: await popup(update, context, tr(lang, "empty")); return await ask(update, context, label, "field", back, cid=cid, field=f)
+        if f in INT_FIELDS:
+            lo, hi = INT_FIELDS[f]
+            try: v = to_int(text)
+            except Exception: await popup(update, context, tr(lang, "need_int")); return await ask(update, context, label, "field", back, cid=cid, field=f)
+            if not lo <= v <= hi: await popup(update, context, tr(lang, "range", lo=lo, hi=hi), alert=True); return await ask(update, context, label, "field", back, cid=cid, field=f)
+        elif f == "signature": v = sanitize_html(text_html, premium=True)[:200]
+        else: v = text[:3000]
+        update_settings(cid, **{f: v}); done(f"{tr(lang, 'saved')} · {label}: {esc(strip_tags(str(v))[:40])}"); return await dispatch(update, context, back)
     if kind == "cat_style":
-        cid = st["cid"]; i = st["i"]; s = get_settings(cid); cats = list(s["categories"])
-        if i < len(cats):
-            cats[i]["style"] = text; update_settings(cid, categories=cats)
-            await popup(update, context, tr(lang, "cat_updated"))
-        context.user_data.pop("await", None); return await view_cat(update, context, cid, i)
-
-    # Criteria weight update
+        s = get_settings(st["cid"]); i = st["idx"]
+        if text and i < len(s["categories"]): s["categories"][i]["style"] = text[:400]; save_settings(st["cid"], s); done(tr(lang, "cat_updated"))
+        else: done(tr(lang, "empty"))
+        return await dispatch(update, context, back)
     if kind == "crit_weight":
-        cid = st["cid"]; i = st["i"]
-        try: w = to_int(text)
-        except Exception: return await msg.reply_text(tr(lang, "need_int"))
-        s = get_settings(cid); crits = list(s["criteria"])
-        if i < len(crits):
-            crits[i]["weight"] = w; update_settings(cid, criteria=crits)
-            await popup(update, context, tr(lang, "crit_updated"))
-        context.user_data.pop("await", None); return await view_crit(update, context, cid, i)
-
-    # Article edit
+        s = get_settings(st["cid"]); i = st["idx"]
+        try:
+            if i < len(s["criteria"]): s["criteria"][i]["weight"] = max(1, min(100, to_int(text))); save_settings(st["cid"], s); done(tr(lang, "crit_updated"))
+        except Exception: done(tr(lang, "need_int"))
+        return await dispatch(update, context, back)
+    # ---- منبع
+    if kind == "src_add":
+        cid = st["cid"]; url = normalize_url(text)
+        if not text or "." not in urlparse(url).netloc: done(tr(lang, "src_bad")); return await dispatch(update, context, back)
+        sid = add_source(uid, cid, url)
+        if not sid: done(tr(lang, "src_dup")); return await dispatch(update, context, back)
+        await render(update, context, tr(lang, "src_checking"))
+        ok, note = await probe_source(get_source(sid), lang, added=True)
+        if ok: q("UPDATE sources SET title=? WHERE id=?", (hostname(url), sid), commit=True)
+        else: log_event("WARN", f"منبع جدید {hostname(url)}: تست بارگذاری ناموفق", uid)
+        try: await context.bot.send_message(uid, note, parse_mode=HTML, disable_web_page_preview=True)
+        except Exception: pass
+        done(note); return await dispatch(update, context, f"a:srcv:{sid}")
+    if kind == "src_api_url":
+        sid = st["sid"]; s = get_source(sid)
+        if not s or (s["admin_id"] != uid and not is_super(uid)): done(tr(lang, "notfound")); return await dispatch(update, context, back)
+        if text in ("-", "—", "‑"): set_source_api(sid, "", "", ""); done(tr(lang, "src_api_del")); return await dispatch(update, context, back)
+        api = text if text.startswith(("http://", "https://")) else "https://" + text
+        if "." not in urlparse(api.replace("{key}", "k")).netloc: done(tr(lang, "src_bad")); return await dispatch(update, context, back)
+        ud["await"] = {"kind": "src_api_key", "sid": sid, "api": api, "back": back}
+        return await render(update, context, f"✏️ {tr(lang, 'src_api_key')}\n\n<i>{tr(lang, 'send_value')}</i>", [[B(tr(lang, "cancel"), "c:cancel")]])
+    if kind == "src_api_key":
+        sid = st["sid"]; s = get_source(sid)
+        if not s or (s["admin_id"] != uid and not is_super(uid)): done(tr(lang, "notfound")); return await dispatch(update, context, back)
+        key = "" if text in ("-", "—", "‑") else text
+        set_source_api(sid, st["api"], key, "")
+        await render(update, context, tr(lang, "src_checking"))
+        try: items, _, _ = await _api_discover(get_source(sid), 10); n = len(items)
+        except Exception as e: n = 0; log_event("WARN", f"API منبع {hostname(st['api'])}: {err_code(e)}", uid)
+        if not n: set_source_active(sid, False, "active")
+        done(tr(lang, "src_api_ok", n=n) if n else tr(lang, "src_api_bad")); return await dispatch(update, context, f"a:srcv:{sid}")
+    # ---- افزودن کانال + لایه‌ی امنیتی
+    if kind == "ch_add":
+        chat = None
+        try:
+            fo = getattr(msg, "forward_origin", None)
+            if fo and getattr(fo, "chat", None) and fo.chat.type == ChatType.CHANNEL: chat = fo.chat
+            elif text: chat = await context.bot.get_chat(text if text.startswith("@") else to_int(text))
+        except Exception as e: done(tr(lang, "ch_no_access", e=esc(str(e)[:80]))); return await dispatch(update, context, back)
+        if not chat or chat.type != ChatType.CHANNEL: done(tr(lang, "ch_need_fwd")); return await dispatch(update, context, back)
+        if not await bot_can_post(context.bot, chat.id): done(tr(lang, "ch_bot_not_admin")); return await dispatch(update, context, back)
+        user_is_admin = False
+        try: user_is_admin = any(m.user.id == uid for m in await context.bot.get_chat_administrators(chat.id))
+        except Exception:
+            try: mem = await context.bot.get_chat_member(chat.id, uid); user_is_admin = mem.status in ("administrator", "creator")
+            except Exception: user_is_admin = False
+        if not user_is_admin:
+            log_event("WARN", f"🚫 ثبت کانال «{chat.title}» ({chat.id}) بدون ادمین‌بودن", uid)
+            await notify_supers(f"🚨 <b>هشدار امنیتی</b>\n<code>{uid}</code> تلاش کرد «{esc(chat.title)}» را بدون ادمین‌بودن ثبت کند.")
+            done(tr(lang, "ch_user_not_admin")); return await dispatch(update, context, back)
+        existing = channel_by_chat(chat.id)
+        if existing:
+            if existing["admin_id"] == uid: update_channel_meta(existing["id"], chat.title, chat.username or ""); done(tr(lang, "ch_exists_mine")); return await dispatch(update, context, f"a:ch:{existing['id']}")
+            ud["await"] = {"kind": "lockcode", "cid": existing["id"], "back": back, "tries": 0, "title": chat.title}
+            return await render(update, context, tr(lang, "ch_locked"), [[B(tr(lang, "cancel"), "c:cancel")]])
+        lim = admin_limits(uid)
+        if lim["max_channels"] is not None and len(list_channels(uid)) >= lim["max_channels"]: done(tr(lang, "limit_channels", n=lim["max_channels"])); return await dispatch(update, context, back)
+        cid = add_channel(uid, chat.id, chat.title or str(chat.id), chat.username or "", uid, lang); log_event("INFO", f"کانال ثبت شد: {chat.title} ({chat.id})", uid)
+        done(tr(lang, "ch_added", title=esc(chat.title))); return await dispatch(update, context, f"a:ch:{cid}")
+    if kind == "lockcode":
+        cid = st["cid"]; ch = get_channel(cid); me = get_user(uid); who = f"{esc(uname(me))} (<code>{uid}</code>)"
+        if not ch: done(tr(lang, "notfound")); return await dispatch(update, context, back)
+        old_uid = ch["admin_id"]; ol = user_lang(old_uid) or "fa"
+        if check_lock(cid, text):
+            lim = admin_limits(uid)
+            if lim["max_channels"] is not None and len(list_channels(uid)) >= lim["max_channels"]: done(tr(lang, "limit_channels", n=lim["max_channels"])); return await dispatch(update, context, back)
+            transfer_channel(cid, uid, lang); log_event("WARN", f"کانال {ch['title']} از {old_uid} به {uid} منتقل شد", uid)
+            await notify_user_fn(old_uid, tr(ol, "ch_owner_moved", title=esc(ch["title"]), who=who)); await notify_supers(f"🔁 «{esc(ch['title'])}» transferred {old_uid} → {uid}")
+            done(tr(lang, "ch_lock_ok", title=esc(ch["title"]))); return await dispatch(update, context, f"a:ch:{cid}")
+        st["tries"] += 1; await notify_user_fn(old_uid, tr(ol, "ch_owner_alert", title=esc(ch["title"]), who=who)); log_event("WARN", f"کد قفل اشتباه برای {ch['title']} توسط {uid}", uid)
+        if st["tries"] >= 3: done(tr(lang, "ch_lock_bad")); return await dispatch(update, context, back)
+        ud["notice"] = tr(lang, "ch_lock_bad"); return await render(update, context, tr(lang, "ch_locked"), [[B(tr(lang, "cancel"), "c:cancel")]])
+    # ---- مقاله
     if kind == "art_edit":
-        aid = st["aid"]; article_update(aid, post_html=text)
-        context.user_data.pop("await", None); await popup(update, context, tr(lang, "art_updated"))
-        return await view_article(update, context, aid)
-
-    # Discount apply
+        a = get_article(st["aid"])
+        if a and (a["admin_id"] == uid or is_super(uid)) and text_html: article_update(st["aid"], post_html=sanitize_html(text_html, premium=True)); done(tr(lang, "art_updated"))
+        else: done(tr(lang, "empty"))
+        return await dispatch(update, context, back)
+    # ---- کد تخفیف
     if kind == "disc":
-        code = text.strip().upper(); d, why = disc_valid(code)
-        if not d: return await msg.reply_text(tr(lang, "disc_expired" if why == "expired" else "disc_exhausted" if why == "exhausted" else "disc_bad"))
-        pid = context.user_data.get("disc_pid")
-        if "disc" not in context.user_data: context.user_data["disc"] = {}
-        context.user_data["disc"][str(pid)] = code; context.user_data.pop("await", None)
-        await popup(update, context, tr(lang, "disc_ok", p=d["percent"]))
-        return await view_plan(update, context, pid)
-
-    # Super admin text edits
-    if kind == "text_edit":
-        key = st["text_key"]; gset(f"text_{key}_{lang}", text)
-        context.user_data.pop("await", None); await msg.reply_text("✅ متن با موفقیت بروزرسانی شد.")
-        return await view_super_texts(update, context)
-
-    # Super admin broadcast
-    if kind == "broadcast":
-        context.user_data.pop("await", None); users = list_users(limit=1000)
-        await msg.reply_text(f"📢 ارسال همگانی به {len(users)} کاربر شروع شد...")
-        sent, failed = 0, 0
-        for u in users:
+        d, why = disc_valid(text); pid = str(st["pid"])
+        if d: ud.setdefault("disc", {})[pid] = d["code"]; done(tr(lang, "disc_ok", p=d["percent"]))
+        else: done(tr(lang, {"expired": "disc_expired", "exhausted": "disc_exhausted"}.get(why, "disc_bad")))
+        return await dispatch(update, context, back)
+    # ---- رسید پرداخت
+    if kind == "receipt":
+        pid = st["pid"]; p = get_plan(pid); u = get_user(uid)
+        if not (msg.photo or msg.document or text): await popup(update, context, tr(lang, "receipt_empty")); return
+        if pay_pending_for(uid, pid): done(tr(lang, "req_pending")); return await dispatch(update, context, back)
+        rid = pay_create(uid, pid, msg.chat_id, msg.message_id, text, st.get("disc"), st.get("final")); ud.pop("await", None); ud.get("disc", {}).pop(str(pid), None)
+        disc = f"\n🎟 {esc(st['disc'])}" if st.get("disc") else ""; note = f"\n📝 {esc(text[:400])}" if text else ""
+        header = tr("fa", "s_pay_new", id=rid, who=esc(uname(u)), uid=uid, plan=esc(p["name"]), price=esc(st.get("final") or p["price"]), disc=disc, note=note); kb = InlineKeyboardMarkup([[B("✅ تأیید / Approve", f"s:pay_ok:{rid}"), B("❌ رد / Reject", f"s:pay_no:{rid}")]])
+        for sid in SUPER_ADMIN_IDS:
             try:
-                await context.bot.send_message(u["id"], text, parse_mode=HTML)
-                sent += 1; await asyncio.sleep(0.05)
-            except Exception: failed += 1
-        return await msg.reply_text(f"✅ ارسال به اتمام رسید.\nارسال شد: {sent} · ناموفق: {failed}")
-
+                if msg.photo or msg.document: await context.bot.copy_message(sid, msg.chat_id, msg.message_id, caption=header[:1000], parse_mode=HTML, reply_markup=kb)
+                else: await context.bot.send_message(sid, header, parse_mode=HTML, reply_markup=kb)
+            except Exception as e: log.warning(f"pay notify {sid}: {e}")
+        log_event("INFO", f"درخواست پرداخت #{rid} برای پلن {p['name']}", uid); return await view_receipt_ok(update, context)
+    # ---- مدیر کلان
+    if kind == "plan_field":
+        f = st["field"]; v = text
+        if f in ("days", "daily_posts", "max_sources", "max_channels", "daily_tests"):
+            try: v = to_int(text)
+            except Exception: done(tr(lang, "need_int")); return await dispatch(update, context, back)
+        update_plan(st["pid"], **{f: v}); done(tr(lang, "saved")); return await dispatch(update, context, back)
+    if kind == "disc_field":
+        f = st["field"]; code = st["code"]
+        try:
+            if f == "percent": disc_update(code, percent=max(1, min(100, to_int(text))))
+            elif f == "max_uses": disc_update(code, max_uses=max(0, to_int(text)))
+            else:
+                exp = parse_expiry(text)
+                if not exp: done(tr(lang, "s_disc_exp_bad")); return await dispatch(update, context, back)
+                disc_update(code, expires=exp)
+            done(tr(lang, "saved"))
+        except Exception: done(tr(lang, "need_int"))
+        return await dispatch(update, context, back)
+    if kind == "model_field":
+        f = st["field"]; v = text
+        try:
+            if f in ("priority", "max_tokens"): v = to_int(text)
+            elif f == "temperature": v = max(0.0, min(2.0, float(text.translate(_FA_DIGITS))))
+        except Exception: done(tr(lang, "need_int")); return await dispatch(update, context, back)
+        update_model(st["mid"], **{f: v}); done(tr(lang, "saved")); return await dispatch(update, context, back)
+    if kind == "gtext": gtext_set(st["key"], st["lg"], sanitize_html(text_html, premium=True)); done(tr(lang, "s_text_saved")); return await dispatch(update, context, back)
+    if kind == "umsg":
+        tl = user_lang(st["target"]) or "fa"
+        try: await context.bot.send_message(st["target"], tr(tl, "s_umsg_head") + sanitize_html(text_html, premium=True), parse_mode=HTML); done(tr(lang, "s_umsg_sent"))
+        except Exception as e: done(tr(lang, "error", e=esc(str(e)[:80])))
+        return await dispatch(update, context, back)
+    if kind == "bc": ud.pop("await", None); ud["bc_src"] = (msg.chat_id, msg.message_id); return await render(update, context, tr(lang, "s_bc_confirm", n=len(list_users())), [[B(tr(lang, "s_bc_go"), "s:bc_go"), B(tr(lang, "cancel"), "s:home")]], force_new=True)
+    done(); return await dispatch(update, context, back)
 # ============================================================
-# دستورات بات تلگرام (Bot Commands)
-async def cmd_start(update, context):
-    uid = update.effective_user.id; args = context.args or []
-    context.user_data.pop("panel", None)
-    context.user_data.pop("await", None)
-    user_upsert(uid, uname=update.effective_user.username, name=update.effective_user.full_name)
-    if is_banned(uid): return await update.message.reply_text(tr("fa", "banned"))
-    if args and (args[0].startswith("dl_") or args[0].startswith("r_")):
-        key = args[0][3:]
-        data = await load_deeplink(key)
-        if isinstance(data, dict):
-            body = data.get("full") or data.get("short") or ""
-            if body.strip():
-                body, _ = fit_html(body, 3800)
-                title = data.get("title") or "نسخه‌ی کامل مقاله"
-                return await update.message.reply_text(f"📖 <b>{html.escape(str(title))}</b>\n\n{body}", parse_mode=HTML, disable_web_page_preview=True)
-        elif isinstance(data, str) and data.strip():
-            body, _ = fit_html(data, 3800)
-            return await update.message.reply_text(f"📖 <b>نسخه‌ی کامل مقاله</b>\n\n{body}", parse_mode=HTML, disable_web_page_preview=True)
-        return await update.message.reply_text("❌ این لینک مقاله منقضی شده یا محتوای آن پیدا نشد. لطفاً لینک جدید مقاله را باز کنید.", disable_web_page_preview=True)
-    await go_home(update, context)
-
-async def cmd_create(update, context):
-    uid = update.effective_user.id
-    if not can_admin(uid): return await update.message.reply_text(tr(L(update), "no_admin"))
-    await view_admin_home(update, context)
-
-async def cmd_help(update, context):
-    lang = L(update)
-    h_fa = "💡 <b>راهنمای ربات خبرنگار هوشمند</b>\n\n/start - شروع و انتخاب زبان\n/create - ورود به پنل مدیریت کانال‌ها\n/report - گزارش آماری کانال\n/logs - لاگ عملکردهای اخیر\n/man - ارتباط با پشتیبانی\n/cancel - انصراف از عملیات جاری"
-    h_en = "💡 <b>News Bot Help</b>\n\n/start - Start & Language selection\n/create - Channel Management Panel\n/report - Channel stats & report\n/logs - Recent activity logs\n/man - Contact support\n/cancel - Cancel current operation"
-    await update.message.reply_text(h_fa if lang == "fa" else h_en, parse_mode=HTML)
-
-async def cmd_man(update, context):
-    lang = L(update)
-    sup_text = gtext("support", lang) or ("📞 جهت ارتباط با پشتیبانی، لطفاً پیام خود را برای @Admin ارسال کنید." if lang == "fa" else "📞 To contact support, please message @Admin.")
-    await update.message.reply_text(sup_text, parse_mode=HTML)
-
-async def cmd_report(update, context):
-    uid = update.effective_user.id; lang = L(update)
-    if is_super(uid): return await update.message.reply_text(report_text(None, None, lang), parse_mode=HTML)
-    chs = list_channels(uid)
-    if not chs: return await update.message.reply_text(tr(lang, "no_channels"))
-    await update.message.reply_text(report_text(uid, chs[0]["id"], lang), parse_mode=HTML)
-
-async def cmd_logs(update, context):
-    uid = update.effective_user.id
-    await view_logs(update, context, admin_id=uid if not is_super(uid) else None)
-
-async def cmd_cancel(update, context):
-    context.user_data.pop("await", None)
-    await update.message.reply_text(tr(L(update), "cancelled"))
-    await go_home(update, context)
-
+# پشتیبانی تک‌پیامی
+def _sup_header(u):
+    who = f"@{u['username']}" if u["username"] else f"<code>{u['id']}</code>"
+    return f"📨 <b>{esc(u['name'] or '')}</b> · {who}"
+async def support_forward(context, user, msg):
+    header = _sup_header(user); sent = 0
+    for sid in SUPER_ADMIN_IDS:
+        try:
+            if msg.text: m = await context.bot.send_message(sid, f"{header}\n{msg.text_html}", parse_mode=HTML, disable_web_page_preview=True)
+            else:
+                try: m = await context.bot.copy_message(sid, msg.chat_id, msg.message_id, caption=(f"{header}\n{msg.caption_html or ''}")[:1000], parse_mode=HTML)
+                except Exception: m = await context.bot.copy_message(sid, msg.chat_id, msg.message_id)
+            support_map_set(sid * 10 ** 8 + m.message_id, user["id"]); sent += 1
+        except Exception as e: log.warning(f"support fwd {sid}: {e}")
+    return sent
+async def support_reply(context, sid, msg, target):
+    tl = user_lang(target) or "fa"; head = tr(tl, "sup_reply_head")
+    if msg.text: await context.bot.send_message(target, head + msg.text_html, parse_mode=HTML, disable_web_page_preview=True)
+    else:
+        try: await context.bot.copy_message(target, msg.chat_id, msg.message_id, caption=(head + (msg.caption_html or ""))[:1000], parse_mode=HTML)
+        except Exception: await context.bot.send_message(target, head, parse_mode=HTML); await context.bot.copy_message(target, msg.chat_id, msg.message_id)
+async def _ack(msg, fallback_text, kb=None):
+    try: await msg.set_reaction("👌")
+    except Exception:
+        try: await msg.reply_text(fallback_text, reply_markup=kb)
+        except Exception: pass
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message; u = update.effective_user; uid = u.id
+    if not msg or msg.chat.type != ChatType.PRIVATE: return
+    user = ensure_user(uid, u.username, u.full_name, premium=getattr(u, "is_premium", None))
+    if user["banned"] and not is_super(uid): return
+    lang = L(update); st = context.user_data.get("await")
+    if st:
+        try: return await handle_input(update, context, st)
+        except Exception as e: log_event("ERROR", f"input {st.get('kind')}: {e}", uid); context.user_data.pop("await", None); return await msg.reply_text(tr(lang, "error", e=str(e)[:150]))
+    if is_super(uid) and msg.reply_to_message:
+        target = support_map_get(uid * 10 ** 8 + msg.reply_to_message.message_id)
+        if target:
+            try: await support_reply(context, uid, msg, target); await _ack(msg, tr(lang, "sup_sent"))
+            except Exception as e: await msg.reply_text(tr(lang, "sup_fail", e=str(e)[:100]))
+            return
+    if support_is_open(uid) and not is_super(uid):
+        if not rate_ok(f"sup:{uid}", 2): return
+        sent = await support_forward(context, user, msg); await _ack(msg, tr(lang, "sup_received") if sent else tr(lang, "sup_fail", e="—"), InlineKeyboardMarkup([[B(tr(lang, "sup_close"), "u:man_close")]])); return
+    if not user_lang(uid): return await view_lang(update, context)
+    context.user_data["panel"] = None; await go_home(update, context)
 # ============================================================
-# حلقه‌ی زمان‌بندی و راه‌اندازی اصلی (Scheduler & Main Entrypoint)
-async def scheduler_loop(app):
-    log.info("Scheduler loop started.")
-    while True:
-        try: await scheduler_tick(app.bot)
-        except asyncio.CancelledError: break
-        except Exception as e: log.error(f"Scheduler tick unhandled error: {e}")
-        await asyncio.sleep(TICK_SECONDS)
-
+# دستورات و دیپ‌لینک
+async def _prep(update, context):
+    u = update.effective_user; ensure_user(u.id, u.username, u.full_name, premium=getattr(u, "is_premium", None)); context.user_data.pop("await", None); context.user_data["panel"] = None
+    return user_lang(u.id)
+async def send_deeplink(update, context, key):
+    data = await load_deeplink(key); chat_id = update.effective_chat.id; lang = user_lang(update.effective_user.id) or "fa"
+    if not data: return await update.message.reply_text(tr(lang, "dl_notfound"))
+    short = data.get("short") or ""; full = data.get("full"); media = data.get("media") or {}
+    body = full if full and str(full).lower() != "null" else short
+    if len(body) > BOT_FULL_MAX: body, _ = fit_html(body, BOT_FULL_MAX, True)
+    if data.get("url") and data.get("show_source", True): body += f'\n\n<a href="{html.escape(data["url"], quote=True)}">{tr(lang, "dl_source")}</a>'
+    if media.get("kind") in ("photo", "video", "animation"):
+        try: await getattr(context.bot, f"send_{media['kind']}")(chat_id, media["url"], caption=preview_text(short, 100), parse_mode=HTML)
+        except Exception as e: log.warning(f"deeplink media: {e}")
+    for chunk in split_html(body):
+        try: await context.bot.send_message(chat_id, chunk, parse_mode=HTML, disable_web_page_preview=True)
+        except BadRequest: await context.bot.send_message(chat_id, downgrade_html(chunk), parse_mode=HTML, disable_web_page_preview=True)
+        await asyncio.sleep(.3)
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = await _prep(update, context)
+    if context.args and context.args[0].startswith("r_"): return await send_deeplink(update, context, context.args[0][2:])
+    if not lang: return await view_lang(update, context)
+    await go_home(update, context)
+async def cmd_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = await _prep(update, context)
+    if not lang: return await view_lang(update, context)
+    await (view_admin_home if can_admin(update.effective_user.id) else view_plans)(update, context)
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = await _prep(update, context)
+    if not is_super(update.effective_user.id): return await go_home(update, context)
+    if not lang: return await view_lang(update, context)
+    await view_super_home(update, context)
+async def cmd_man(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = await _prep(update, context); uid = update.effective_user.id
+    if not lang: return await view_lang(update, context)
+    support_open(uid)   # آغاز/پایان نشست پشتیبانی به مدیر کلان اعلام نمی‌شود؛ فقط پیام‌های واقعی کاربر فرستاده می‌شوند
+    await render(update, context, tr(lang, "sup_open"), [[B(tr(lang, "sup_close"), "u:man_close")]], force_new=True)
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = await _prep(update, context)
+    if not lang: return await view_lang(update, context)
+    await render(update, context, gtext("help", lang), [[B(tr(lang, "home"), "home")]])
+async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = await _prep(update, context)
+    if not lang: return await view_lang(update, context)
+    await render(update, context, gtext("about", lang), [[B(tr(lang, "home"), "home")]])
+async def cmd_lang(update: Update, context: ContextTypes.DEFAULT_TYPE): await _prep(update, context); await view_lang(update, context)
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = await _prep(update, context)
+    if not lang: return await view_lang(update, context)
+    await update.message.reply_text(tr(lang, "cancelled")); await go_home(update, context)
+async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = await _prep(update, context)
+    if not lang: return await view_lang(update, context)
+    await go_home(update, context)
+# ============================================================
+# راه‌اندازی
+async def job_tick(context: ContextTypes.DEFAULT_TYPE):
+    try: await scheduler_tick(context.bot)
+    except Exception as e: log_event("ERROR", f"scheduler: {e}")
+async def post_init(app: Application):
+    global BOT_USERNAME, NOTIFY_SUPER, NOTIFY_USER
+    me = await app.bot.get_me(); BOT_USERNAME = me.username; NOTIFY_SUPER = notify_supers; NOTIFY_USER = notify_user_fn
+    await app.bot.set_my_commands([BotCommand("start", "منوی اصلی"), BotCommand("create", "پنل مدیریت / پلن"), BotCommand("man", "پشتیبانی"), BotCommand("about", "درباره"), BotCommand("lang", "زبان"), BotCommand("help", "راهنما"), BotCommand("cancel", "لغو عملیات")], language_code="fa")
+    await app.bot.set_my_commands([BotCommand("start", "Main menu"), BotCommand("create", "Admin panel / plan"), BotCommand("man", "Support"), BotCommand("about", "About"), BotCommand("lang", "Language"), BotCommand("help", "Help"), BotCommand("cancel", "Cancel action")])
+    app.job_queue.run_repeating(job_tick, interval=TICK_SECONDS, first=15, name="tick"); log_event("INFO", f"ربات @{me.username} راه‌اندازی شد")
+    await notify_supers(f"🚀 @{me.username} راه‌اندازی شد · 🤖 مدل‌های فعال {len(list_models(True))} · CF KV {'✅' if CF_ENABLED else '❌'} · تیک هر {TICK_SECONDS}s · AI×{AI_CONCURRENCY} CYCLE×{CYCLE_CONCURRENCY}")
+async def post_shutdown(app: Application):
+    global _http
+    if _http:
+        try: await _http.aclose()
+        except Exception: pass
+async def on_error(update, context):
+    log.exception("خطا: %s", context.error)
+    try: log_event("ERROR", f"unhandled: {context.error}")
+    except Exception: pass
 def main():
     global APP
-    init_db()
-    if not BOT_TOKEN:
-        log.error("BOT_TOKEN is not set! Please set BOT_TOKEN in environment variables.")
-        return
+    if not BOT_TOKEN: raise SystemExit("BOT_TOKEN تنظیم نشده است.")
+    if not SUPER_ADMIN_IDS: raise SystemExit("SUPER_ADMIN_IDS تنظیم نشده است.")
+    init_core(); APP = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).concurrent_updates(True).build()
+    for cmd, fn in (("start", cmd_start), ("create", cmd_create), ("admin", cmd_admin), ("man", cmd_man), ("help", cmd_help), ("about", cmd_about), ("lang", cmd_lang), ("cancel", cmd_cancel)): APP.add_handler(CommandHandler(cmd, fn))
+    APP.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.COMMAND, cmd_unknown))
+    APP.add_handler(CallbackQueryHandler(on_callback)); APP.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_message)); APP.add_error_handler(on_error)
+    log.info("در حال اجرا…"); APP.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
+if __name__ == "__main__": main()
+# ---------- پایان فایل newsbot.py ----------
 
-    APP = Application.builder().token(BOT_TOKEN).build()
-
-    # Commands
-    APP.add_handler(CommandHandler("start", cmd_start))
-    APP.add_handler(CommandHandler("create", cmd_create))
-    APP.add_handler(CommandHandler("help", cmd_help))
-    APP.add_handler(CommandHandler("man", cmd_man))
-    APP.add_handler(CommandHandler("report", cmd_report))
-    APP.add_handler(CommandHandler("logs", cmd_logs))
-    APP.add_handler(CommandHandler("cancel", cmd_cancel))
-
-    # Callbacks and Messages
-    APP.add_handler(CallbackQueryHandler(on_callback))
-    APP.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
-
-    log.info("Starting Telegram Bot application...")
-
-    async def post_init(application):
-        global BOT_USERNAME
-        try:
-            me = await application.bot.get_me()
-            BOT_USERNAME = me.username or ""
-            log.info(f"Bot username loaded: @{BOT_USERNAME}" if BOT_USERNAME else "Bot username is empty")
-        except Exception as e:
-            log.error(f"Could not load bot username: {e}")
-        asyncio.create_task(scheduler_loop(application))
-
-    APP.post_init = post_init
-    APP.run_polling(drop_pending_updates=True)
-
-if __name__ == "__main__":
-    main()
