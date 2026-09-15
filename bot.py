@@ -2332,8 +2332,8 @@ async def view_article(update, context, aid):
 async def view_my_ai(update, context):
     """مدل‌های شخصیِ همین مدیر (جدا از مدل‌های عمومی مدیر کلان)."""
     uid = update.effective_user.id; lang = L(update); ms = list_models(owner_id=uid)
-    text = tr(lang, "my_ai_title") + ("".join(tr(lang, "my_ai_line", i=_mic(m), name=esc(m["name"]), model=esc(m["model"]), ok=m["ok_count"]) for m in ms) if ms else tr(lang, "my_ai_none"))
-    kb = pairs([B(f"{_mic(m)} {m['name'][:20]}", f"a:myai_v:{m['id']}") for m in ms]) + [[B(tr(lang, "my_ai_add"), "a:myai_add")], [B(tr(lang, "back"), "a:home")]]
+    text = tr(lang, "my_ai_title") + ("".join(tr(lang, "my_ai_line", i=_mic(m), name=esc(_mname(m)), model=esc(m["model"]), ok=m["ok_count"]) for m in ms) if ms else tr(lang, "my_ai_none"))
+    kb = pairs([B(f"{_mic(m)} {_mname(m)[:20]}", f"a:myai_v:{m['id']}") for m in ms]) + [[B(tr(lang, "my_ai_add"), "a:myai_add")], [B(tr(lang, "back"), "a:home")]]
     await render(update, context, text, kb)
 async def view_my_ai_model(update, context, mid):
     uid = update.effective_user.id; lang = L(update); m = get_model(mid)
@@ -2471,10 +2471,11 @@ async def view_s_user(update, context, tid):
     kb = [[B(tr(lang, "s_uplan"), f"s:uplan:{tid}"), B(tr(lang, "s_urevoke"), f"s:urevoke:{tid}")], [B(tr(lang, "s_uban"), f"s:uban:{tid}"), B(tr(lang, "s_umsg"), f"s:umsg:{tid}")], [B(tr(lang, "s_ureport"), f"s:ureport:{tid}"), B(tr(lang, "s_ufree"), f"s:ufree:{tid}")], [B(tr(lang, "s_utests"), f"s:utests:{tid}"), B(tr(lang, "s_uposts"), f"s:uposts:{tid}")], [B(tr(lang, "back"), "s:users:0")]]
     await render(update, context, text, kb)
 def _mic(m): return "⏸" if not m["active"] else "🟢" if m["status"] == "ok" else "🔴"
+def _mname(m): return str(m["name"] or m["model"] or f"#{m['id']}")
 async def view_s_models(update, context):
     lang = L(update); ms = list_models()
-    text = tr(lang, "s_models_title") + "\n" + "".join(f"\n{_mic(m)} <b>{esc(m['name'])}</b> · <code>{esc(m['model'])}</code> · p{m['priority']} · ✅{m['ok_count']}" for m in ms)
-    kb = pairs([B(f"{_mic(m)} {m['name'][:20]} (p{m['priority']})", f"s:model:{m['id']}") for m in ms]) + [[B(tr(lang, "s_model_add"), "s:model_add"), B(tr(lang, "s_models_test"), "s:models_test")], [B(tr(lang, "back"), "s:home")]]; await render(update, context, text, kb)
+    text = tr(lang, "s_models_title") + "\n" + "".join(f"\n{_mic(m)} <b>{esc(_mname(m))}</b> · <code>{esc(m['model'])}</code> · p{m['priority']} · ✅{m['ok_count']}" for m in ms)
+    kb = pairs([B(f"{_mic(m)} {_mname(m)[:20]} (p{m['priority']})", f"s:model:{m['id']}") for m in ms]) + [[B(tr(lang, "s_model_add"), "s:model_add"), B(tr(lang, "s_models_test"), "s:models_test")], [B(tr(lang, "back"), "s:home")]]; await render(update, context, text, kb)
 async def view_s_model(update, context, mid):
     lang = L(update); m = get_model(mid)
     if not m: return await view_s_models(update, context)
