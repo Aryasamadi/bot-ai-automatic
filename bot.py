@@ -3,7 +3,7 @@
 NewsBot v3 — یک‌فایل کامل: هسته‌ی داده، موتور محتوا، رابط کاربری، پنل مدیر کلان
 نیازمندی‌ها: python-telegram-bot[job-queue]>=21, httpx, feedparser, trafilatura, beautifulsoup4, lxml
 """
-import os, re, json, html, time, random, asyncio, logging, sqlite3, hashlib, secrets, tempfile, threading, sys
+import os, re, json, html, time, random, asyncio, logging, sqlite3, hashlib, secrets, tempfile, threading, ipaddress, socket
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 import httpx, feedparser, trafilatura
@@ -11,11 +11,12 @@ from bs4 import BeautifulSoup
 #  ============================================================
 # تنظیمات محیطی
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-SUPER_ADMIN_IDS = {int(x) for x in os.getenv("SUPER_ADMIN_IDS", "0").split(",") if x.strip().isdigit()}
+SUPER_ADMIN_IDS = {int(x) for x in os.getenv("SUPER_ADMIN_IDS", "").split(",") if x.strip().isdigit() and int(x) > 0}
 DB_FILE = os.getenv("DB_FILE", "newsbot.db")
 DATA_TTL_HOURS = int(os.getenv("DATA_TTL_HOURS", "24"))
 MAX_MEDIA_MB = int(os.getenv("MAX_MEDIA_MB", "50"))
 MAX_MEDIA_BYTES = MAX_MEDIA_MB * 1024 * 1024
+MAX_PAGE_BYTES = int(os.getenv("MAX_PAGE_MB", "8")) * 1024 * 1024   # سقف حجم صفحه/فید دانلودی (جلوگیری از پرشدن حافظه)
 MAX_ARTICLE_CHARS = int(os.getenv("MAX_ARTICLE_CHARS", "28000"))
 MAX_ARTICLE_PAGES = int(os.getenv("MAX_ARTICLE_PAGES", "3"))
 CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "")
@@ -126,7 +127,7 @@ CREATE TABLE IF NOT EXISTS sources(id INTEGER PRIMARY KEY AUTOINCREMENT, admin_i
 CREATE TABLE IF NOT EXISTS usage(admin_id INTEGER, day TEXT, posts INTEGER DEFAULT 0, tests INTEGER DEFAULT 0, PRIMARY KEY(admin_id, day));
 CREATE TABLE IF NOT EXISTS articles(id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER, channel_id INTEGER, hash TEXT, url TEXT, title TEXT, source_id INTEGER, published_at TEXT, created_at TEXT, status TEXT, reason TEXT, score REAL, category TEXT, text TEXT, post_html TEXT, full_html TEXT, media TEXT, links TEXT, model TEXT, UNIQUE(channel_id, hash));
 CREATE TABLE IF NOT EXISTS posted(channel_id INTEGER, hash TEXT, posted_at TEXT, PRIMARY KEY(channel_id, hash));
-CREATE TABLE IF NOT EXISTS ai_models(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, kind TEXT, base_url TEXT, api_key TEXT, model TEXT, priority INTEGER DEFAULT 10, active INTEGER DEFAULT 1, status TEXT DEFAULT 'ok', fail_count INTEGER DEFAULT 0, last_error TEXT, last_ok TEXT, last_fail TEXT, ok_count INTEGER DEFAULT 0, temperature REAL DEFAULT 0.5, max_tokens INTEGER DEFAULT 2500);
+CREATE TABLE IF NOT EXISTS ai_models(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, kind TEXT, base_url TEXT, api_key TEXT, model TEXT, priority INTEGER DEFAULT 10, active INTEGER DEFAULT 1, status TEXT DEFAULT 'ok', fail_count INTEGER DEFAULT 0, last_error TEXT, last_ok TEXT, last_fail TEXT, ok_count INTEGER DEFAULT 0, temperature REAL DEFAULT 0.5, max_tokens INTEGER DEFAULT 2500, owner_id INTEGER);
 CREATE TABLE IF NOT EXISTS deeplinks(key TEXT PRIMARY KEY, admin_id INTEGER, created_at TEXT, local_json TEXT);
 CREATE TABLE IF NOT EXISTS kv_cache(key TEXT PRIMARY KEY, value TEXT, cached_at TEXT);
 CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, level TEXT, admin_id INTEGER, msg TEXT);
@@ -144,7 +145,9 @@ MIGRATIONS = [("users", "next_plan_id", "INTEGER"), ("users", "next_plan_days", 
               ("channels", "lock_code", "TEXT"), ("channels", "verified_by", "INTEGER"), ("channels", "created_at", "TEXT"), ("channels", "settings", "TEXT"),
               ("sources", "channel_id", "INTEGER"), ("sources", "feed_url", "TEXT"), ("sources", "last_error", "TEXT"), ("articles", "channel_id", "INTEGER"),
               ("sources", "bot_active", "INTEGER DEFAULT 1"), ("sources", "api_url", "TEXT"), ("sources", "api_key", "TEXT"), ("sources", "api_note", "TEXT DEFAULT ''"),
-              ("pay_requests", "discount", "TEXT"), ("pay_requests", "final_price", "TEXT")]
+              ("pay_requests", "discount", "TEXT"), ("pay_requests", "final_price", "TEXT"),
+              ("ai_models", "temperature", "REAL DEFAULT 0.5"), ("ai_models", "max_tokens", "INTEGER DEFAULT 2500"), ("ai_models", "owner_id", "INTEGER"),
+              ("plans", "daily_tests", "INTEGER DEFAULT 2"), ("sources", "found_total", "INTEGER DEFAULT 0"), ("sources", "title", "TEXT DEFAULT ''")]
 def db():
     global _conn
     if _conn is None:
@@ -158,10 +161,24 @@ def db():
         _conn.commit()
     return _conn
 def q(sql, params=(), one=False, commit=False):
-    with _lock:
-        cur = db().execute(sql, params)
-        if commit: db().commit(); return cur.lastrowid
-        return cur.fetchone() if one else cur.fetchall()
+    """قفل موقت SQLite زیر بار (چند چرخه‌ی هم‌زمان) خطا نمی‌دهد؛ چند بار کوتاه دوباره تلاش می‌شود."""
+    for attempt in range(4):
+        try:
+            with _lock:
+                cur = db().execute(sql, params)
+                if commit: db().commit(); return cur.lastrowid
+                return cur.fetchone() if one else cur.fetchall()
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            if attempt == 3 or ("locked" not in msg and "busy" not in msg): raise
+            time.sleep(0.15 * (attempt + 1))
+_COLS = {}
+def _safe_fields(table, f):
+    """در SQL پویا فقط ستون‌های واقعیِ همان جدول پذیرفته می‌شوند (نام ستون از ورودی کاربر می‌آید)."""
+    if table not in _COLS: _COLS[table] = {r["name"] for r in q(f"PRAGMA table_info({table})")}
+    bad = [k for k in f if k not in _COLS[table]]
+    if bad: raise ValueError(f"unknown column: {bad[0]}")
+    return f
 def gset(k, v): q("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (k, json.dumps(v, ensure_ascii=False)), commit=True)
 def gget(k, default=None):
     r = q("SELECT value FROM settings WHERE key=?", (k,), one=True)
@@ -212,7 +229,7 @@ def role_of(uid):
 def user_lang(uid):
     u = get_user(uid); return u["lang"] if u and u["lang"] in LANGS else None
 def set_lang(uid, lang): q("UPDATE users SET lang=? WHERE id=?", (lang if lang in LANGS else "fa", uid), commit=True)
-def list_users(role=None, limit=5000): return q("SELECT * FROM users" + (" WHERE role=?" if role else "") + " ORDER BY created_at DESC LIMIT ?", ((role, limit) if role else (limit,)))
+def list_users(role=None, limit=200000): return q("SELECT * FROM users" + (" WHERE role=?" if role else "") + " ORDER BY created_at DESC LIMIT ?", ((role, limit) if role else (limit,)))
 def list_admins(): return q("SELECT * FROM users WHERE role IN ('admin','super') AND banned=0")
 def count_users(): return q("SELECT role, COUNT(*) c FROM users GROUP BY role")
 # ============================================================
@@ -232,7 +249,7 @@ def create_plan(**f):
     return q("INSERT INTO plans(name,name_en,days,daily_posts,max_sources,max_channels,daily_tests,price,price_en,description,description_en,is_free,sort) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
              (f.get("name", "پلن"), f.get("name_en", ""), f.get("days", 30), f.get("daily_posts", 5), f.get("max_sources", 5), f.get("max_channels", 1), f.get("daily_tests", 2), f.get("price", ""), f.get("price_en", ""), f.get("description", ""), f.get("description_en", ""), f.get("is_free", 0), f.get("sort", 0)), commit=True)
 def update_plan(pid, **f):
-    for k, v in f.items(): q(f"UPDATE plans SET {k}=? WHERE id=?", (v, pid), commit=True)
+    for k, v in _safe_fields("plans", f).items(): q(f"UPDATE plans SET {k}=? WHERE id=?", (v, pid), commit=True)
 def delete_plan(pid): q("DELETE FROM plans WHERE id=?", (pid,), commit=True)
 def assign_plan(uid, pid, days=None):
     """
@@ -302,7 +319,7 @@ def disc_create(code, percent, expires_iso, max_uses=0):
     if not code or disc_get(code): return None
     q("INSERT INTO discounts(code,percent,expires,max_uses,used,active,created_at) VALUES(?,?,?,?,0,1,?)", (code, max(1, min(100, int(percent))), expires_iso, int(max_uses or 0), now_iso()), commit=True); return code
 def disc_update(code, **f):
-    for k, v in f.items(): q(f"UPDATE discounts SET {k}=? WHERE code=?", (v, code), commit=True)
+    for k, v in _safe_fields("discounts", f).items(): q(f"UPDATE discounts SET {k}=? WHERE code=?", (v, code), commit=True)
 def disc_delete(code): q("DELETE FROM discounts WHERE code=?", (code,), commit=True)
 def disc_valid(code):
     """خروجی: (row|None, reason) — reason: ok | notfound | inactive | expired | exhausted"""
@@ -484,6 +501,7 @@ def article_insert(uid, cid, h, url, title, source_id, published_at, status="dis
         db().commit(); return cur.lastrowid if cur.rowcount else None
 def article_update(aid, **f):
     if not f: return
+    _safe_fields("articles", f)
     q("UPDATE articles SET " + ", ".join(f"{k}=?" for k in f) + " WHERE id=?", (*f.values(), aid), commit=True)
 def get_article(aid): return q("SELECT * FROM articles WHERE id=?", (aid,), one=True)
 def articles_by_status(cid, status, limit=50):
@@ -540,9 +558,33 @@ def http():
         _http = httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(25, connect=10), limits=httpx.Limits(max_connections=FETCH_CONCURRENCY + 8, max_keepalive_connections=8),
                                   headers={"User-Agent": UA_BROWSER, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language": "fa,en;q=0.8"})
     return _http
+_PRIVATE_HOSTS = ("localhost", "metadata.google.internal")
+_host_ok = {}
+def public_url(u):
+    """آدرس، بیرونی و امن است؟ منبعِ کاربر نباید به شبکه‌ی داخلی سرور اشاره کند (SSRF)."""
+    try: p = urlparse(str(u))
+    except Exception: return False
+    if p.scheme not in ("http", "https") or not p.hostname: return False
+    host = p.hostname.lower()
+    if host in _host_ok: return _host_ok[host]
+    ok = not (host in _PRIVATE_HOSTS or host.endswith((".local", ".internal", ".localhost")))
+    if ok:
+        try: addrs = [i[4][0] for i in socket.getaddrinfo(host, None)]
+        except Exception: addrs = []      # resolve نشد؛ خودِ درخواست خطای معمول می‌دهد
+        for a in addrs:
+            try: ip = ipaddress.ip_address(a)
+            except Exception: ok = False; break
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast: ok = False; break
+    if len(_host_ok) > 5000: _host_ok.clear()
+    _host_ok[host] = ok; return ok
 async def fetch(url, **kw):
     """دانلود با سمافور سراسری (جلوگیری از فشار هم‌زمان). خروجی: Response یا Exception."""
-    async with FETCH_SEM: return await http().get(url, **kw)
+    if not await asyncio.to_thread(public_url, url): raise FetchError(403, str(url))
+    async with FETCH_SEM: r = await http().get(url, **kw)
+    try:
+        if int(r.headers.get("content-length") or 0) > MAX_PAGE_BYTES: raise FetchError(413, str(url))
+    except (TypeError, ValueError): pass
+    return r
 class FetchError(RuntimeError):
     """خطای HTTP با کد وضعیت؛ برای پیام اختصاصی ۴۰۳ هنگام افزودن منبع."""
     def __init__(self, status, url=""): super().__init__(f"HTTP {status}"); self.status = int(status); self.url = url
@@ -758,8 +800,8 @@ def sanitize_html(text, premium=False):
         else:
             if tag == "a":
                 h = re.search(r'href=["\']([^"\']+)["\']', attrs)
-                if not h: continue
-                out.append(f'<a href="{html.escape(h.group(1), quote=True)}">')
+                if not h or not h.group(1).strip().lower().startswith(("http://", "https://", "tg://")): continue
+                out.append(f'<a href="{html.escape(h.group(1).strip(), quote=True)}">')
             elif tag == "tg-emoji":
                 eid = re.search(r'emoji-id=["\']?(\d+)', attrs)
                 if not eid: continue
@@ -1468,6 +1510,7 @@ def _ext_kind(u, fallback="photo"):
 async def download_media(media):
     """دانلود جریانی تا سقف MAX_MEDIA_MB (پیش‌فرض ۵۰ مگابایت = سقف آپلود ربات‌های تلگرام). اگر نوبت اول رد شد، یک‌بار با هدر دیگری دوباره تلاش می‌شود."""
     if not media or not media.get("url"): return None
+    if not await asyncio.to_thread(public_url, media["url"]): return None
     for hdr in (_media_headers(media), {"User-Agent": UA_FEED, "Accept": "*/*"}):
         try:
             async with FETCH_SEM:
@@ -1480,13 +1523,18 @@ async def download_media(media):
                     except Exception: pass
                     kind = "animation" if "gif" in ct else "photo" if ct.startswith("image/") else "video" if ct.startswith("video/") else _ext_kind(media["url"], media.get("kind") or "document")
                     ext = {"photo": ".jpg", "animation": ".gif", "video": ".mp4"}.get(kind, os.path.splitext(urlparse(media["url"]).path)[1] or ".bin")
-                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext); size = 0
-                    async for chunk in r.aiter_bytes(262144):
-                        size += len(chunk)
-                        if size > MAX_MEDIA_BYTES: tmp.close(); os.unlink(tmp.name); log.info(f"media skipped (> {MAX_MEDIA_MB}MB)"); return None
-                        tmp.write(chunk)
-                    tmp.close()
-                    if size < 1024: os.unlink(tmp.name); return None
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext); size = 0; keep = False
+                    try:      # فایل موقت در هیچ مسیری (خطا، سقف حجم، فایل ناقص) روی دیسک جا نمی‌ماند
+                        async for chunk in r.aiter_bytes(262144):
+                            size += len(chunk)
+                            if size > MAX_MEDIA_BYTES: log.info(f"media skipped (> {MAX_MEDIA_MB}MB)"); return None
+                            tmp.write(chunk)
+                        keep = size >= 1024
+                    finally:
+                        tmp.close()
+                        if not keep:
+                            try: os.unlink(tmp.name)
+                            except Exception: pass
                     if kind == "photo" and size > 10 * 1024 * 1024: kind = "document"
                     return tmp.name, kind
         except Exception as e: log.warning(f"media: {e}")
@@ -1919,7 +1967,7 @@ TXT = {
     "src_dead": ("⚠️ تست بارگذاری موفق نبود؛ نمی‌توان از این سایت محتوا تولید کرد. اگر فید RSS دارد، آدرس فید را مستقیم بدهید.", "⚠️ Load test failed; content can't be produced from this site. If it has an RSS feed, give the feed URL directly."),
     "src_added_off": ("\n➕ منبع اضافه شد اما 🔴 خاموش است.", "\n➕ The source was added but is 🔴 off."), "src_now_off": ("\n🔴 منبع خاموش شد.", "\n🔴 The source was turned off."),
     "src_view": ("🌐 <b>{host}</b>\n<code>{url}</code>\n{feed}\n{st} · آخرین بررسی {last} · 🆕 {n} · ⚠️×{f}{err}", "🌐 <b>{host}</b>\n<code>{url}</code>\n{feed}\n{st} · last check {last} · 🆕 {n} · ⚠️×{f}{err}"),
-    "src_feed": ("📡 <code>{u}</code>", "📡 <code>{u}</code>"), "active": ("🟢 فعال", "?? active"), "inactive": ("🔴 غیرفعال", "🔴 inactive"), "toggle": ("⏯ روشن/خاموش", "⏯ On/off"), "delete": ("🗑 حذف", "🗑 Delete"),
+    "src_feed": ("📡 <code>{u}</code>", "📡 <code>{u}</code>"), "active": ("🟢 فعال", "🟢 active"), "inactive": ("🔴 غیرفعال", "🔴 inactive"), "toggle": ("⏯ روشن/خاموش", "⏯ On/off"), "delete": ("🗑 حذف", "🗑 Delete"),
     "src_st": ("{c} کانال · {b} ربات", "{c} channel · {b} bot"), "tog_ch": ("⏯ منبع کانال", "⏯ Channel source"), "tog_bot": ("🤖 منبع ربات", "🤖 Bot source"),
     "src_ch_on": ("🟢 منبع برای کانال روشن شد", "🟢 Source on for channel"), "src_ch_off": ("🔴 منبع برای کانال خاموش شد", "🔴 Source off for channel"),
     "src_bot_on": ("🟢 منبع برای محتوای ربات روشن شد", "🟢 Source on for bot content"), "src_bot_off": ("🔴 منبع برای محتوای ربات خاموش شد", "🔴 Source off for bot content"),
