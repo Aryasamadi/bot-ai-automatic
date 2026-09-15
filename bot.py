@@ -170,8 +170,9 @@ def q(sql, params=(), one=False, commit=False):
                 return cur.fetchone() if one else cur.fetchall()
         except sqlite3.OperationalError as e:
             msg = str(e).lower()
-            if attempt == 3 or ("locked" not in msg and "busy" not in msg): raise
-            time.sleep(0.15 * (attempt + 1))
+            try: db().rollback()   # تراکنش ناتمام باز نماند؛ وگرنه تلاش دوباره روی تغییر نیمه‌کاره سوار می‌شود
+            except Exception: pass
+            if attempt == 3 or ("locked" not in msg and "busy" not in msg): raise   # انتظار قفل با PRAGMA busy_timeout انجام می‌شود؛ حلقه‌ی رویداد مسدود نمی‌شود
 _COLS = {}
 def _safe_fields(table, f):
     """در SQL پویا فقط ستون‌های واقعیِ همان جدول پذیرفته می‌شوند (نام ستون از ورودی کاربر می‌آید)."""
@@ -305,6 +306,18 @@ def usage_inc(uid, field):
     q("INSERT INTO usage(admin_id,day,posts,tests) VALUES(?,?,0,0) ON CONFLICT(admin_id,day) DO NOTHING", (uid, d), commit=True)
     q(f"UPDATE usage SET {field}={field}+1 WHERE admin_id=? AND day=?", (uid, d), commit=True)
 def usage_reset(uid, field="tests"): q(f"UPDATE usage SET {field}=0 WHERE admin_id=? AND day=?", (uid, today_str(admin_offset(uid))), commit=True)
+def usage_reserve(uid, field="posts"):
+    """سهمیه را پیشاپیش و اتمیک رزرو می‌کند تا چند چرخه‌ی هم‌زمان از سقف پلن عبور نکنند. خروجی: True اگر سهمیه گرفته شد."""
+    lim = admin_limits(uid); cap = lim["daily_posts"] if field == "posts" else lim["daily_tests"]
+    if cap is None: return True
+    d = today_str(admin_offset(uid))
+    q("INSERT INTO usage(admin_id,day,posts,tests) VALUES(?,?,0,0) ON CONFLICT(admin_id,day) DO NOTHING", (uid, d), commit=True)
+    with _lock:
+        cur = db().execute(f"UPDATE usage SET {field}={field}+1 WHERE admin_id=? AND day=? AND {field}<?", (uid, d, cap))
+        db().commit(); return cur.rowcount > 0
+def usage_release(uid, field="posts"):
+    """سهمیه‌ی رزروشده‌ای که به نتیجه نرسید (انتشار ناموفق) باز می‌گردد."""
+    q(f"UPDATE usage SET {field}=MAX(0,{field}-1) WHERE admin_id=? AND day=?", (uid, today_str(admin_offset(uid))), commit=True)
 def remaining(uid, field="posts"):
     lim = admin_limits(uid); cap = lim["daily_posts"] if field == "posts" else lim["daily_tests"]
     if cap is None: return None
@@ -368,11 +381,23 @@ DEFAULT_CATEGORIES = {
     "fa": [{"name": "خبری", "emoji": "📰", "style": "تیتر کوتاه بولد، لید یک‌جمله‌ای، ۲ تا ۳ پاراگراف کوتاه، یک نکته‌ی کلیدی با «•»."},
            {"name": "آموزشی", "emoji": "🎓", "style": "تیتر بولد، مقدمه‌ی یک‌خطی، ۳ تا ۶ نکته با «•»، جمع‌بندی یک‌خطی."},
            {"name": "تحلیلی", "emoji": "🧠", "style": "تیتر بولد، یک نقل‌قول کلیدی داخل blockquote، تحلیل در دو پاراگراف کوتاه."},
-           {"name": "معرفی و بررسی", "emoji": "🔍", "style": "تیتر بولد، خلاصه‌ی یک‌خطی، مزایا/معایب با «•»، جمع‌بندی بی‌طرف."}],
+           {"name": "معرفی و بررسی", "emoji": "🔍", "style": "تیتر بولد، خلاصه‌ی یک‌خطی، مزایا/معایب با «•»، جمع‌بندی بی‌طرف."},
+           {"name": "علمی و پژوهشی", "emoji": "🔬", "style": "تیتر بولد، یافته‌ی اصلی در یک جمله، روش و اعداد مهم با «•»، محدودیت‌ها در یک خط."},
+           {"name": "اقتصادی و بازار", "emoji": "📈", "style": "تیتر بولد، عدد/روند کلیدی در blockquote، دلیل و پیامد در دو پاراگراف کوتاه، بدون توصیه‌ی مالی."},
+           {"name": "سلامت و سبک زندگی", "emoji": "🫁", "style": "تیتر بولد، توضیح ساده، توصیه‌های عملی با «•»، یک خط یادآوری که جایگزین پزشک نیست."},
+           {"name": "ورزشی", "emoji": "🏆", "style": "تیتر بولد، نتیجه/رخداد در خط اول، آمار مهم با «•»، یک جمله درباره‌ی ادامه‌ی ماجرا."},
+           {"name": "فرهنگ و هنر", "emoji": "🎭", "style": "تیتر بولد، معرفی کوتاه اثر/رخداد، یک نقل‌قول در blockquote، لحن روایی و بی‌قضاوت."},
+           {"name": "شغلی و مهارت", "emoji": "💼", "style": "تیتر بولد، فرصت/مهارت در یک جمله، مراحل عملی با «•»، یک خط جمع‌بندی."}],
     "en": [{"name": "News", "emoji": "📰", "style": "Short bold headline, one-sentence lead, 2–3 short paragraphs, one key point as a “•” bullet."},
            {"name": "Tutorial", "emoji": "🎓", "style": "Bold headline, one-line intro, 3–6 “•” bullets, one-line takeaway."},
            {"name": "Analysis", "emoji": "🧠", "style": "Bold headline, one key quote in blockquote, analysis in two short paragraphs."},
-           {"name": "Review", "emoji": "🔍", "style": "Bold headline, one-line summary, pros/cons as “•” bullets, neutral verdict."}],
+           {"name": "Review", "emoji": "🔍", "style": "Bold headline, one-line summary, pros/cons as “•” bullets, neutral verdict."},
+           {"name": "Science & research", "emoji": "🔬", "style": "Bold headline, the main finding in one sentence, method and key numbers as “•” bullets, limitations in one line."},
+           {"name": "Business & markets", "emoji": "📈", "style": "Bold headline, the key figure or trend in a blockquote, cause and effect in two short paragraphs, no financial advice."},
+           {"name": "Health & lifestyle", "emoji": "🫁", "style": "Bold headline, plain explanation, practical tips as “•” bullets, one line noting it is not medical advice."},
+           {"name": "Sports", "emoji": "🏆", "style": "Bold headline, result or event on the first line, key stats as “•” bullets, one sentence on what comes next."},
+           {"name": "Culture & arts", "emoji": "🎭", "style": "Bold headline, short introduction of the work or event, one quote in blockquote, narrative and non-judgmental tone."},
+           {"name": "Career & skills", "emoji": "💼", "style": "Bold headline, the opportunity or skill in one sentence, actionable steps as “•” bullets, one-line takeaway."}],
 }
 DEFAULT_CRITERIA = {
     "fa": [{"name": "ارزش محتوایی", "weight": 40}, {"name": "غیرتبلیغاتی بودن", "weight": 15}, {"name": "کیفیت و کامل بودن", "weight": 20}, {"name": "ارتباط با موضوع کانال", "weight": 15}, {"name": "تازگی", "weight": 10}],
@@ -628,14 +653,19 @@ def detect_kind(base_url):
     if "anthropic.com" in b: return "anthropic"
     if "generativelanguage.googleapis.com" in b: return "gemini"
     return "openai"     # OpenAI-compatible: OpenAI, OpenRouter, Groq, DeepSeek, Together, Mistral, xAI, Ollama, LM Studio, …
-def list_models(active_only=False): return q("SELECT * FROM ai_models" + (" WHERE active=1" if active_only else "") + " ORDER BY priority, id")
+def list_models(active_only=False, owner_id=None):
+    """owner_id=None ⇒ مدل‌های عمومیِ مدیر کلان · owner_id=<uid> ⇒ مدل‌های شخصیِ همان مدیر"""
+    sql = "SELECT * FROM ai_models WHERE " + ("owner_id=?" if owner_id else "owner_id IS NULL")
+    if active_only: sql += " AND active=1"
+    return q(sql + " ORDER BY priority, id", (owner_id,) if owner_id else ())
 def get_model(mid): return q("SELECT * FROM ai_models WHERE id=?", (mid,), one=True)
-def add_model(base_url, api_key, model, name="", priority=10, temperature=0.5, max_tokens=2500):
+def add_model(base_url, api_key, model, name="", priority=10, temperature=0.5, max_tokens=2500, owner_id=None):
     base_url = str(base_url).strip().rstrip("/"); model = str(model).strip(); kind = detect_kind(base_url)
     name = (name or f"{hostname(base_url) or kind}").strip()[:40]
-    return q("INSERT INTO ai_models(name,kind,base_url,api_key,model,priority,temperature,max_tokens) VALUES(?,?,?,?,?,?,?,?)", (name, kind, base_url, api_key.strip(), model, priority, temperature, max_tokens), commit=True)
+    return q("INSERT INTO ai_models(name,kind,base_url,api_key,model,priority,temperature,max_tokens,owner_id) VALUES(?,?,?,?,?,?,?,?,?)", (name, kind, base_url, api_key.strip(), model, priority, temperature, max_tokens, owner_id), commit=True)
 def update_model(mid, **f):
     if "base_url" in f: f["base_url"] = str(f["base_url"]).strip().rstrip("/"); f["kind"] = detect_kind(f["base_url"])
+    _safe_fields("ai_models", f)
     q("UPDATE ai_models SET " + ", ".join(f"{k}=?" for k in f) + " WHERE id=?", (*f.values(), mid), commit=True)
 def delete_model(mid): q("DELETE FROM ai_models WHERE id=?", (mid,), commit=True)
 async def notify_super(text, kb=None):
@@ -709,10 +739,10 @@ def _model_ready(m):
     """مدلِ سالم، یا مدلِ افتاده‌ای که وقت آزمایش دوباره‌اش رسیده است."""
     if m["status"] != "down": return True
     lf = parse_dt(m["last_fail"]); return bool(not lf or (now_utc() - lf) >= timedelta(minutes=MODEL_PROBE_MIN))
-async def ai_chat(system, user, on_queue=None):
-    """خروجی: (text, model_name, err_code) — ابتدا سراغ مدلِ بیکار می‌رود (توزیع بار بین مدل‌ها)؛ اگر همه مشغول بودند درخواست در صف همان مدل می‌ماند و on_queue صدا زده می‌شود تا به مدیر «در صف پردازش» نشان داده شود."""
-    models = [m for m in list_models(active_only=True) if _model_ready(m)]
-    if not models: log_event("ERROR", "هیچ مدل فعالی در دسترس نیست."); return None, None, "ai_none"
+async def ai_chat(system, user, on_queue=None, owner_id=None):
+    """خروجی: (text, model_name, err_code) — اولویت با مدل‌های شخصیِ خودِ مدیر است؛ اگر نداشت یا همه‌شان خطا دادند، مدل‌های عمومی ربات امتحان می‌شوند. ابتدا سراغ مدلِ بیکار می‌رود؛ اگر همه مشغول بودند on_queue صدا زده می‌شود."""
+    models = ([m for m in list_models(active_only=True, owner_id=owner_id) if _model_ready(m)] if owner_id else []) + [m for m in list_models(active_only=True) if _model_ready(m)]
+    if not models: log_event("ERROR", "هیچ مدل فعالی در دسترس نیست.", owner_id); return None, None, "ai_none"
     last, tried, told = "ai_error", set(), False
     while True:
         rest = [m for m in models if m["id"] not in tried]
@@ -741,7 +771,7 @@ async def probe_down_models():
     for m in q("SELECT * FROM ai_models WHERE active=1 AND status='down' ORDER BY last_fail LIMIT 1"):
         lf = parse_dt(m["last_fail"])
         if not lf or (now_utc() - lf) >= timedelta(minutes=MODEL_PROBE_MIN): await test_model(m["id"])
-def any_model_available(): return any(_model_ready(m) for m in list_models(active_only=True))
+def any_model_available(owner_id=None): return any(_model_ready(m) for m in list_models(active_only=True, owner_id=owner_id)) or (bool(owner_id) and any(_model_ready(m) for m in list_models(active_only=True)))
 def models_free_count(): return sum(1 for m in list_models(active_only=True) if _model_ready(m) and not model_busy(m["id"]))
 def parse_json(text):
     if not text: return None
@@ -1452,9 +1482,9 @@ def weighted_score(s, scores):
         except Exception: v = 5.0
         tot += w; acc += w * v / 10
     return round(acc / tot * 100, 1) if tot else 0.0
-async def generate(s, art, on_queue=None):
+async def generate(s, art, on_queue=None, owner_id=None):
     """خروجی: (json, model_name, error_code) — error_code کلید امن است (هرگز متن خطای مدل یا base url)."""
-    want_full = len(art["text"]) > 1200; system, user = build_prompt(s, art, want_full); raw, model, err = await ai_chat(system, user, on_queue=on_queue)
+    want_full = len(art["text"]) > 1200; system, user = build_prompt(s, art, want_full); raw, model, err = await ai_chat(system, user, on_queue=on_queue, owner_id=owner_id)
     if not raw: return None, None, err
     j = parse_json(raw)
     if not j or not str(j.get("post") or "").strip(): j = {"is_ad": False, "category": s["categories"][0]["name"] if s["categories"] else "", "title": art["title"], "scores": {}, "post": clean_ai_text(salvage_post(raw), s)[:3000], "full": None}
@@ -1589,14 +1619,15 @@ async def bot_can_post(bot, chat_id):
         return me.status == "administrator" and getattr(me, "can_post_messages", True) is not False
     except Exception: return False
 async def publish_article(bot, aid, count_usage=True):
-    """خروجی: (ok, link|error_code) — error_code: not_ready | no_channel | bot_not_admin | duplicate | send_failed:<err>"""
+    """خروجی: (ok, link|error_code) — error_code: not_ready | no_channel | bot_not_admin | duplicate | quota | send_failed:<err>"""
     a = get_article(aid)
     if not a or not a["post_html"]: return False, "not_ready"
     ch = get_channel(a["channel_id"]); admin_id = a["admin_id"]
     if not ch: return False, "no_channel"
+    if count_usage and not usage_reserve(admin_id, "posts"): return False, "quota"   # سهمیه قبل از ارسال و اتمیک گرفته می‌شود
     s = get_settings(ch["id"]); lang = s["ui_lang"]; prem = bool(s.get("premium_format"))
-    if not await bot_can_post(bot, ch["chat_id"]): article_update(aid, status="failed", reason="bot_not_admin"); return False, "bot_not_admin"
-    if posted_before(ch["chat_id"], a["hash"]): article_update(aid, status="failed", reason="duplicate"); return False, "duplicate"
+    if not await bot_can_post(bot, ch["chat_id"]): article_update(aid, status="failed", reason="bot_not_admin"); usage_release(admin_id, "posts") if count_usage else None; return False, "bot_not_admin"
+    if posted_before(ch["chat_id"], a["hash"]): article_update(aid, status="failed", reason="duplicate"); usage_release(admin_id, "posts") if count_usage else None; return False, "duplicate"
     media = json.loads(a["media"]) if a["media"] and s["include_media"] else None
     tail = make_tail(s, ch, a["url"]); post = re.sub(r'\s*🔗 <a href="[^"]+">Source</a>\s*', "\n", a["post_html"] or ""); post = clean_ai_text(strip_source_url(post, a["url"]), s); body = post[:-len(tail)] if tail and post.endswith(tail) else post; text = post; limit = int(s["post_limit"])
     if len(post) > limit:
@@ -1613,14 +1644,13 @@ async def publish_article(bot, aid, count_usage=True):
         text = cut + more + tail
     try:
         try: msg = await send_post(bot, ch["chat_id"], text, media)
-        except Exception as e: article_update(aid, status="failed", reason=f"send: {str(e)[:120]}"); log_event("ERROR", f"ارسال به {ch['title']}: {e}", admin_id); return False, f"send_failed:{str(e)[:120]}"
+        except Exception as e: article_update(aid, status="failed", reason=f"send: {str(e)[:120]}"); log_event("ERROR", f"ارسال به {ch['title']}: {e}", admin_id); usage_release(admin_id, "posts") if count_usage else None; return False, f"send_failed:{str(e)[:120]}"
     finally:
         if media and media.get("_file"):
             try: os.unlink(media["_file"][0])
             except Exception: pass
     mark_posted(ch["chat_id"], a["hash"]); link = msg_link(ch, msg)
     article_update(aid, status="published", links=json.dumps([link]), reason="")
-    if count_usage: usage_inc(admin_id, "posts")
     log_event("INFO", f"منتشر شد در {ch['title']}: {(a['title'] or '')[:60]}", admin_id); return True, link
 # ============================================================
 # تشخیص مرحله‌ای (Diagnostics) — کوتاه، نمادین، دوزبانه
@@ -1761,7 +1791,7 @@ async def _cycle(bot, uid, cid, test_mode, progress):
             if bad: article_update(aid, status="rejected", reason=f"ad_filter: {why}"); res["rejected"] += 1; cnt["ad"] += 1; details.append((art["title"], "ad: " + why)); continue
             D.stage = "ai"; pct = min(94, 40 + int(50 * i / len(candidates))); await p(pct, P["ai"].format(t=art["title"][:40]))
             async def _on_queue(_pct=pct): await p(_pct, P["queue"])
-            gen, model, err = await generate(s, art, on_queue=_on_queue)
+            gen, model, err = await generate(s, art, on_queue=_on_queue, owner_id=uid)
             if not gen: article_update(aid, status="failed", reason=f"ai: {err}"); res["errors"] += 1; ai_err = err; stop = True; break
             D.stage = "score"
             if gen.get("is_ad"): article_update(aid, status="rejected", reason=f"ai_ad: {gen.get('ad_reason', '')}", score=gen["score"]); res["rejected"] += 1; cnt["ai_ad"] += 1; details.append((art["title"], f"AI ad: {str(gen.get('ad_reason', ''))[:40]}")); continue
@@ -1992,6 +2022,13 @@ TXT = {
     "crits_title": ("📏 <b>معیارها</b>\nامتیاز ۰–۱۰۰ · زیر {m} رد می‌شود.", "📏 <b>Criteria</b>\nScore 0–100 · below {m} is rejected."), "crit_add": ("➕ معیار", "➕ Criterion"),
     "crit_line": ("\n• {name} — {w} ({p}%)", "\n• {name} — {w} ({p}%)"), "crit_btn": ("{name} · {w}", "{name} · {w}"), "crit_view": ("📏 <b>{name}</b> · وزن {w}", "📏 <b>{name}</b> · weight {w}"), "crit_w": ("✏️ وزن", "✏️ Weight"),
     "crit_w_prompt": ("وزن جدید (۱–۱۰۰):", "New weight (1–100):"), "crit_added": ("✅ معیار اضافه شد", "✅ Criterion added"), "crit_updated": ("✅ وزن بروزرسانی شد", "✅ Weight updated"), "crit_min": ("⚠️ حداقل یک معیار لازم است", "⚠️ At least one criterion required"),
+    # ---- هوش مصنوعی شخصیِ مدیر
+    "my_ai": ("🤖 هوش مصنوعی من", "🤖 My AI"),
+    "my_ai_title": ("🤖 <b>هوش مصنوعی من</b>\nمدل‌های شخصی شما اول استفاده می‌شوند؛ اگر خطا دادند، مدل‌های عمومی ربات جایگزین می‌شوند.", "🤖 <b>My AI</b>\nYour own models are used first; if they fail, the bot's shared models take over."),
+    "my_ai_none": ("\n\n⚠️ <b>هنوز مدل شخصی ندارید.</b> مدل‌های عمومی ممکن است هر لحطه شلوغ یا خاموش شوند؛ حتماً یک مدل شخصی اضافه کنید.", "\n\n⚠️ <b>You have no personal model yet.</b> The shared models can get busy or go down at any time; adding your own is strongly recommended."),
+    "my_ai_line": ("\n{i} <b>{name}</b> · <code>{model}</code> · ✅{ok}", "\n{i} <b>{name}</b> · <code>{model}</code> · ✅{ok}"),
+    "my_ai_add": ("➕ افزودن مدل", "➕ Add model"), "my_ai_added": ("✅ مدل «{name}» اضافه شد · {res}", "✅ Model “{name}” added · {res}"),
+    "my_ai_view": ("🤖 <b>{name}</b> · {kind}\n<code>{model}</code>\n🔗 <code>{base}</code>\n{st} · ✅ {ok} · ⚠️×{fc}\n🕐 موفق {lo} · خطا {lf}", "🤖 <b>{name}</b> · {kind}\n<code>{model}</code>\n🔗 <code>{base}</code>\n{st} · ✅ {ok} · ⚠️×{fc}\n🕐 ok {lo} · error {lf}"),
     # ---- زمان‌بندی
     "sched_title": ("⏰ <b>زمان‌بندی — {title}</b>\n⏱ هر {iv}′ · 📦 {ppc} پست/چرخه · 🕰 {lb}h اخیر · 📅 بدون تاریخ {ud}\n🌙 {quiet} · 🌍 {city} {tz} (⌚ {loc} · UTC {utc})\n🔁 {mode}", "⏰ <b>Schedule — {title}</b>\n⏱ every {iv}′ · 📦 {ppc} posts/cycle · 🕰 last {lb}h · 📅 undated {ud}\n🌙 {quiet} · 🌍 {city} {tz} (⌚ {loc} · UTC {utc})\n🔁 {mode}"),
     "mode_auto": ("⚡ خودکار — انتشار مستقیم", "⚡ auto — publish directly"), "mode_review": ("📝 بازبینی — تأیید دستی در صف", "📝 review — manual approval in queue"), "none": ("—", "—"),
@@ -2055,6 +2092,8 @@ WIZ = {
     "plan_new": [("name", ("نام (فارسی)", "Name (Persian)"), "str"), ("name_en", ("نام (انگلیسی)", "Name (English)"), "str"), ("days", ("مدت (روز)", "Days"), "int"), ("daily_posts", ("پست روزانه", "Posts/day"), "int"), ("max_sources", ("حداکثر منبع", "Max sources"), "int"), ("max_channels", ("حداکثر کانال", "Max channels"), "int"), ("daily_tests", ("تست روزانه", "Tests/day"), "int"),
                  ("price", ("قیمت (فارسی، مثلاً ۲۰۰,۰۰۰ تومان)", "Price (Persian)"), "str"), ("price_en", ("قیمت (انگلیسی، مثلاً 5 USDT)", "Price (English)"), "str"), ("description", ("توضیح کوتاه (فارسی)", "Short description (Persian)"), "str"), ("description_en", ("توضیح کوتاه (انگلیسی)", "Short description (English)"), "str")],
     "model_add": [("base_url", ("Base URL سرویس را بفرستید (همان آدرسی که سرویس‌دهنده‌ی شما اعلام کرده است):", "Send the service Base URL (exactly as your provider documents it):"), "str"),
+                  ("api_key", ("کلید API (توکن)", "API key (token)"), "str"), ("model", ("نام مدل", "Model name"), "str")],
+    "my_ai_add": [("base_url", ("Base URL سرویس هوش مصنوعی خودتان را بفرستید (همان آدرسی که سرویس‌دهنده اعلام کرده):", "Send the Base URL of your own AI service (exactly as your provider documents it):"), "str"),
                   ("api_key", ("کلید API (توکن)", "API key (token)"), "str"), ("model", ("نام مدل", "Model name"), "str")],
     "disc_add": [("code", ("کد تخفیف (مثلاً SPRING30)", "Discount code (e.g. SPRING30)"), "str"), ("percent", ("درصد تخفیف (۱–۱۰۰)", "Discount percent (1–100)"), "int"), ("expires", ("انقضا: تعداد روز (مثلاً 30) یا تاریخ (2025-12-31)", "Expiry: days (e.g. 30) or date (2025-12-31)"), "str"), ("max_uses", ("حداکثر دفعات استفاده (0 = نامحدود)", "Max uses (0 = unlimited)"), "int")],
 }
@@ -2174,7 +2213,7 @@ async def view_admin_home(update, context):
     if not lim["active"]: text += "\n\n" + tr(lang, "plan_inactive")
     text += "\n\n" + (tr(lang, "pick_channel") if chs else tr(lang, "no_channels"))
     kb = pairs([B(f"{'🟢' if get_settings(c['id'])['enabled'] else '🔴'} {c['title'][:22]}", f"a:ch:{c['id']}") for c in chs])
-    kb.append([B(tr(lang, "ch_add"), "a:chadd")]); kb.append([B(tr(lang, "my_plan"), "a:plan")])
+    kb.append([B(tr(lang, "ch_add"), "a:chadd")]); kb.append([B(tr(lang, "my_plan"), "a:plan"), B(tr(lang, "my_ai"), "a:myai")])
     if is_super(uid): kb.append([B(tr(lang, "super_panel"), "s:home")])
     await render(update, context, text, kb)
 async def view_channel(update, context, cid):
@@ -2290,6 +2329,18 @@ async def view_article(update, context, aid):
     kb.append([B(tr(lang, "back"), f"a:que:{cid}" if a["status"] in ("ready", "published") else f"a:rej:{cid}")]); await render(update, context, text, kb)
 # ============================================================
 # پلن من، لاگ، تست فوری (با محدودیت نرخ)
+async def view_my_ai(update, context):
+    """مدل‌های شخصیِ همین مدیر (جدا از مدل‌های عمومی مدیر کلان)."""
+    uid = update.effective_user.id; lang = L(update); ms = list_models(owner_id=uid)
+    text = tr(lang, "my_ai_title") + ("".join(tr(lang, "my_ai_line", i=_mic(m), name=esc(m["name"]), model=esc(m["model"]), ok=m["ok_count"]) for m in ms) if ms else tr(lang, "my_ai_none"))
+    kb = pairs([B(f"{_mic(m)} {m['name'][:20]}", f"a:myai_v:{m['id']}") for m in ms]) + [[B(tr(lang, "my_ai_add"), "a:myai_add")], [B(tr(lang, "back"), "a:home")]]
+    await render(update, context, text, kb)
+async def view_my_ai_model(update, context, mid):
+    uid = update.effective_user.id; lang = L(update); m = get_model(mid)
+    if not m or m["owner_id"] != uid: await popup(update, context, tr(lang, "notfound")); return await view_my_ai(update, context)
+    text = tr(lang, "my_ai_view", name=esc(m["name"]), kind=m["kind"], model=esc(m["model"]), base=esc(m["base_url"]), st=tr(lang, "s_m_off" if not m["active"] else "s_m_ok" if m["status"] == "ok" else "s_m_down"), ok=m["ok_count"], fc=m["fail_count"], lo=ago_text(m["last_ok"], lang), lf=ago_text(m["last_fail"], lang))
+    kb = [[B(tr(lang, "s_model_test"), f"a:myai_t:{mid}"), B(tr(lang, "toggle"), f"a:myai_o:{mid}")]] + pairs([B(f"✏️ {f[2] if lang == 'en' else f[1]}", f"a:myai_e:{mid}:{f[0]}") for f in MODEL_FIELDS]) + [[B(tr(lang, "delete"), f"a:myai_d:{mid}")], [B(tr(lang, "back"), "a:myai")]]
+    await render(update, context, text, kb)
 async def view_my_plan(update, context):
     uid = update.effective_user.id; lang = L(update); lim = admin_limits(uid); use = usage_today(uid)
     pname = "∞" if is_super(uid) else (plan_txt(lim["plan"], "name", lang) or tr(lang, "no_plan"))
@@ -2475,8 +2526,21 @@ async def dispatch(update, context, data):
     if a == "a":
         if not can_admin(uid): await popup(update, context, tr(lang, "no_admin"), alert=True); return await view_plans(update, context)
         lim = admin_limits(uid)
+        # عملیاتی که محتوا تولید/منتشر می‌کنند فقط با پلن فعال (مشاهده و تنطیمات آزاد می‌ماند)
+        if b in ("test", "pub", "srca", "chadd") and not lim["active"]: await popup(update, context, tr(lang, "plan_inactive"), alert=True); return await view_my_plan(update, context)
         if b == "home": return await view_admin_home(update, context)
         if b == "plan": return await view_my_plan(update, context)
+        if b == "myai": return await view_my_ai(update, context)
+        if b == "myai_add": return await wiz_start(update, context, "my_ai_add", "a:myai")
+        if b in ("myai_v", "myai_t", "myai_o", "myai_d", "myai_e"):
+            mid = int(c); m = get_model(mid)
+            if not m or m["owner_id"] != uid: await popup(update, context, tr(lang, "notfound")); return await view_my_ai(update, context)
+            if b == "myai_v": return await view_my_ai_model(update, context, mid)
+            if b == "myai_o": update_model(mid, active=0 if m["active"] else 1, status="ok", fail_count=0); await popup(update, context, tr(lang, "s_model_off" if m["active"] else "s_model_on")); return await view_my_ai_model(update, context, mid)
+            if b == "myai_d": delete_model(mid); await popup(update, context, tr(lang, "deleted")); return await view_my_ai(update, context)
+            if b == "myai_e": return await ask(update, context, tr(lang, "s_field_prompt", f=fl(MODEL_FIELDS, d, lang)), "model_field", f"a:myai_v:{mid}", mid=mid, field=d, own=1)
+            await render(update, context, tr(lang, "s_model_testing")); ok, out, t = await test_model(mid)
+            await popup(update, context, tr(lang, "s_model_res", i="✅" if ok else "❌", t=t, out=out[:120]), alert=True); return await view_my_ai_model(update, context, mid)
         if b == "logs":
             if c.lstrip("-").isdigit() and channel_owned(int(c), uid): return await view_logs(update, context, admin_id=uid, back=f"a:ch:{c}", refresh=f"a:logs:{c}")
             return await view_logs(update, context, admin_id=uid)
@@ -2698,6 +2762,12 @@ async def handle_input(update, context, st):
             if not base_url.startswith("http") or not model: done(tr(lang, "s_model_need")); return await dispatch(update, context, back)
             mid = add_model(base_url, dta["api_key"], model); ok, out, t = await test_model(mid); name = get_model(mid)["name"]
             done(tr(lang, "s_model_added", name=esc(name), res=("✅" if ok else "❌ " + esc(out[:80])) + f" ({t}s)"))
+        elif st["wiz"] == "my_ai_add":
+            base_url, model = dta["base_url"].strip(), dta["model"].strip()
+            if not base_url.startswith("http") or not model: done(tr(lang, "s_model_need")); return await dispatch(update, context, back)
+            mid = add_model(base_url, dta["api_key"], model, owner_id=uid); ok, out, t = await test_model(mid); name = get_model(mid)["name"]
+            done(tr(lang, "my_ai_added", name=esc(name), res=("✅" if ok else "❌ " + esc(out[:80])) + f" ({t}s)"))
+            return await dispatch(update, context, f"a:myai_v:{mid}")
         elif st["wiz"] == "disc_add":
             exp = parse_expiry(dta["expires"])
             if not exp: done(tr(lang, "s_disc_exp_bad")); return await dispatch(update, context, back)
@@ -2736,8 +2806,7 @@ async def handle_input(update, context, st):
         ok, note = await probe_source(get_source(sid), lang, added=True)
         if ok: q("UPDATE sources SET title=? WHERE id=?", (hostname(url), sid), commit=True)
         else: log_event("WARN", f"منبع جدید {hostname(url)}: تست بارگذاری ناموفق", uid)
-        try: await context.bot.send_message(uid, note, parse_mode=HTML, disable_web_page_preview=True)
-        except Exception: pass
+        await send_temp(context, uid, note)      # پیام بلندِ نتیجه‌ی تست، موقت است و خودش پاک می‌شود
         done(note); return await dispatch(update, context, f"a:srcv:{sid}")
     if kind == "src_api_url":
         sid = st["sid"]; s = get_source(sid)
@@ -2845,6 +2914,9 @@ async def handle_input(update, context, st):
         return await dispatch(update, context, back)
     if kind == "model_field":
         f = st["field"]; v = text
+        if st.get("own"):      # مدل شخصی: فقط مالک خودش اجازه‌ی ویرایش دارد
+            om = get_model(st["mid"])
+            if not om or om["owner_id"] != uid: done(tr(lang, "notfound")); return await dispatch(update, context, back)
         try:
             if f in ("priority", "max_tokens"): v = to_int(text)
             elif f == "temperature": v = max(0.0, min(2.0, float(text.translate(_FA_DIGITS))))
@@ -2885,6 +2957,15 @@ async def _ack(msg, fallback_text, kb=None):
     except Exception:
         try: await msg.reply_text(fallback_text, reply_markup=kb)
         except Exception: pass
+async def send_temp(context, chat_id, text, seconds=10):
+    """پیام بلندِ گذرا (خطا/اطلاع) پس از چند لحطه حذف می‌شود تا محیط چت تمیز بماند."""
+    try: m = await context.bot.send_message(chat_id, text[:4000], parse_mode=HTML, disable_web_page_preview=True)
+    except Exception: return
+    async def _rm():
+        await asyncio.sleep(seconds)
+        try: await context.bot.delete_message(chat_id, m.message_id)
+        except Exception: pass
+    asyncio.create_task(_rm())
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message; u = update.effective_user; uid = u.id
     if not msg or msg.chat.type != ChatType.PRIVATE: return
