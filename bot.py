@@ -1552,6 +1552,7 @@ async def download_media(media):
     if not media or not media.get("url"): return None
     if not await asyncio.to_thread(public_url, media["url"]): return None
     for hdr in (_media_headers(media), {"User-Agent": UA_FEED, "Accept": "*/*"}):
+        tmp = None; path = None
         try:
             async with FETCH_SEM:
                 async with http().stream("GET", media["url"], headers=hdr, timeout=httpx.Timeout(180, connect=15)) as r:
@@ -1563,21 +1564,27 @@ async def download_media(media):
                     except Exception: pass
                     kind = "animation" if "gif" in ct else "photo" if ct.startswith("image/") else "video" if ct.startswith("video/") else _ext_kind(media["url"], media.get("kind") or "document")
                     ext = {"photo": ".jpg", "animation": ".gif", "video": ".mp4"}.get(kind, os.path.splitext(urlparse(media["url"]).path)[1] or ".bin")
-                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext); size = 0; keep = False
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext); size = 0
                     try:      # فایل موقت در هیچ مسیری (خطا، سقف حجم، فایل ناقص) روی دیسک جا نمی‌ماند
                         async for chunk in r.aiter_bytes(262144):
                             size += len(chunk)
                             if size > MAX_MEDIA_BYTES: log.info(f"media skipped (> {MAX_MEDIA_MB}MB)"); return None
                             tmp.write(chunk)
-                        keep = size >= 1024
                     finally:
                         tmp.close()
-                        if not keep:
-                            try: os.unlink(tmp.name)
-                            except Exception: pass
+                    if size < 1024: return None
                     if kind == "photo" and size > 10 * 1024 * 1024: kind = "document"
-                    return tmp.name, kind
-        except Exception as e: log.warning(f"media: {e}")
+                    path = tmp.name
+        except Exception as e:
+            log.warning(f"media: {e}"); path = None
+        except BaseException:
+            path = None
+            raise
+        finally:
+            if tmp is not None and path is None:   # مالکیت فایل فقط پس از خروج سالم از استریم منتقل می‌شود
+                try: os.unlink(tmp.name)
+                except OSError: pass
+        if path: return path, kind
     return None
 def _is_parse_err(e): s = str(e).lower(); return "parse" in s or "entit" in s or "tag" in s or "unsupported start" in s
 async def _send_media(bot, chat_id, caption, pm, media):
@@ -1667,6 +1674,8 @@ async def publish_article(bot, aid, count_usage=True, test_user=None):
                 return False, f"send_failed:{str(e)[:120]}"
             # No await between acknowledged delivery and its accounting.
             published = True
+            op = _current_operation.get()
+            if op: op.published_count += 1
             mark_posted(ch["chat_id"], a["hash"]); link = msg_link(ch, msg)
             article_update(aid, status="published", links=json.dumps([link]), reason="")
             if test_user is not None:
@@ -1752,8 +1761,6 @@ async def run_channel_cycle(bot, uid, cid, test_mode=False, progress=None):
         async with CYCLE_SEM: return await _cycle(bot, uid, cid, test_mode, progress)
 async def _cycle(bot, uid, cid, test_mode, progress):
     D = Diag(); res = _res(D); s = get_settings(cid); ch = get_channel(cid); lim = admin_limits(uid); lang = s["ui_lang"]; P = PROG[lang if lang in PROG else "fa"]
-    op = _current_operation.get()
-    pending_ready = [0]
     async def p(pct, txt):
         if progress:
             try: await progress(pct, txt)
@@ -1840,7 +1847,12 @@ async def _cycle(bot, uid, cid, test_mode, progress):
             sname = article_src_name(aid)
             if sname: res["src"] = sname; D.add("from_src", name=sname)
             if test_mode or (s["mode"] == "auto" and not quiet):
-                D.stage = "publish"; await p(96, P["pub"]); ok, out = await publish_article(bot, aid, count_usage=not test_mode, test_user=uid if test_mode else None)
+                D.stage = "publish"; await p(96, P["pub"])
+                try: ok, out = await publish_article(bot, aid, count_usage=not test_mode, test_user=uid if test_mode else None)
+                except asyncio.CancelledError:
+                    a = get_article(aid)
+                    if a and a["status"] == "ready": article_update(aid, status="failed", reason="cancelled")
+                    raise
                 if ok:
                     res["published"] += 1; res["links"].append(out); res["pub"].append(((gen.get("title") or art["title"] or "")[:60], sname, out))
                 else:
@@ -2168,6 +2180,7 @@ class Operation:
     cancelled: bool = False
     started: bool = False
     replaced_status: bool = False
+    published_count: int = 0
     failed: bool = False
     status_message_id: int | None = None
     status_text: str = ""
@@ -2195,6 +2208,7 @@ def operation_text(lang, key):
         "running": ("⚙️ در حال پردازش…", "⚙️ Processing…"),
         "completed": ("✅ عملیات انجام شد", "✅ Operation completed"),
         "cancelled": ("⛔ عملیات لغو شد", "⛔ Operation cancelled"),
+        "cancelled_after_publish": ("ادامهٔ عملیات لغو شد؛ {n} مطلب پیش از توقف منتشر شده و حذف نشده است.", "Further work cancelled; {n} post(s) were published before stopping and have not been removed."),
         "failed": ("⚠️ عملیات انجام نشد؛ دوباره تلاش کنید.", "⚠️ Operation failed; please try again."),
         "busy": ("عملیات قبلی در حال اجراست؛ برای توقف /cancel را بفرستید.", "An operation is running; use /cancel to stop it."),
         "fallback": ("⚠️ مدل پاسخ قابل‌استفاده نداد؛ در حال بررسی مدل بعدی…", "⚠️ Model unavailable; trying the next model…"),
@@ -2287,7 +2301,8 @@ async def run_user_operation(update, context, kind, channel, work, show_status=F
                 try:
                     if outcome == "cancelled":
                         clear_interaction(context)
-                        await operation_status(context, operation_text(lang, outcome), terminal=True)
+                        key = "cancelled_after_publish" if op.published_count else "cancelled"
+                        await operation_status(context, operation_text(lang, key).format(n=op.published_count), terminal=True)
                     elif outcome == "failed" and not op.final_status:
                         await operation_status(context, operation_text(lang, outcome), failed=True, terminal=True)
                     elif op.status_message_id is not None and not op.final_status:
@@ -2332,7 +2347,7 @@ async def popup(update, context, text, alert=False):
         return
     qy = update.callback_query
     if qy:
-        try: await qy.answer(strip_tags(text)[:200], show_alert=alert); context.user_data["_answered"] = True; return
+        try: await qy.answer(strip_tags(text)[:200], show_alert=alert); context._callback_answered = True; return
         except Exception: pass
     await send_temp(context, update.effective_chat.id, text)
 async def render(update, context, text, kb=None, force_new=False):
@@ -2583,14 +2598,13 @@ async def run_test(update, context, cid):
     if rem is not None and rem <= 0: await popup(update, context, tr(lang, "limit_tests", n=admin_limits(uid)["daily_tests"]), alert=True); return await view_channel(update, context, cid)
     if ch_lock(cid).locked(): await popup(update, context, tr(lang, "test_busy"), alert=True); return await view_channel(update, context, cid)
     if not is_super(uid) and not rate_free(f"test:{cid}", TEST_COOLDOWN_SEC): await popup(update, context, tr(lang, "test_wait", n=rate_left(f"test:{cid}", TEST_COOLDOWN_SEC)), alert=True); return await view_channel(update, context, cid)
-    try: await qy.answer(); context.user_data["_answered"] = True
+    try: await qy.answer(); context._callback_answered = True
     except Exception: pass
     last = [0.0]; head = tr(lang, "test_head", title=esc(ch["title"]))
     async def progress(pct, txt):
         if time.time() - last[0] < 1.6 and pct < 100: return
         last[0] = time.time()
-        try: await qy.edit_message_text(f"{head}\n\n{bar(pct)} <b>{pct}%</b>\n⏳ {esc(txt)}", parse_mode=HTML)
-        except Exception: pass
+        await operation_status(context, f"{head}\n\n{bar(pct)} <b>{pct}%</b>\n{esc(txt)}")
     await progress(1, tr(lang, "preparing"))
     try: res = await run_channel_cycle(context.bot, uid, cid, test_mode=True, progress=progress)
     except Exception as e:
@@ -2605,6 +2619,8 @@ async def run_test(update, context, cid):
     if res["published"]: text = f"{tr(lang, 'test_ok')}{src_line}\n\n{tr(lang, 'test_log', d=diag)}"; kb.append([U(f"{tr(lang, 'art_view')} {i + 1}", l) for i, l in enumerate(res["links"][:3])])
     elif res.get("queued"): text = f"{tr(lang, 'test_queued')}{src_line}\n\n{tr(lang, 'test_log', d=diag)}"; kb.append([B(tr(lang, "queue", n=ready_count(cid)), f"a:que:{cid}")])
     else: text = f"{tr(lang, 'test_fail')}{src_line}\n\n{tr(lang, 'test_log', d=diag)}\n\n{tr(lang, 'test_retry_note')}"; kb.append([B(tr(lang, "rejected"), f"a:rej:{cid}"), B(tr(lang, "sched"), f"a:sch:{cid}")])
+    op = _current_operation.get()
+    if op: op.failed = not ok
     kb.append([B(tr(lang, "back_panel"), f"a:ch:{cid}")]); await render(update, context, text, kb)
 # ---------- پایان پنل مدیر میانی ----------
 # ============================================================
@@ -2764,7 +2780,7 @@ async def dispatch(update, context, data):
             if b == "myai_o": update_model(mid, active=0 if m["active"] else 1, status="ok", fail_count=0); await popup(update, context, tr(lang, "s_model_off" if m["active"] else "s_model_on")); return await view_my_ai_model(update, context, mid)
             if b == "myai_d": delete_model(mid); await popup(update, context, tr(lang, "deleted")); return await view_my_ai(update, context)
             if b == "myai_e": return await ask(update, context, tr(lang, "s_field_prompt", f=fl(MODEL_FIELDS, d, lang)), "model_field", f"a:myai_v:{mid}", mid=mid, field=d, own=1)
-            await render(update, context, tr(lang, "s_model_testing")); ok, out, t = await test_model(mid)
+            await operation_status(context, tr(lang, "s_model_testing")); ok, out, t = await test_model(mid)
             await popup(update, context, tr(lang, "s_model_res", i="✅" if ok else "❌", t=t, out=out[:120]), alert=True); return await view_my_ai_model(update, context, mid)
         if b == "logs":
             if c.lstrip("-").isdigit() and channel_owned(int(c), uid): return await view_logs(update, context, admin_id=uid, back=f"a:ch:{c}", refresh=f"a:logs:{c}")
@@ -2926,9 +2942,9 @@ async def dispatch(update, context, data):
         if b == "model_d": delete_model(int(c)); await popup(update, context, tr(lang, "deleted")); return await view_s_models(update, context)
         if b == "model_e": return await ask(update, context, tr(lang, "s_field_prompt", f=fl(MODEL_FIELDS, d, lang)), "model_field", f"s:model:{c}", mid=int(c), field=d)
         if b == "model_test":
-            await render(update, context, tr(lang, "s_model_testing")); ok, out, t = await test_model(int(c)); await popup(update, context, tr(lang, "s_model_res", i="✅" if ok else "❌", t=t, out=out[:120]), alert=True); return await view_s_model(update, context, int(c))
+            await operation_status(context, tr(lang, "s_model_testing")); ok, out, t = await test_model(int(c)); await popup(update, context, tr(lang, "s_model_res", i="✅" if ok else "❌", t=t, out=out[:120]), alert=True); return await view_s_model(update, context, int(c))
         if b == "models_test":
-            await render(update, context, tr(lang, "s_model_testing")); res = []
+            await operation_status(context, tr(lang, "s_model_testing")); res = []
             for m in list_models(): ok, out, t = await test_model(m["id"]); res.append(f"{'✅' if ok else '❌'} {esc(m['name'])} ({t}s)" + ("" if ok else f": {esc(out[:60])}"))
             ud["notice"] = "\n".join(res) or "—"; return await view_s_models(update, context)
         if b == "pays": return await view_s_pays(update, context)
@@ -2942,7 +2958,7 @@ async def dispatch(update, context, data):
         return await view_super_home(update, context)
     return await go_home(update, context)
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    qy = update.callback_query; u = update.effective_user; context.user_data["_answered"] = False
+    qy = update.callback_query; u = update.effective_user; context._callback_answered = False
     if qy.data != "c:cancel" and not rate_ok(f"cb:{u.id}", CB_RATE):
         try: await qy.answer(tr(user_lang(u.id) or "fa", "busy_click"))
         except Exception: pass
@@ -2968,7 +2984,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_interaction(context, keep=keep)
         return await dispatch(update, context, data)
     await run_user_operation(update, context, f"callback:{data}", channel, work, replace=navigation, keep=keep)
-    if not context.user_data.get("_answered"):
+    if not getattr(context, "_callback_answered", False):
         try: await qy.answer()
         except Exception: pass
 # ============================================================
