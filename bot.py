@@ -409,7 +409,7 @@ def default_settings(lang="fa", channel_username=""):
             "categories": [dict(c) for c in DEFAULT_CATEGORIES[lang]], "criteria": [dict(c) for c in DEFAULT_CRITERIA[lang]], "min_score": 60,
             "lookback_hours": 24, "allow_undated": True, "quiet_start": None, "quiet_end": None, "utc_offset": DEFAULT_UTC_OFFSET,
             "include_media": True, "include_link": True, "signature": f"@{channel_username}" if channel_username else "@channel", "max_words": 150, "post_limit": POST_LIMIT_DEFAULT,
-            "strict_ads": False, "interval_minutes": 60, "posts_per_cycle": 2, "hashtags": True, "premium_format": False,
+            "strict_ads": False, "interval_minutes": 60, "posts_per_cycle": 2, "hashtags": True,
             "last_run": None, "last_end": None, "last_result": "", "last_diag": None, "last_notified_diag": ""}
 def get_settings(cid):
     ch = q("SELECT settings, username, admin_id FROM channels WHERE id=?", (cid,), one=True)
@@ -741,9 +741,11 @@ def _model_ready(m):
     lf = parse_dt(m["last_fail"]); return bool(not lf or (now_utc() - lf) >= timedelta(minutes=MODEL_PROBE_MIN))
 async def ai_chat(system, user, on_queue=None, owner_id=None):
     """خروجی: (text, model_name, err_code) — اولویت با مدل‌های شخصیِ خودِ مدیر است؛ اگر نداشت یا همه‌شان خطا دادند، مدل‌های عمومی ربات امتحان می‌شوند. ابتدا سراغ مدلِ بیکار می‌رود؛ اگر همه مشغول بودند on_queue صدا زده می‌شود."""
-    models = ([m for m in list_models(active_only=True, owner_id=owner_id) if _model_ready(m)] if owner_id else []) + [m for m in list_models(active_only=True) if _model_ready(m)]
+    personal = [m for m in list_models(active_only=True, owner_id=owner_id) if _model_ready(m)] if owner_id else []
+    shared = [m for m in list_models(active_only=True) if _model_ready(m)]
+    models = personal + shared
     if not models: log_event("ERROR", "هیچ مدل فعالی در دسترس نیست.", owner_id); return None, None, "ai_none"
-    last, tried, told = "ai_error", set(), False
+    last, tried, told, personal_exhausted = "ai_error", set(), False, False
     while True:
         rest = [m for m in models if m["id"] not in tried]
         if not rest: return None, None, last
@@ -753,11 +755,18 @@ async def ai_chat(system, user, on_queue=None, owner_id=None):
             try: await on_queue()
             except Exception: pass
         m = (free or rest)[0]; tried.add(m["id"])
+        # Track if we've exhausted personal models and are now using shared
+        if personal and m in shared and all(pm["id"] in tried for pm in personal):
+            personal_exhausted = True
         try:
             async with model_lock(m["id"]):
                 async with AI_SEM: text = await _call_model(m, system, user)
             if not text or not text.strip(): raise RuntimeError("empty response")
-            await _mark_ok(m); return text.strip(), m["name"], None
+            await _mark_ok(m)
+            model_label = m["name"]
+            if personal_exhausted:
+                model_label = f"{m['name']} (fallback)"
+            return text.strip(), model_label, None
         except Exception as e: last = err_code(e); await _mark_fail(m, e)
 async def test_model(mid):
     m = get_model(mid); t = time.time()
@@ -803,8 +812,8 @@ def parse_json(text):
 # ============================================================
 # HTML امن تلگرام + فرمت‌بندی
 ALLOWED = {"b", "strong", "i", "em", "u", "s", "del", "code", "pre", "a", "blockquote", "tg-spoiler", "span", "tg-emoji"}
-def sanitize_html(text, premium=False):
-    """Markdown/HTML آزاد → HTML مجاز تلگرام. premium=True اجازه‌ی <tg-emoji> می‌دهد؛ در غیر این‌صورت متن داخلش (ایموجی معمولی) حفظ می‌شود."""
+def sanitize_html(text):
+    """Markdown/HTML آزاد → HTML مجاز تلگرام."""
     if not text: return ""
     text = str(text)
     text = re.sub(r"(?m)^[ \t]*[-–—_=*~•⸻]{3,}[ \t]*$", "", text)  # جداکننده‌های رباتیک (--- و امثال آن) حذف می‌شوند
@@ -821,7 +830,7 @@ def sanitize_html(text, premium=False):
         if tag == "span":
             if "tg-spoiler" not in attrs: continue
             tag = "tg-spoiler"
-        if tag == "tg-emoji" and not premium: continue
+        if tag == "tg-emoji": continue
         if closing:
             if tag in stack:
                 while stack:
@@ -846,9 +855,9 @@ def tidy_html(t):
     t = re.sub(r"(</b>|</blockquote>)\n(?!\n)(?!•)", r"\1\n\n", t); t = re.sub(r"([.!?؟۔])\n(?!\n)(?!•)(?=\S)", r"\1\n\n", t)
     t = re.sub(r"\n{3,}", "\n\n", t); return t.strip()
 def downgrade_html(t):
-    """حذف قابلیت‌های پریمیوم/خاص با حفظ متن و فرمت‌های معمولی (برای تلاش دوباره پس از خطای پارس تلگرام)."""
+    """حذف قابلیت‌های خاص با حفظ متن و فرمت‌های معمولی (برای تلاش دوباره پس از خطای پارس تلگرام)."""
     t = re.sub(r"</?tg-emoji[^>]*>", "", t or ""); t = re.sub(r"</?tg-spoiler>", "", t); t = t.replace("<blockquote expandable>", "<blockquote>")
-    return sanitize_html(t, premium=False)
+    return sanitize_html(t)
 def strip_tags(t): return html.unescape(re.sub(r"<[^>]+>", "", t or ""))
 def salvage_post(raw):
     """نگهبان نشت JSON — اگر پاسخ مدل قابل تجزیه نباشد، پاکت JSON حذف و فقط متن واقعی پست بازیابی می‌شود؛ هرگز JSON خام منتشر نمی‌شود."""
@@ -892,19 +901,19 @@ def _cut_pos(text, limit):
     if pos > limit * 0.4: return pos
     sp = cut.rfind(" ")
     return sp if sp > limit * 0.4 else len(cut)
-def split_post_html(text, limit, premium=True):
+def split_post_html(text, limit):
     """پست را در مرز امن به دو بخش «کانال + ادامه» می‌شکند؛ بخش دوم برای «ادامه در ربات» است و متنِ بخش اول را تکرار نمی‌کند."""
     if len(text) <= limit: return text, ""
     pos = _cut_pos(text, limit); head_raw, rest_raw = text[:pos], text[pos:]
     if rest_raw[:1] not in ("<", "", "\n", " ") and ">" in rest_raw[:80]:
         gt = rest_raw.find(">")
         if "<" not in rest_raw[:gt]: rest_raw = rest_raw[gt + 1:]  # تکه‌ی نیمه‌تمامِ یک تگ از ابتدای ادامه حذف می‌شود
-    head = sanitize_html(re.sub(r"<[^>]*$", "", head_raw), premium=premium).rstrip() + " …"
-    rest = sanitize_html(rest_raw, premium=premium).strip()
+    head = sanitize_html(re.sub(r"<[^>]*$", "", head_raw)).rstrip() + " …"
+    rest = sanitize_html(rest_raw).strip()
     return head, rest
-def fit_html(text, limit, premium=True):
+def fit_html(text, limit):
     if len(text) <= limit: return text, False
-    return split_post_html(text, limit, premium)[0], True
+    return split_post_html(text, limit)[0], True
 def clean_ai_text(t, s=None):
     """زباله‌های مدل حذف می‌شود: دیکشنری امتیازها («معیار»: ۹، ...) و تکه‌های JSON چسبیده به متن پست — هرگز به کانال یا ربات نمی‌رسد."""
     if not t: return t
@@ -960,16 +969,16 @@ def split_html(text, limit=MSG_LIMIT):
     if len(text) <= limit: return [text]
     chunks, cur = [], ""
     for para in text.split("\n"):
-        if len(cur) + len(para) + 1 > limit: chunks.append(sanitize_html(cur, premium=True)); cur = para
+        if len(cur) + len(para) + 1 > limit: chunks.append(sanitize_html(cur)); cur = para
         else: cur = f"{cur}\n{para}" if cur else para
-    if cur: chunks.append(sanitize_html(cur, premium=True))
+    if cur: chunks.append(sanitize_html(cur))
     return chunks
 def preview_text(html_text, n=100):
     t = re.sub(r"\s+", " ", strip_tags(html_text).replace("\n", " ")).strip()
     if len(t) <= n: return html.escape(t)
     cut = t[:n]; sp = cut.rfind(" "); return html.escape(cut[:sp] if sp > n * 0.6 else cut) + " …"
 def headline_of(html_text):
-    first = (html_text or "").strip().split("\n", 1)[0]; return sanitize_html(first, premium=True)[:900]
+    first = (html_text or "").strip().split("\n", 1)[0]; return sanitize_html(first)[:900]
 # ============================================================
 # کشف مقاله — فید (RSS/Atom/RDF) → سایت‌مپ → لینک‌های HTML ؛ آدرس فید پیدا‌شده کش می‌شود
 FEED_ACCEPT = "application/rss+xml, application/atom+xml, application/rdf+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.5"
@@ -1440,7 +1449,6 @@ def heuristic_ad_check(art, strict=False):
 # پرامپت، تولید و ترکیب نهایی
 def build_prompt(s, art, want_full):
     cats = "\n".join(f"- {c['emoji']} {c['name']}: {c['style']}" for c in s["categories"]) or "- General"; crit = "\n".join(f"- {c['name']} (weight {c['weight']})" for c in s["criteria"])
-    premium = ("\n- Advanced formatting is ON: you MAY also use <u>, <s>, <tg-spoiler> (one teaser line) and <blockquote expandable> (extra details). Use them tastefully." if s.get("premium_format") else "")
     system = f"""You are the editor-in-chief and content evaluator of a Telegram channel. Output language: {s['language']}. EVERY word of the output MUST be written in {s['language']}, regardless of any other instruction. Channel topic: {s['topic'] or 'general'}.
 EDITOR INSTRUCTIONS (follow strictly):
 {s['prompt']}
@@ -1462,7 +1470,7 @@ FORMATTING RULES (mandatory, not optional):
 - FORMAT CONTRACT: paragraphs are separated by ONE blank line; never end mid-sentence — finish the sentence or compress the story; plain words only (no 'quoted' terms, no [markdown](links)); a sale price, discount or original-price comparison in the story means is_ad=true.
 - VARY THE SUBJECT: name the main person/thing once at first mention, then use pronouns or natural substitutes — never open every paragraph with the same name.
 - UNKNOWN NAMES: a little-known person, company or term gets a one-clause introduction at first mention.
-- NEUTRAL & SOURCE-ONLY: strictly neutral — no judgment, opinion, praise or personal analysis; never add or invent anything beyond the source; never pad to reach the cap — shorter is fine.{premium}
+- NEUTRAL & SOURCE-ONLY: strictly neutral — no judgment, opinion, praise or personal analysis; never add or invent anything beyond the source; never pad to reach the cap — shorter is fine.
 - "post": an engaging, COMPLETE mini-story — max {s['max_words']} words and at most {max(400, int(s['post_limit']) - 120)} characters; never leave the story half-told: if space is tight, compress the whole story instead of dropping its second half.{', ending with 2–4 relevant hashtags on the last line' if s['hashtags'] else ''}.
 - "full": {'the EXPANDED bot version: everything the post says PLUS the deeper details, background, numbers and context — it must NOT merely repeat the post; start fresh and go deeper. Same format: <b> sub-headings, bullets, at least two <blockquote> highlights (300–700 words, max 2500 characters).' if want_full else 'null'}
 - If the text is an advertisement / advertorial / product-for-sale / betting promotion: is_ad=true.
@@ -1492,7 +1500,7 @@ async def generate(s, art, on_queue=None, owner_id=None):
 def signature_of(s, ch):
     sig = (s.get("signature") or "").strip()
     if sig.lower() == "@channel": sig = f"@{ch['username']}" if ch and ch["username"] else ""
-    return sanitize_html(sig, premium=s.get("premium_format", False)) if sig else ""
+    return sanitize_html(sig) if sig else ""
 def make_tail(s, ch, url):
     """پایان‌بند پست کانال: فقط امضا — منبع هرگز در کانال نمایش داده نمی‌شود (فقط در «ادامه در ربات»، با اجازه‌ی مدیر)."""
     sig = signature_of(s, ch)
@@ -1507,9 +1515,9 @@ def ensure_quote(t):
     i = cand[len(cand) // 2] if len(cand) > 1 else cand[0]; parts[i] = f"<blockquote>{parts[i].strip()}</blockquote>"
     return "\n\n".join(parts)
 def compose(s, ch, art, gen):
-    prem = bool(s.get("premium_format")); post = sanitize_html(ensure_quote(clean_ai_text(salvage_post(gen.get("post") or ""), s)), premium=prem)
+    post = sanitize_html(ensure_quote(clean_ai_text(salvage_post(gen.get("post") or ""), s)))
     full = clean_ai_text(salvage_post(gen["full"]), s) if gen.get("full") and str(gen["full"]).lower() != "null" else None
-    if full: full = finish_ok(fit_html(sanitize_html(ensure_quote(full), premium=prem), BOT_FULL_MAX, prem)[0])
+    if full: full = finish_ok(fit_html(sanitize_html(ensure_quote(full)), BOT_FULL_MAX)[0])
     core = re.sub(r"#[^\s#]+", " ", re.sub(r"<[^>]+>", " ", post)); core = re.sub(r"[\s‌]+", " ", core).strip()
     if len(core) < 120 and full and len(re.sub(r"<[^>]+>", " ", full)) >= 200:
         # پست تهی/یک‌خطی (فقط ایموجی و امضا): آغاز نسخه‌ی کامل به‌عنوان پست کانال ساخته می‌شود تا کانال هرگز خالی نماند
@@ -1518,7 +1526,7 @@ def compose(s, ch, art, gen):
         for x in sen:
             if acc and len(acc) + len(x) + 1 > cap: break
             acc += (" " if acc else "") + x
-        if len(acc) >= 120: post = sanitize_html(ensure_quote(acc + " …"), premium=prem)
+        if len(acc) >= 120: post = sanitize_html(ensure_quote(acc + " …"))
     return post + make_tail(s, ch, art["url"]), full
 # ============================================================
 # رسانه و انتشار
@@ -1594,7 +1602,7 @@ async def _send_media(bot, chat_id, caption, pm, media):
     except Exception as e:
         log.warning(f"send_{k}: {e}"); return None
 async def send_post(bot, chat_id, text, media=None):
-    """کپشن ≤۱۰۲۴ → رسانه+کپشن · متن بلندتر → رسانه با تیتر و سپس متن · خطای پارس → تنزل تدریجی فرمت (پریمیوم → معمولی → ساده)."""
+    """کپشن ≤۱۰۲۴ → رسانه+کپشن · متن بلندتر → رسانه با تیتر و سپس متن · خطای پارس → تنزل تدریجی فرمت (معمولی → ساده)."""
     variants = [(text, "HTML"), (downgrade_html(text), "HTML"), (strip_tags(text), None)]
     for i, (t, pm) in enumerate(variants):
         try:
@@ -2260,7 +2268,7 @@ async def view_content(update, context, cid):
     kb = [[B(tr(lang, "b_topic"), f"a:set:{cid}:topic"), B(tr(lang, "b_lang"), f"a:set:{cid}:language")], [B(tr(lang, "b_prompt"), f"a:set:{cid}:prompt"), B(tr(lang, "b_sig"), f"a:set:{cid}:signature")],
           [B(tr(lang, "b_cats", n=len(s["categories"])), f"a:cat:{cid}"), B(tr(lang, "b_crits", n=len(s["criteria"])), f"a:cri:{cid}")], [B(tr(lang, "b_min", n=s["min_score"]), f"a:set:{cid}:min_score"), B(tr(lang, "b_words", n=s["max_words"]), f"a:set:{cid}:max_words")],
           [B(tr(lang, "b_limit", n=s["post_limit"]), f"a:set:{cid}:post_limit"), B(tr(lang, "b_hashtags", i=onoff(s["hashtags"])), f"a:tog:{cid}:hashtags")], [B(tr(lang, "b_link", i=onoff(s["include_link"])), f"a:tog:{cid}:include_link"), B(tr(lang, "b_media", i=onoff(s["include_media"])), f"a:tog:{cid}:include_media")],
-          [B(tr(lang, "b_strict", i=onoff(s["strict_ads"])), f"a:tog:{cid}:strict_ads"), B(tr(lang, "b_premium", i=onoff(s["premium_format"])), f"a:tog:{cid}:premium_format")], [B(tr(lang, "back"), f"a:ch:{cid}")]]
+          [B(tr(lang, "b_strict", i=onoff(s["strict_ads"])), f"a:tog:{cid}:strict_ads")], [B(tr(lang, "back"), f"a:ch:{cid}")]]
     await render(update, context, text, kb)
 async def view_cats(update, context, cid):
     lang = L(update); s = get_settings(cid)
