@@ -2620,12 +2620,8 @@ async def run_test(update, context, cid):
     elif res.get("queued"): text = f"{tr(lang, 'test_queued')}{src_line}\n\n{tr(lang, 'test_log', d=diag)}"; kb.append([B(tr(lang, "queue", n=ready_count(cid)), f"a:que:{cid}")])
     else: text = f"{tr(lang, 'test_fail')}{src_line}\n\n{tr(lang, 'test_log', d=diag)}\n\n{tr(lang, 'test_retry_note')}"; kb.append([B(tr(lang, "rejected"), f"a:rej:{cid}"), B(tr(lang, "sched"), f"a:sch:{cid}")])
     op = _current_operation.get()
-if op:
-    op.failed = not ok
-    op.final_status = True
-
-kb.append([B(tr(lang, "back_panel"), f"a:ch:{cid}")])
-await render(update, context, text, kb)
+    if op: op.failed = not ok
+    kb.append([B(tr(lang, "back_panel"), f"a:ch:{cid}")]); await render(update, context, text, kb)
 # ---------- پایان پنل مدیر میانی ----------
 # ============================================================
 # پنل مدیر کلان، dispatch (با محدودکننده‌ی نرخ)، ورودی‌ها، پشتیبانی، دیپ‌لینک، main
@@ -3485,3 +3481,4 @@ def main():
     log.info("در حال اجرا…"); APP.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
 if __name__ == "__main__": main()
 # ---------- پایان فایل newsbot.py ----------
+
