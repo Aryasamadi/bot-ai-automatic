@@ -17,13 +17,23 @@ jobs:
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           brew install vespa-cli
 
-      - name: Deploy Application
+      - name: Sanitize XML files and Deploy
         env:
           VESPA_CLI_API_KEY: ${{ secrets.VESPA_CLOUD_KEY }}
         run: |
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          
+          # 1. تنظیم کانفیگ
           vespa config set target cloud
           vespa config set application aria.bot-ai-automatic.default
+          
+          # 2. حذف کاراکترهای BOM و خطوط خالی احتمالی از تمامی فایل‌های XML
+          find src/main/application -name "*.xml" -exec sed -i '1s/^\xEF\xBB\xBF//' {} +
+          find src/main/application -name "*.xml" -exec sed -i '1{/^[[:space:]]*$/d}' {} +
+
+          # 3. ایجاد گواهی امنیتی
           mkdir -p src/main/application/security
           vespa auth cert -a aria.bot-ai-automatic.default
+          
+          # 4. دپلوی
           vespa deploy src/main/application --wait 300
