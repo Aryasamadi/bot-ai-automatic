@@ -1,0 +1,19 @@
+name: Deploy to Vespa Cloud
+
+on:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Vespa CLI
+        uses: vespa-engine/vespa-management-action@v1
+        with:
+          apiKey: ${{ secrets.VESPA_CLOUD_KEY }}
+          
+      - name: Deploy Application
+        run: vespa deploy src/main/application --wait 300
