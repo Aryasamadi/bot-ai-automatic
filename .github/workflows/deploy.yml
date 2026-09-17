@@ -12,10 +12,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Install Vespa CLI
-        run: |
-          curl -fsSL https://github.com/vespa-engine/vespa/releases/download/v8.280.12/vespa-cli_8.280.12_linux_amd64.tar.gz | tar -xz
-          sudo mv vespa-cli_8.280.12_linux_amd64/bin/vespa /usr/local/bin/
+      - name: Setup Vespa CLI
+        uses: vespa-engine/vespa-management-action/setup-cli@v1
 
       - name: Deploy Application
         env:
