@@ -3,17 +3,23 @@ name: Deploy to Vespa Cloud
 on:
   push:
     branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      
-      - name: Setup Vespa CLI
-        uses: vespa-engine/vespa-management-action@v1
-        with:
-          apiKey: ${{ secrets.VESPA_CLOUD_KEY }}
-          
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install Vespa CLI
+        run: |
+          curl -fsSL https://github.com/vespa-engine/vespa/releases/download/v8.280.12/vespa-cli_8.280.12_linux_amd64.tar.gz | tar -xz
+          sudo mv vespa-cli_8.280.12_linux_amd64/bin/vespa /usr/local/bin/
+
       - name: Deploy Application
-        run: vespa deploy src/main/application --wait 300
+        env:
+          VESPA_CLI_API_KEY: ${{ secrets.VESPA_CLOUD_KEY }}
+        run: |
+          vespa config set target cloud
+          vespa deploy src/main/application --wait 300
