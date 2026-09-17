@@ -12,10 +12,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Install Vespa CLI
+      - name: Install Vespa CLI via Homebrew
         run: |
-          curl -fsSL https://vespa.ai/install-cli.sh | bash
-          sudo cp $HOME/.vespa/bin/vespa /usr/local/bin/
+          brew install vespa-cli
 
       - name: Deploy Application
         env:
