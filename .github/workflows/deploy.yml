@@ -15,12 +15,12 @@ jobs:
       - name: Install Vespa CLI
         run: |
           curl -fsSL https://vespa.ai/install-cli.sh | bash
-          echo "$HOME/.vespa/bin" >> $GITHUB_PATH
 
       - name: Deploy Application
         env:
           VESPA_CLI_API_KEY: ${{ secrets.VESPA_CLOUD_KEY }}
         run: |
+          export PATH="$HOME/.vespa/bin:$PATH"
           vespa config set target cloud
           vespa config set application aria.bot-ai-automatic.default
           vespa deploy src/main/application --wait 300
