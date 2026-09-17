@@ -17,27 +17,25 @@ jobs:
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           brew install vespa-cli
 
-      - name: Clean XML and Deploy
+      - name: Debug and Deploy
         env:
           VESPA_CLI_API_KEY: ${{ secrets.VESPA_CLOUD_KEY }}
         run: |
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           
-          # 1. تنظیم کانفیگ Vespa
+          # ۱. نمایش لیست تمام فایل‌های موجود در پوشه اپلیکیشن
+          echo "=== List of files in src/main/application ==="
+          find src/main/application -type f
+
+          # ۲. پاکسازی تمام فایل‌های هیدن یا تپلی/بک‌آپ احتمالی
+          find src/main/application -name ".*" -delete
+          find src/main/application -name "*~" -delete
+
+          # ۳. تنظیم کانفیگ و ساخت گواهی
           vespa config set target cloud
           vespa config set application aria.bot-ai-automatic.default
-          
-          # 2. بازنویسی استاندارد و ساختاریافته فایل services.xml با پایتون برای حذف تمام کاراکترهای زاید
-          python3 -c "
-          import os
-          content = '<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<services version=\"1.0\">\n  <container id=\"default\" version=\"1.0\">\n    <document-api/>\n  </container>\n</services>\n'
-          os.makedirs('src/main/application/security', exist_ok=True)
-          with open('src/main/application/services.xml', 'wb') as f:
-              f.write(content.encode('utf-8'))
-          "
-
-          # 3. ایجاد گواهی امنیتی
+          mkdir -p src/main/application/security
           vespa auth cert -a aria.bot-ai-automatic.default
-          
-          # 4. دپلوی اپلیکیشن
+
+          # ۴. اجرای دپلوی
           vespa deploy src/main/application --wait 300
