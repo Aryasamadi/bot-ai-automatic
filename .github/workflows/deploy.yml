@@ -22,4 +22,5 @@ jobs:
           VESPA_CLI_API_KEY: ${{ secrets.VESPA_CLOUD_KEY }}
         run: |
           vespa config set target cloud
+          vespa config set application aria.bot-ai-automatic.default
           vespa deploy src/main/application --wait 300
