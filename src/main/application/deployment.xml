@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<deployment version="1.0">
+    <instance id="default">
+        <prod>
+            <region>aws-us-east-1c</region>
+        </prod>
+    </instance>
+</deployment>
