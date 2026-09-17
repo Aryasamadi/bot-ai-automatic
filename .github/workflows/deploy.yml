@@ -24,5 +24,6 @@ jobs:
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           vespa config set target cloud
           vespa config set application aria.bot-ai-automatic.default
+          mkdir -p src/main/application/security
           vespa auth cert -a aria.bot-ai-automatic.default
           vespa deploy src/main/application --wait 300
