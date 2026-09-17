@@ -17,25 +17,20 @@ jobs:
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           brew install vespa-cli
 
-      - name: Debug and Deploy
+      - name: Fix XMLs and Deploy
         env:
           VESPA_CLI_API_KEY: ${{ secrets.VESPA_CLOUD_KEY }}
         run: |
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           
-          # ۱. نمایش لیست تمام فایل‌های موجود در پوشه اپلیکیشن
-          echo "=== List of files in src/main/application ==="
-          find src/main/application -type f
+          # 1. حذف فایل deployment.xml که عامل اصلی این خطاست
+          rm -f src/main/application/deployment.xml
 
-          # ۲. پاکسازی تمام فایل‌های هیدن یا تپلی/بک‌آپ احتمالی
-          find src/main/application -name ".*" -delete
-          find src/main/application -name "*~" -delete
-
-          # ۳. تنظیم کانفیگ و ساخت گواهی
+          # 2. تنظیم کانفیگ و ساخت گواهی
           vespa config set target cloud
           vespa config set application aria.bot-ai-automatic.default
           mkdir -p src/main/application/security
           vespa auth cert -a aria.bot-ai-automatic.default
 
-          # ۴. اجرای دپلوی
+          # 3. اجرای دپلوی
           vespa deploy src/main/application --wait 300
