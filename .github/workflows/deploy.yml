@@ -12,8 +12,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Setup Vespa CLI
-        uses: vespa-engine/vespa-management-action/setup-cli@v1
+      - name: Install Vespa CLI
+        run: |
+          curl -fsSL https://vespa.ai/install-cli.sh | bash
+          echo "$HOME/.vespa/bin" >> $GITHUB_PATH
 
       - name: Deploy Application
         env:
