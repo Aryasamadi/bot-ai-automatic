@@ -3,10 +3,14 @@ name: Run Telegram Bot
 on:
   workflow_dispatch:
 
+permissions:
+  actions: write
+  contents: read
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 350
 
     steps:
       - name: Checkout repository
@@ -27,3 +31,17 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           SUPER_ADMIN_IDS: ${{ secrets.SUPER_ADMIN_IDS }}
         run: python bot.py
+
+  restart:
+    if: always()
+    needs: run-bot
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Restart bot workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run bot.yml \
+            --repo "${{ github.repository }}" \
+            --ref "${{ github.ref_name }}"
