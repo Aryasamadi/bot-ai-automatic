@@ -5,9 +5,6 @@ NewsBot v3 — یک‌فایل کامل: هسته‌ی داده، موتور م�
 """
 import os, re, json, html, time, random, asyncio, logging, sqlite3, hashlib, secrets, tempfile, threading, ipaddress, socket
 from datetime import datetime, timedelta, timezone
-from contextvars import ContextVar
-from dataclasses import dataclass, field
-from types import SimpleNamespace
 from urllib.parse import urljoin, urlparse
 import httpx, feedparser, trafilatura
 from bs4 import BeautifulSoup
@@ -310,17 +307,17 @@ def usage_inc(uid, field):
     q(f"UPDATE usage SET {field}={field}+1 WHERE admin_id=? AND day=?", (uid, d), commit=True)
 def usage_reset(uid, field="tests"): q(f"UPDATE usage SET {field}=0 WHERE admin_id=? AND day=?", (uid, today_str(admin_offset(uid))), commit=True)
 def usage_reserve(uid, field="posts"):
-    """سهمیه را پیشاپیش و اتمیک رزرو می‌کند تا چند چرخه‌ی هم‌زمان از سقف پلن عبور نکنند. خروجی: (ok, day) — day سطلِ همان رزرو است."""
+    """سهمیه را پیشاپیش و اتمیک رزرو می‌کند تا چند چرخه‌ی هم‌زمان از سقف پلن عبور نکنند. خروجی: True اگر سهمیه گرفته شد."""
     lim = admin_limits(uid); cap = lim["daily_posts"] if field == "posts" else lim["daily_tests"]
-    if cap is None: return True, None
+    if cap is None: return True
     d = today_str(admin_offset(uid))
     q("INSERT INTO usage(admin_id,day,posts,tests) VALUES(?,?,0,0) ON CONFLICT(admin_id,day) DO NOTHING", (uid, d), commit=True)
     with _lock:
         cur = db().execute(f"UPDATE usage SET {field}={field}+1 WHERE admin_id=? AND day=? AND {field}<?", (uid, d, cap))
-        db().commit(); return cur.rowcount > 0, d
-def usage_release(uid, field, day):
-    if day is None: return
-    q(f"UPDATE usage SET {field}=MAX(0,{field}-1) WHERE admin_id=? AND day=?", (uid, day), commit=True)
+        db().commit(); return cur.rowcount > 0
+def usage_release(uid, field="posts"):
+    """سهمیه‌ی رزروشده‌ای که به نتیجه نرسید (انتشار ناموفق) باز می‌گردد."""
+    q(f"UPDATE usage SET {field}=MAX(0,{field}-1) WHERE admin_id=? AND day=?", (uid, today_str(admin_offset(uid))), commit=True)
 def remaining(uid, field="posts"):
     lim = admin_limits(uid); cap = lim["daily_posts"] if field == "posts" else lim["daily_tests"]
     if cap is None: return None
@@ -463,13 +460,7 @@ def add_channel(uid, chat_id, title, username, verified_by, lang="fa"):
     if channel_by_chat(chat_id): return None
     return q("INSERT INTO channels(admin_id,chat_id,title,username,lock_code,verified_by,created_at,settings) VALUES(?,?,?,?,?,?,?,?)",
              (uid, chat_id, title, username or "", _lock_code(), verified_by, now_iso(), json.dumps(default_settings(lang, username), ensure_ascii=False)), commit=True)
-def publication_pending(cid):
-    if ch_lock(cid).locked(): return True
-    rows = q("SELECT s.value FROM articles a JOIN settings s ON s.key='pubj:'||a.id WHERE a.channel_id=? AND s.value!='null'", (cid,))
-    return any((json.loads(r["value"]) or {}).get("phase") in ("in_flight", "partial", "ack") for r in rows)
-
 def transfer_channel(cid, new_uid, lang="fa"):
-    if publication_pending(cid): raise RuntimeError("channel_busy")
     ch = get_channel(cid)
     if not ch: return None
     q("DELETE FROM sources WHERE channel_id=?", (cid,), commit=True); q("DELETE FROM articles WHERE channel_id=? AND status!='published'", (cid,), commit=True)
@@ -478,16 +469,13 @@ def transfer_channel(cid, new_uid, lang="fa"):
 def regen_lock(cid): code = _lock_code(); q("UPDATE channels SET lock_code=? WHERE id=?", (code, cid), commit=True); return code
 def reset_channel_link(cid):
     """بازتولید کد قفل ⇒ پیوند کانال از نظر امنیتی باطل می‌شود: کد تازه صادر می‌شود، صف انتشار (تأیید‌نشده‌ها) پاک می‌شود، اتوماسیون خاموش و وضعیت چرخه صفر می‌شود. منابع و آرشیو منتشر‌شده دست‌نخورده می‌مانند."""
-    code = _lock_code()
-    if publication_pending(cid): raise RuntimeError("channel_busy")
-    q("UPDATE channels SET lock_code=? WHERE id=?", (code, cid), commit=True)
+    code = _lock_code(); q("UPDATE channels SET lock_code=? WHERE id=?", (code, cid), commit=True)
     n = q("SELECT COUNT(*) c FROM articles WHERE channel_id=? AND status!='published'", (cid,), one=True)["c"]
     q("DELETE FROM articles WHERE channel_id=? AND status!='published'", (cid,), commit=True)
     update_settings(cid, enabled=False, last_run=None, last_end=None, last_result="", last_diag=None, last_notified_diag="")
     return code, n
 def check_lock(cid, code): ch = get_channel(cid); return bool(ch and ch["lock_code"] and str(code).strip() == ch["lock_code"])
 def del_channel(cid, uid):
-    if publication_pending(cid): raise RuntimeError("channel_busy")
     q("DELETE FROM sources WHERE channel_id=? AND admin_id=?", (cid, uid), commit=True); q("DELETE FROM articles WHERE channel_id=? AND admin_id=?", (cid, uid), commit=True)
     q("DELETE FROM channels WHERE id=? AND admin_id=?", (cid, uid), commit=True)
 def update_channel_meta(cid, title=None, username=None):
@@ -541,119 +529,11 @@ def article_update(aid, **f):
     _safe_fields("articles", f)
     q("UPDATE articles SET " + ", ".join(f"{k}=?" for k in f) + " WHERE id=?", (*f.values(), aid), commit=True)
 def get_article(aid): return q("SELECT * FROM articles WHERE id=?", (aid,), one=True)
-def get_pub_journal(aid): return gget(f"pubj:{aid}") or None
-def set_pub_journal(aid, entry): gset(f"pubj:{aid}", entry)
-def release_publication(aid, journal, reason):
-    with _lock:
-        conn = db()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            day = journal.get("reserved_day")
-            if day is not None and journal.get("phase") != "in_flight":
-                conn.execute("UPDATE usage SET posts=MAX(0,posts-1) WHERE admin_id=? AND day=?", (journal["admin_id"], day))
-            journal = dict(journal, reserved_day=day if journal.get("phase") == "in_flight" else None)
-            conn.execute("UPDATE articles SET reason=? WHERE id=?", (reason, aid))
-            if journal.get("phase") == "prepared":
-                conn.execute("DELETE FROM settings WHERE key=?", (f"pubj:{aid}",))
-            else:
-                conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (f"pubj:{aid}", json.dumps(journal)))
-            conn.commit()
-        except BaseException:
-            conn.rollback(); raise
-    return journal
-
-class PublicationTransport:
-    def __init__(self, bot, aid, journal, parent):
-        self.bot, self.aid, self.journal, self.parent = bot, aid, journal, parent
-        self.caption_complete = False
-    def __getattr__(self, name):
-        method = getattr(self.bot, name)
-        if not name.startswith("send_"): return method
-        async def send(*args, **kwargs):
-            operation_checkpoint()
-            if self.parent.cancelling(): raise asyncio.CancelledError
-            previous = self.journal["phase"]
-            self.journal["phase"] = "in_flight"
-            set_pub_journal(self.aid, self.journal)
-            try: message = await method(*args, **kwargs)
-            except (BadRequest, RetryAfter, Forbidden):
-                self.journal["phase"] = previous
-                set_pub_journal(self.aid, self.journal)
-                raise
-            except NetworkError:
-                raise
-            except Exception:
-                raise
-            if name != "send_message" and not self.caption_complete:
-                self.journal.update(phase="partial", media_id=message.message_id)
-            else:
-                self.journal.update(phase="ack", message_id=message.message_id)
-            set_pub_journal(self.aid, self.journal)
-            return message
-        return send
-
-def reserve_publication(aid, admin_id, count_usage, test_user, previous):
-    day = today_str(admin_offset(admin_id))
-    cap = admin_limits(admin_id)["daily_posts"] if count_usage else None
-    journal = dict(previous or {}, phase="partial" if previous and previous.get("media_id") else "prepared",
-                   admin_id=admin_id, test_user=test_user, day=day, reserved_day=day if count_usage and cap is not None else None)
-    with _lock:
-        conn = db()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            if journal["reserved_day"] is not None:
-                conn.execute("INSERT OR IGNORE INTO usage(admin_id,day,posts,tests) VALUES(?,?,0,0)", (admin_id, day))
-                cur = conn.execute("UPDATE usage SET posts=posts+1 WHERE admin_id=? AND day=? AND posts<?", (admin_id, day, cap))
-                if not cur.rowcount: conn.rollback(); return None
-            conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (f"pubj:{aid}", json.dumps(journal)))
-            conn.commit()
-        except BaseException:
-            conn.rollback(); raise
-    return journal
-
-def settle_publication(aid, ch, journal):
-    link = journal.get("link") or msg_link(ch, SimpleNamespace(message_id=journal["message_id"]))
-    with _lock:
-        conn = db()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            a = conn.execute("SELECT * FROM articles WHERE id=?", (aid,)).fetchone()
-            if not a: raise RuntimeError("article_missing")
-            if a["status"] != "published":
-                conn.execute("INSERT OR IGNORE INTO posted VALUES(?,?,?)", (ch["chat_id"], a["hash"], now_iso()))
-                conn.execute("UPDATE articles SET status='published',links=?,reason='' WHERE id=?", (json.dumps([link]), aid))
-                uid = journal.get("test_user")
-                if uid is not None:
-                    day = journal["day"]
-                    conn.execute("INSERT INTO usage(admin_id,day,posts,tests) VALUES(?,?,0,1) ON CONFLICT(admin_id,day) DO UPDATE SET tests=tests+1", (uid, day))
-            conn.execute("DELETE FROM settings WHERE key=?", (f"pubj:{aid}",))
-            conn.commit()
-        except BaseException:
-            conn.rollback(); raise
-    if journal.get("test_user") is not None: rate_mark(f"test:{ch['id']}")
-def recover_publications():
-    for row in q("SELECT a.id,a.channel_id,a.reason FROM articles a JOIN settings s ON s.key='pubj:'||a.id WHERE s.value!='null'"):
-        if ch_lock(row["channel_id"]).locked(): continue
-        journal = get_pub_journal(row["id"])
-        if not journal: continue
-        try:
-            if journal.get("phase") == "ack":
-                ch = get_channel(row["channel_id"])
-                if ch: settle_publication(row["id"], ch, journal)
-            else:
-                release_publication(row["id"], journal, "delivery_unknown" if journal.get("phase") == "in_flight" else row["reason"] or "")
-        except Exception: log.exception("publication recovery failed article=%s", row["id"])
-
-def articles_by_status(cid, status, limit=50, automatic=False):
+def articles_by_status(cid, status, limit=50):
     st = ("rejected", "failed") if status == "rejected" else (status,)
-    order = "ASC" if status == "ready" else "DESC"
-    eligible = " AND COALESCE(reason,'')!='cancelled'" if automatic else ""
-    return q(f"SELECT id,title,score,category,created_at,url,reason,status FROM articles WHERE channel_id=? AND status IN ({','.join('?'*len(st))}){eligible} ORDER BY id {order} LIMIT ?", (cid, *st, limit))
+    return q(f"SELECT id,title,score,category,created_at,url,reason,status FROM articles WHERE channel_id=? AND status IN ({','.join('?'*len(st))}) ORDER BY id DESC LIMIT ?", (cid, *st, limit))
 def ready_count(cid): return q("SELECT COUNT(*) c FROM articles WHERE channel_id=? AND status='ready'", (cid,), one=True)["c"]
-def delete_article(aid, uid):
-    a = get_article(aid)
-    if a and publication_pending(a["channel_id"]): raise RuntimeError("channel_busy")
-    q("DELETE FROM articles WHERE id=? AND admin_id=?", (aid, uid), commit=True)
+def delete_article(aid, uid): q("DELETE FROM articles WHERE id=? AND admin_id=?", (aid, uid), commit=True)
 def posted_before(chat_id, h): return bool(q("SELECT 1 FROM posted WHERE channel_id=? AND hash=?", (chat_id, h), one=True))
 def mark_posted(chat_id, h): q("INSERT OR IGNORE INTO posted VALUES(?,?,?)", (chat_id, h, now_iso()), commit=True)
 def count_articles(uid=None, hours=24, status=None, cid=None):
@@ -666,7 +546,7 @@ def cleanup():
     if (time.time() - float(gget("last_cleanup", 0))) < 3600: return
     ttl = (now_utc() - timedelta(hours=DATA_TTL_HOURS)).isoformat()
     q("DELETE FROM articles WHERE created_at<? AND status NOT IN ('ready','published')", (ttl,), commit=True)
-    q("DELETE FROM articles WHERE created_at<? AND status='published'", ((now_utc() - timedelta(hours=72)).isoformat(),), commit=True)
+    q("DELETE FROM articles WHERE created_at<? AND status IN ('ready','published')", ((now_utc() - timedelta(hours=72)).isoformat(),), commit=True)
     q("DELETE FROM posted WHERE posted_at<?", ((now_utc() - timedelta(days=90)).isoformat(),), commit=True)
     q("DELETE FROM kv_cache WHERE cached_at<?", (ttl,), commit=True)
     q("DELETE FROM deeplinks WHERE created_at<?", ((now_utc() - timedelta(days=30)).isoformat(),), commit=True)
@@ -754,7 +634,7 @@ async def load_deeplink(key):
     if data: q("INSERT OR REPLACE INTO kv_cache VALUES(?,?,?)", (key, data, now_iso()), commit=True); return json.loads(data)
     return None
 def init_core():
-    db(); seed_plans(); recover_publications()
+    db(); seed_plans()
     if gget("automation_enabled") is None: gset("automation_enabled", True)
     log.info(f"core v3 آماده | CF KV: {'فعال' if CF_ENABLED else 'محلی'} | مدیر کلان: {SUPER_ADMIN_IDS} | AI×{AI_CONCURRENCY} FETCH×{FETCH_CONCURRENCY} CYCLE×{CYCLE_CONCURRENCY}")
 # ---------- پایان لایه‌ی هسته‌ی داده ----------
@@ -762,7 +642,7 @@ def init_core():
 # موتور: مدل‌های AI سازگار با همه، فرمت‌بندی، کشف/استخراج قدرتمند، انتشار، چرخه، زمان‌بند
 # ============================================================
 from urllib.parse import parse_qsl, urlencode
-from telegram.error import BadRequest, RetryAfter, NetworkError, Forbidden
+from telegram.error import BadRequest, RetryAfter
 def hostname(u):
     try: return urlparse(u).netloc.replace("www.", "") or u
     except Exception: return str(u)
@@ -801,77 +681,42 @@ def _err_text(r):
         j = r.json(); e = j.get("error"); msg = (e.get("message") if isinstance(e, dict) else e) or j.get("message") or j.get("detail") or r.text
     except Exception: msg = r.text
     return f"HTTP {r.status_code}: {re.sub(r'<[^>]+>', '', str(msg))[:160]}"
-class AIResponseError(RuntimeError):
-    pass
-
-
-def _provider_json(r):
-    if r.status_code >= 400: raise AIResponseError(_err_text(r))
-    try: j = r.json()
-    except ValueError as e: raise AIResponseError("malformed provider JSON") from e
-    if not isinstance(j, dict): raise AIResponseError("malformed provider envelope")
-    if j.get("error"): raise AIResponseError("provider error response")
-    return j
-
-
-def _ai_text(value):
-    if not isinstance(value, str): raise AIResponseError("invalid response text")
-    value = value.strip()
-    if not value: raise AIResponseError("empty response")
-    return value
-
-
 def _openai_content(j):
-    choices = j.get("choices")
-    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-        raise AIResponseError("malformed provider choices")
-    ch = choices[0]; msg = ch.get("message") or ch.get("delta") or {}
-    if not isinstance(msg, dict): raise AIResponseError("malformed provider message")
-    if msg.get("refusal"): raise AIResponseError("provider refused response")
-    c = msg.get("content") or ch.get("text")
-    if isinstance(c, list):
-        if any(not isinstance(p, dict) or not isinstance(p.get("text"), str) for p in c):
-            raise AIResponseError("malformed provider content")
-        c = "".join(p["text"] for p in c)
-    return _ai_text(c)
+    ch = (j.get("choices") or [{}])[0]; msg = ch.get("message") or ch.get("delta") or {}; c = msg.get("content")
+    if not c and ch.get("text"): c = ch["text"]
+    if isinstance(c, list): c = "".join(p.get("text", "") for p in c if isinstance(p, dict))
+    return c or ""
 async def _post(url, **kw): return await http().post(url, timeout=httpx.Timeout(120, connect=15), **kw)
 async def _call_model(m, system, user):
-    kind = m["kind"] or detect_kind(m["base_url"]); base = (m["base_url"] or "").rstrip("/"); key = m["api_key"] or ""; model = m["model"]; temp = 0.5 if m["temperature"] is None else float(m["temperature"]); mx = int(m["max_tokens"] or 2500)
+    kind = m["kind"] or detect_kind(m["base_url"]); base = (m["base_url"] or "").rstrip("/"); key = m["api_key"] or ""; model = m["model"]; temp = float(m["temperature"] or 0.5); mx = int(m["max_tokens"] or 2500)
     if kind == "anthropic":
         url = base + ("/messages" if base.endswith("/v1") else "/v1/messages")
         r = await _post(url, headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"}, json={"model": model, "max_tokens": mx, "temperature": temp, "system": system, "messages": [{"role": "user", "content": user}]})
-        j = _provider_json(r); blocks = j.get("content")
-        if not isinstance(blocks, list) or any(not isinstance(b, dict) for b in blocks): raise AIResponseError("malformed provider content")
-        parts = [b.get("text") for b in blocks if b.get("type") == "text"]
-        if any(not isinstance(p, str) for p in parts): raise AIResponseError("invalid response text")
-        return _ai_text("".join(parts))
+        if r.status_code >= 400: raise RuntimeError(_err_text(r))
+        return "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")
     if kind == "gemini":
         model = model.replace("models/", ""); root = base if re.search(r"/v1(beta)?$", base) else base + "/v1beta"
         r = await _post(f"{root}/models/{model}:generateContent", params={"key": key}, json={"system_instruction": {"parts": [{"text": system}]}, "contents": [{"role": "user", "parts": [{"text": user}]}], "generationConfig": {"temperature": temp, "maxOutputTokens": mx}})
-        j = _provider_json(r); cands = j.get("candidates")
-        if not isinstance(cands, list) or not cands or not isinstance(cands[0], dict): raise AIResponseError("malformed provider candidates")
-        content = cands[0].get("content")
-        if not isinstance(content, dict): raise AIResponseError("provider blocked response")
-        parts = content.get("parts")
-        if not isinstance(parts, list) or any(not isinstance(p, dict) or not isinstance(p.get("text"), str) for p in parts): raise AIResponseError("malformed provider parts")
-        return _ai_text("".join(p["text"] for p in parts))
+        if r.status_code >= 400: raise RuntimeError(_err_text(r))
+        cands = r.json().get("candidates") or []
+        if not cands: raise RuntimeError("no candidates (safety block?)")
+        return "".join(p.get("text", "") for p in cands[0].get("content", {}).get("parts", []))
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     if "openrouter" in base: headers.update({"HTTP-Referer": "https://t.me", "X-Title": "NewsBot"})
     body = {"model": model, "temperature": temp, "max_tokens": mx, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
     url = base if base.endswith("/chat/completions") else base + "/chat/completions"
     r = await _post(url, headers=headers, json=body)
     if r.status_code == 404 and not re.search(r"/v\d", base): r = await _post(base + "/v1/chat/completions", headers=headers, json=body)
-    return _openai_content(_provider_json(r))
+    if r.status_code >= 400: raise RuntimeError(_err_text(r))
+    return _openai_content(r.json())
 async def _mark_fail(m, err):
-    cur = get_model(m["id"]) or m   # اسنپ‌شاتِ ورودی ممکن است کهنه باشد؛ شمارنده از سطر فعلی خوانده می‌شود
-    fc = (cur["fail_count"] or 0) + 1; update_model(m["id"], fail_count=fc, last_error=str(err)[:300], last_fail=now_iso())
-    if fc >= 2 and cur["status"] != "down":
+    fc = (m["fail_count"] or 0) + 1; update_model(m["id"], fail_count=fc, last_error=str(err)[:300], last_fail=now_iso())
+    if fc >= 2 and m["status"] != "down":
         update_model(m["id"], status="down"); log_event("ERROR", f"مدل «{m['name']}» از کار افتاد: {err}")
         await notify_super(f"🔴 مدل <b>{html.escape(m['name'])}</b> (<code>{html.escape(m['model'])}</code>) از کار افتاد.\n<code>{html.escape(str(err)[:200])}</code>")
 async def _mark_ok(m):
-    cur = get_model(m["id"]) or m   # ok_count/fail_count از سطر فعلی، نه از اسنپ‌شات احتمالاً کهنه
-    update_model(m["id"], fail_count=0, status="ok", last_ok=now_iso(), ok_count=(cur["ok_count"] or 0) + 1)
-    if cur["status"] == "down": log_event("INFO", f"مدل «{m['name']}» دوباره فعال شد."); await notify_super(f"🟢 مدل <b>{html.escape(m['name'])}</b> دوباره فعال شد.")
+    update_model(m["id"], fail_count=0, status="ok", last_ok=now_iso(), ok_count=(m["ok_count"] or 0) + 1)
+    if m["status"] == "down": log_event("INFO", f"مدل «{m['name']}» دوباره فعال شد."); await notify_super(f"🟢 مدل <b>{html.escape(m['name'])}</b> دوباره فعال شد.")
 # --- حریم خصوصی مدل‌ها: هیچ نام مدل/آدرس/کلیدی به مدیر میانی نمی‌رسد؛ فقط یک کد کوتاه و بی‌خطر
 AI_ERR = {"ai_busy": ("سرویس هوش مصنوعی موقتاً شلوغ است", "AI service is busy right now"), "ai_auth": ("دسترسی سرویس هوش مصنوعی برقرار نشد", "AI service access failed"),
           "ai_timeout": ("سرویس هوش مصنوعی پاسخ نداد", "AI service did not respond"), "ai_empty": ("پاسخ خالی از سرویس هوش مصنوعی", "Empty response from AI service"),
@@ -894,98 +739,43 @@ def _model_ready(m):
     """مدلِ سالم، یا مدلِ افتاده‌ای که وقت آزمایش دوباره‌اش رسیده است."""
     if m["status"] != "down": return True
     lf = parse_dt(m["last_fail"]); return bool(not lf or (now_utc() - lf) >= timedelta(minutes=MODEL_PROBE_MIN))
-_ai_events = ContextVar("ai_events", default=None)
-
-
-def _model_label(m, owner_id=None):
-    if owner_id and m["owner_id"] != owner_id: return "مدل عمومی/پیش‌فرض" if user_lang(owner_id) != "en" else "Public/default model"
-    return m["name"] or m["model"]
-
-
-async def _ai_event(event, label="", code=None):
-    callback = _ai_events.get()
-    if callback: await callback(event, label, code)
-
-
-def _validate_output(text):
-    text = _ai_text(text)
-    if text.startswith(("{", "[")):
-        try: j = json.loads(text)
-        except ValueError as e: raise AIResponseError("malformed AI output") from e
-        if not isinstance(j, dict) or j.get("error"): raise AIResponseError("invalid AI output")
-    return text
-
-
-def _validate_ready(text):
-    if _ai_text(text).upper() != "READY": raise AIResponseError("invalid health-check output")
-
-
-def _validate_generation(text):
-    _validate_output(text)
-    j = parse_json(text)
-    if isinstance(j, dict):
-        if j.get("is_ad") is True: return
-        post = j.get("post")
-        if not isinstance(post, str) or not strip_tags(post).strip(): raise AIResponseError("invalid empty post")
-    elif not strip_tags(salvage_post(text)).strip(): raise AIResponseError("empty AI output")
-
-
-async def _try_models(groups, system, user, owner_id=None, on_queue=None, validate=None, explicit_id=None):
-    tried = set(); last = "ai_none"
-    for stage, models in groups:
-        if stage == "test" and not models: await _ai_event("no_test")
-        rest = list(models)
-        while rest:
-            free = [m for m in rest if not model_busy(m["id"])]
-            m = (rest if explicit_id == rest[0]["id"] else (free or rest))[0]
-            rest.remove(m)
-            if m["id"] in tried: continue
-            tried.add(m["id"])
-            label = _model_label(m, owner_id)
-            if model_busy(m["id"]) or AI_SEM.locked():
-                await _ai_event("busy", label)
-                if on_queue: await on_queue()
-            try:
-                async with model_lock(m["id"]):
-                    current = get_model(m["id"])
-                    if not current or current["owner_id"] != m["owner_id"] or (m["id"] != explicit_id and (not current["active"] or not _model_ready(current))):
-                        await _ai_event("unavailable", label); continue
-                    async with AI_SEM:
-                        await _ai_event("start", label, stage)
-                        text = _validate_output(await _call_model(current, system, user))
-                        if validate: validate(text)
-                    await _mark_ok(current)
-                await _ai_event("success", label)
-                return text, label, None
-            except (httpx.HTTPError, asyncio.TimeoutError, AIResponseError) as e:
-                last = "ai_timeout" if isinstance(e, (httpx.TimeoutException, asyncio.TimeoutError)) else err_code(e)
-                await _mark_fail(m, e)
-                await _ai_event("failure", label, last)
-    await _ai_event("failed", code=last)
-    return None, None, last
-
-
-async def ai_chat(system, user, on_queue=None, owner_id=None, selected_id=None, validate=None):
+async def ai_chat(system, user, on_queue=None, owner_id=None):
+    """خروجی: (text, model_name, err_code) — اولویت با مدل‌های شخصیِ خودِ مدیر است؛ اگر نداشت یا همه‌شان خطا دادند، مدل‌های عمومی ربات امتحان می‌شوند. ابتدا سراغ مدلِ بیکار می‌رود؛ اگر همه مشغول بودند on_queue صدا زده می‌شود."""
     personal = [m for m in list_models(active_only=True, owner_id=owner_id) if _model_ready(m)] if owner_id else []
-    if selected_id is not None:
-        selected = get_model(selected_id)
-        if not selected or selected["owner_id"] != owner_id or owner_id is None:
-            return None, None, "ai_none"
-        personal = [selected] + [m for m in personal if m["id"] != selected_id]
     shared = [m for m in list_models(active_only=True) if _model_ready(m)]
-    test_id = gget("test_model_id")
-    test = [m for m in shared if m["id"] == test_id]
-    shared = [m for m in shared if m["id"] != test_id]
-    return await _try_models([("personal", personal), ("test", test), ("public", shared)], system, user,
-                             owner_id, on_queue, validate, selected_id)
-
-
+    models = personal + shared
+    if not models: log_event("ERROR", "هیچ مدل فعالی در دسترس نیست.", owner_id); return None, None, "ai_none"
+    last, tried, told, personal_exhausted = "ai_error", set(), False, False
+    while True:
+        rest = [m for m in models if m["id"] not in tried]
+        if not rest: return None, None, last
+        free = [m for m in rest if not model_busy(m["id"])]
+        if not free and on_queue and not told:
+            told = True
+            try: await on_queue()
+            except Exception: pass
+        m = (free or rest)[0]; tried.add(m["id"])
+        # Track if we've exhausted personal models and are now using shared
+        if personal and m in shared and all(pm["id"] in tried for pm in personal):
+            personal_exhausted = True
+        try:
+            async with model_lock(m["id"]):
+                async with AI_SEM: text = await _call_model(m, system, user)
+            if not text or not text.strip(): raise RuntimeError("empty response")
+            await _mark_ok(m)
+            model_label = m["name"]
+            if personal_exhausted:
+                model_label = f"{m['name']} (fallback)"
+            return text.strip(), model_label, None
+        except Exception as e: last = err_code(e); await _mark_fail(m, e)
 async def test_model(mid):
-    m = get_model(mid); t = time.monotonic()
-    if not m: return False, "no model", 0.0
-    out, label, err = await _try_models([("direct", [m])], "You are a health-check. Reply with exactly one word.",
-                                      "Say: READY", validate=_validate_ready, explicit_id=mid)
-    return out is not None, out[:100] if out else err, round(time.monotonic() - t, 1)
+    m = get_model(mid); t = time.time()
+    try:
+        async with model_lock(mid):
+            async with AI_SEM: out = await _call_model(m, "You are a health-check. Reply with exactly one word.", "Say: READY")
+        if not out or not out.strip(): raise RuntimeError("empty response")
+        await _mark_ok(m); return True, out.strip()[:100], round(time.time() - t, 1)
+    except Exception as e: await _mark_fail(m, e); return False, str(e)[:200], round(time.time() - t, 1)
 async def probe_down_models():
     for m in q("SELECT * FROM ai_models WHERE active=1 AND status='down' ORDER BY last_fail LIMIT 1"):
         lf = parse_dt(m["last_fail"])
@@ -1050,7 +840,7 @@ def sanitize_html(text):
             if tag == "a":
                 h = re.search(r'href=["\']([^"\']+)["\']', attrs)
                 if not h or not h.group(1).strip().lower().startswith(("http://", "https://", "tg://")): continue
-                out.append(f'<a href="{html.escape(html.unescape(h.group(1).strip()), quote=True)}">')
+                out.append(f'<a href="{html.escape(h.group(1).strip(), quote=True)}">')
             elif tag == "tg-emoji":
                 eid = re.search(r'emoji-id=["\']?(\d+)', attrs)
                 if not eid: continue
@@ -1354,7 +1144,7 @@ def _api_items(raw, base, limit):
         pd = parse_dt(pub); img = _api_first(d, "urlToImage", "image", "image_url", "imageUrl", "thumbnail", "thumb", "enclosure", "cover", "featured_image", "picture", "media")
         vid = _api_first(d, "video", "video_url", "videoUrl", "mp4")
         media = (_mk_media(vid, "video", u) if vid else None) or (_mk_media(img, "photo", u) if img else None)
-        out.append({"url": u, "title": re.sub(r"\s+", " ", title)[:300], "published": pd.isoformat() if pd else None, "html": body if "<" in body else html.escape(body), "media": media})
+        out.append({"url": u, "title": re.sub(r"\s+", " ", title)[:300], "published": pd.isoformat() if pd else None, "html": body if "<" in body else "", "media": media})
         if len(out) >= limit: break
     out.sort(key=lambda x: x["published"] or "", reverse=True); return out
 def _has_api(src):
@@ -1702,19 +1492,11 @@ def weighted_score(s, scores):
     return round(acc / tot * 100, 1) if tot else 0.0
 async def generate(s, art, on_queue=None, owner_id=None):
     """خروجی: (json, model_name, error_code) — error_code کلید امن است (هرگز متن خطای مدل یا base url)."""
-    want_full = len(art["text"]) > 1200; system, user = build_prompt(s, art, want_full); raw, model, err = await ai_chat(system, user, on_queue=on_queue, owner_id=owner_id, validate=_validate_generation)
+    want_full = len(art["text"]) > 1200; system, user = build_prompt(s, art, want_full); raw, model, err = await ai_chat(system, user, on_queue=on_queue, owner_id=owner_id)
     if not raw: return None, None, err
     j = parse_json(raw)
-    if not isinstance(j, dict):
-        # پاکت JSON قابل تجزیه نبود → بازیابی متن واقعی از پاسخ خام (رفتار salvage قبلی حفظ می‌شود)
-        j = {"is_ad": False, "category": s["categories"][0]["name"] if s["categories"] else "", "title": art["title"], "scores": {}, "post": clean_ai_text(salvage_post(raw), s)[:3000], "full": None}
-    elif not str(j.get("post") or "").strip() and not j.get("is_ad"):
-        j = {"is_ad": False, "category": s["categories"][0]["name"] if s["categories"] else "", "title": art["title"], "scores": {}, "post": clean_ai_text(salvage_post(raw), s)[:3000], "full": None}
-    # تبلیغِ صریحِ مدل (حتی بدون post) هرگز با محتوای ساختگی بازنویسی نمی‌شود
-    scores = j.get("scores")
-    if not isinstance(scores, dict) or not scores:
-        scores = None; j.pop("scores", None)
-    j["score"] = weighted_score(s, scores) if scores else 65.0; return j, model, None
+    if not j or not str(j.get("post") or "").strip(): j = {"is_ad": False, "category": s["categories"][0]["name"] if s["categories"] else "", "title": art["title"], "scores": {}, "post": clean_ai_text(salvage_post(raw), s)[:3000], "full": None}
+    j["score"] = weighted_score(s, j.get("scores") or {}) if j.get("scores") else 65.0; return j, model, None
 def signature_of(s, ch):
     sig = (s.get("signature") or "").strip()
     if sig.lower() == "@channel": sig = f"@{ch['username']}" if ch and ch["username"] else ""
@@ -1768,7 +1550,6 @@ async def download_media(media):
     if not media or not media.get("url"): return None
     if not await asyncio.to_thread(public_url, media["url"]): return None
     for hdr in (_media_headers(media), {"User-Agent": UA_FEED, "Accept": "*/*"}):
-        tmp = None; path = None
         try:
             async with FETCH_SEM:
                 async with http().stream("GET", media["url"], headers=hdr, timeout=httpx.Timeout(180, connect=15)) as r:
@@ -1780,27 +1561,21 @@ async def download_media(media):
                     except Exception: pass
                     kind = "animation" if "gif" in ct else "photo" if ct.startswith("image/") else "video" if ct.startswith("video/") else _ext_kind(media["url"], media.get("kind") or "document")
                     ext = {"photo": ".jpg", "animation": ".gif", "video": ".mp4"}.get(kind, os.path.splitext(urlparse(media["url"]).path)[1] or ".bin")
-                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext); size = 0
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext); size = 0; keep = False
                     try:      # فایل موقت در هیچ مسیری (خطا، سقف حجم، فایل ناقص) روی دیسک جا نمی‌ماند
                         async for chunk in r.aiter_bytes(262144):
                             size += len(chunk)
                             if size > MAX_MEDIA_BYTES: log.info(f"media skipped (> {MAX_MEDIA_MB}MB)"); return None
                             tmp.write(chunk)
+                        keep = size >= 1024
                     finally:
                         tmp.close()
-                    if size < 1024: return None
+                        if not keep:
+                            try: os.unlink(tmp.name)
+                            except Exception: pass
                     if kind == "photo" and size > 10 * 1024 * 1024: kind = "document"
-                    path = tmp.name
-        except Exception as e:
-            log.warning(f"media: {e}"); path = None
-        except BaseException:
-            path = None
-            raise
-        finally:
-            if tmp is not None and path is None:   # مالکیت فایل فقط پس از خروج سالم از استریم منتقل می‌شود
-                try: os.unlink(tmp.name)
-                except OSError: pass
-        if path: return path, kind
+                    return tmp.name, kind
+        except Exception as e: log.warning(f"media: {e}")
     return None
 def _is_parse_err(e): s = str(e).lower(); return "parse" in s or "entit" in s or "tag" in s or "unsupported start" in s
 async def _send_media(bot, chat_id, caption, pm, media):
@@ -1810,8 +1585,7 @@ async def _send_media(bot, chat_id, caption, pm, media):
         try: return await bot.send_photo(chat_id, media["url"], caption=caption, parse_mode=pm)
         except BadRequest as e:
             if _is_parse_err(e): raise
-        except (NetworkError, RetryAfter, Forbidden): raise
-        except Exception: raise
+        except Exception: pass
     if not mf: mf = await download_media(media); media["_file"] = mf
     if not mf: return None
     path, k = mf
@@ -1825,27 +1599,22 @@ async def _send_media(bot, chat_id, caption, pm, media):
     except BadRequest as e:
         if _is_parse_err(e): raise
         log.warning(f"send_{k}: {e}"); return None
-    except (NetworkError, Forbidden): raise
-    except Exception:
-        raise
+    except Exception as e:
+        log.warning(f"send_{k}: {e}"); return None
 async def send_post(bot, chat_id, text, media=None):
     """کپشن ≤۱۰۲۴ → رسانه+کپشن · متن بلندتر → رسانه با تیتر و سپس متن · خطای پارس → تنزل تدریجی فرمت (معمولی → ساده)."""
     variants = [(text, "HTML"), (downgrade_html(text), "HTML"), (strip_tags(text), None)]
-    sent_media = SimpleNamespace(message_id=media["_sent_id"]) if media and media.get("_sent_id") else None
     for i, (t, pm) in enumerate(variants):
         try:
             if media:
                 cap_ok = len(t) <= CAPTION_LIMIT; cap = t if cap_ok else (headline_of(t) if pm else strip_tags(headline_of(t)))
-                if isinstance(bot, PublicationTransport): bot.caption_complete = cap_ok
-                m = sent_media or await _send_media(bot, chat_id, cap, pm, media)
+                m = await _send_media(bot, chat_id, cap, pm, media)
                 if m:
-                    if not sent_media:
-                        sent_media = m
-                        if cap_ok: return m
+                    if cap_ok: return m
                     return await bot.send_message(chat_id, t, parse_mode=pm, disable_web_page_preview=True, reply_to_message_id=m.message_id)
             return await bot.send_message(chat_id, t, parse_mode=pm, disable_web_page_preview=True)
         except RetryAfter as e:
-            await asyncio.sleep(min(30, float(e.retry_after) + 1)); return await bot.send_message(chat_id, t, parse_mode=pm, disable_web_page_preview=True, **({"reply_to_message_id": sent_media.message_id} if sent_media else {}))
+            await asyncio.sleep(min(30, float(e.retry_after) + 1)); return await bot.send_message(chat_id, t, parse_mode=pm, disable_web_page_preview=True)
         except BadRequest as e:
             if _is_parse_err(e) and i < len(variants) - 1: continue
             raise
@@ -1857,103 +1626,40 @@ async def bot_can_post(bot, chat_id):
         if me.status == "creator": return True
         return me.status == "administrator" and getattr(me, "can_post_messages", True) is not False
     except Exception: return False
-async def publish_article(bot, aid, count_usage=True, test_user=None):
+async def publish_article(bot, aid, count_usage=True):
+    """خروجی: (ok, link|error_code) — error_code: not_ready | no_channel | bot_not_admin | duplicate | quota | send_failed:<err>"""
     a = get_article(aid)
-    if not a: return False, "not_ready"
-    async with ch_lock(a["channel_id"]):
-        return await _publish_article_locked(bot, aid, count_usage, test_user)
-
-async def _publish_article_locked(bot, aid, count_usage=True, test_user=None):
-    a = get_article(aid)
-    if not a or a["status"] != "ready" or not a["post_html"]: return False, "not_ready"
+    if not a or not a["post_html"]: return False, "not_ready"
     ch = get_channel(a["channel_id"]); admin_id = a["admin_id"]
     if not ch: return False, "no_channel"
-    operation_checkpoint()
-    journal = get_pub_journal(aid)
-    if journal and (journal.get("link") or journal.get("phase") == "ack"):
-        link = journal.get("link") or msg_link(ch, SimpleNamespace(message_id=journal["message_id"]))
-        settle_publication(aid, ch, journal)
-        return True, link
-    if journal:
-        journal = release_publication(aid, journal, "delivery_unknown" if journal.get("phase") == "in_flight" else (a["reason"] or ""))
-        if journal.get("phase") == "in_flight": return False, "delivery_unknown"
-    if ch["admin_id"] != admin_id: return False, "no_channel"
-    if posted_before(ch["chat_id"], a["hash"]): return False, "duplicate"
-    journal = reserve_publication(aid, admin_id, count_usage, test_user, journal)
-    if journal is None: return False, "quota"
-    media = None; published = False
+    if count_usage and not usage_reserve(admin_id, "posts"): return False, "quota"   # سهمیه قبل از ارسال و اتمیک گرفته می‌شود
+    s = get_settings(ch["id"]); lang = s["ui_lang"]; prem = bool(s.get("premium_format"))
+    if not await bot_can_post(bot, ch["chat_id"]): article_update(aid, status="failed", reason="bot_not_admin"); usage_release(admin_id, "posts") if count_usage else None; return False, "bot_not_admin"
+    if posted_before(ch["chat_id"], a["hash"]): article_update(aid, status="failed", reason="duplicate"); usage_release(admin_id, "posts") if count_usage else None; return False, "duplicate"
+    media = json.loads(a["media"]) if a["media"] and s["include_media"] else None
+    tail = make_tail(s, ch, a["url"]); post = re.sub(r'\s*🔗 <a href="[^"]+">Source</a>\s*', "\n", a["post_html"] or ""); post = clean_ai_text(strip_source_url(post, a["url"]), s); body = post[:-len(tail)] if tail and post.endswith(tail) else post; text = post; limit = int(s["post_limit"])
+    if len(post) > limit:
+        # ادامه‌ی «بیشتر» همیشه ساخته می‌شود — پستِ کانال هرگز نصفه‌نیمه رها نمی‌شود؛
+        # ادامه یا «نسخه‌ی مفصل» است (اگر تولید شده) یا فقط بخشِ ادامه‌ی خودِ پست — متنِ کانال هرگز دوباره تکرار نمی‌شود.
+        cut, rest = split_post_html(body, max(200, limit - len(tail) - 100 - len(BOT_USERNAME)), prem)
+        htitle = f"<b>{html.escape(a['title'] or '')}</b>"
+        cfull = clean_ai_text(strip_source_url(a["full_html"], a["url"]), s) if source_bot_ok(a["source_id"]) and a["full_html"] else ""
+        ftxt = cfull if cfull.strip() else ((htitle + "\n\n" + rest) if rest else htitle)
+        if len(ftxt) > BOT_FULL_MAX: ftxt = fit_html(ftxt, BOT_FULL_MAX, prem)[0]
+        ftxt = finish_ok(ftxt)
+        key = await store_deeplink(admin_id, {"short": cut, "full": ftxt, "title": a["title"], "url": a["url"], "show_source": bool(s.get("include_link", True)), "media": {k: v for k, v in media.items() if not k.startswith("_")} if media else None, "ts": now_iso()})
+        more = f'\n\n<a href="https://t.me/{BOT_USERNAME}?start=r_{key}">📖 {"بیشتر" if lang == "fa" else "more..."}</a>'
+        text = cut + more + tail
     try:
-        s = get_settings(ch["id"]); lang = s["ui_lang"]
-        if not await bot_can_post(bot, ch["chat_id"]):
-            article_update(aid, reason="bot_not_admin"); return False, "bot_not_admin"
-        operation_checkpoint()
-        if posted_before(ch["chat_id"], a["hash"]):
-            article_update(aid, reason="duplicate"); return False, "duplicate"
-        media = json.loads(a["media"]) if a["media"] and s["include_media"] else None
-        tail = make_tail(s, ch, a["url"]); post = re.sub(r'\s*🔗 <a href="[^"]+">Source</a>\s*', "\n", a["post_html"] or ""); post = clean_ai_text(strip_source_url(post, a["url"]), s); body = post[:-len(tail)] if tail and post.endswith(tail) else post; text = post; limit = int(s["post_limit"])
-        if len(post) > limit:
-            cut, rest = split_post_html(body, max(200, limit - len(tail) - 100 - len(BOT_USERNAME)))
-            htitle = f"<b>{html.escape(a['title'] or '')}</b>"
-            cfull = clean_ai_text(strip_source_url(a["full_html"], a["url"]), s) if source_bot_ok(a["source_id"]) and a["full_html"] else ""
-            ftxt = cfull if cfull.strip() else ((htitle + "\n\n" + rest) if rest else htitle)
-            if len(ftxt) > BOT_FULL_MAX: ftxt = fit_html(ftxt, BOT_FULL_MAX)[0]
-            ftxt = finish_ok(ftxt)
-            key = await store_deeplink(admin_id, {"short": cut, "full": ftxt, "title": a["title"], "url": a["url"], "show_source": bool(s.get("include_link", True)), "media": {k: v for k, v in media.items() if not k.startswith("_")} if media else None, "ts": now_iso()})
-            more = f'\n\n<a href="https://t.me/{BOT_USERNAME}?start=r_{key}">📖 {"بیشتر" if lang == "fa" else "more..."}</a>'
-            text = cut + more + tail
-        if journal.get("media_id"):
-            text = journal["text"]
-            media = {"_sent_id": journal["media_id"]}
-        elif media and media.get("kind") != "photo": media["_file"] = await download_media(media)
-        journal["text"] = text
-        set_pub_journal(aid, journal)
-        operation_checkpoint()
-        parent = asyncio.current_task()
-        async def commit_send():
-            nonlocal published
-            operation_checkpoint()
-            if parent.cancelling(): raise asyncio.CancelledError
-            try: msg = await send_post(PublicationTransport(bot, aid, journal, parent), ch["chat_id"], text, media)
-            except Exception as e:
-                if journal.get("phase") == "ack":
-                    published = True
-                    raise
-                article_update(aid, reason="delivery_unknown" if journal.get("phase") == "in_flight" else f"send: {str(e)[:120]}")
-                log.exception("publication failed article=%s channel=%s", aid, ch["id"])
-                return False, f"send_failed:{str(e)[:120]}"
-            published = True
-            op = _current_operation.get()
-            if op: op.published_count += 1
-            link = msg_link(ch, msg)
-            journal.update(phase="ack", link=link)
-            set_pub_journal(aid, journal)
-            settle_publication(aid, ch, journal)
-            log_event("INFO", f"منتشر شد در {ch['title']}: {(a['title'] or '')[:60]}", admin_id)
-            return True, link
-        sending = asyncio.create_task(commit_send(), name=f"publication:{aid}")
-        try: return await asyncio.shield(sending)
-        except asyncio.CancelledError:
-            # Keep the channel locked until an in-flight delivery has settled, even on repeated cancellation.
-            while not sending.done():
-                try: await asyncio.shield(sending)
-                except asyncio.CancelledError: continue
-                except Exception: break
-            if not sending.cancelled():
-                try: sending.result()
-                except Exception: log.exception("publication settlement failed article=%s", aid)
-            raise
-    except asyncio.CancelledError:
-        if not published: article_update(aid, reason="delivery_unknown" if journal.get("phase") == "in_flight" else "cancelled")
-        raise
+        try: msg = await send_post(bot, ch["chat_id"], text, media)
+        except Exception as e: article_update(aid, status="failed", reason=f"send: {str(e)[:120]}"); log_event("ERROR", f"ارسال به {ch['title']}: {e}", admin_id); usage_release(admin_id, "posts") if count_usage else None; return False, f"send_failed:{str(e)[:120]}"
     finally:
-        try:
-            if not published and journal.get("phase") != "ack":
-                current = get_article(aid)
-                release_publication(aid, journal, current["reason"] if current else "")
-        finally:
-            if media and media.get("_file"):
-                try: os.unlink(media["_file"][0])
-                except OSError: log.debug("media cleanup failed", exc_info=True)
+        if media and media.get("_file"):
+            try: os.unlink(media["_file"][0])
+            except Exception: pass
+    mark_posted(ch["chat_id"], a["hash"]); link = msg_link(ch, msg)
+    article_update(aid, status="published", links=json.dumps([link]), reason="")
+    log_event("INFO", f"منتشر شد در {ch['title']}: {(a['title'] or '')[:60]}", admin_id); return True, link
 # ============================================================
 # تشخیص مرحله‌ای (Diagnostics) — کوتاه، نمادین، دوزبانه
 DIAG = {
@@ -2041,7 +1747,7 @@ async def _cycle(bot, uid, cid, test_mode, progress):
         try: items, changed, method = await discover_source(src, use_cache=not test_mode); return src, name, items, changed, method, None
         except Exception as e: return src, name, None, False, "", str(e)[:80]
     results = await asyncio.gather(*[one(src) for src in sources])
-    leftovers = q("SELECT id,url,title,published_at FROM articles WHERE channel_id=? AND status='discovered' AND source_id IN (SELECT id FROM sources WHERE active=1 AND channel_id=articles.channel_id) ORDER BY id DESC LIMIT 10", (cid,))
+    leftovers = q("SELECT id,url,title,published_at FROM articles WHERE channel_id=? AND status='discovered' ORDER BY id DESC LIMIT 10", (cid,))
     candidates, all_items, n_old, seen = [], [], 0, set()
     for src, name, items, changed, method, err in results:
         if err == "cooldown": D.add("src_cooldown", name=name); continue
@@ -2075,27 +1781,6 @@ async def _cycle(bot, uid, cid, test_mode, progress):
     D.add("found", n=len(candidates))
     # --- پردازش (استخراج ۳تایی هم‌زمان، تولید ترتیبی تا رسیدن به هدف)
     quiet = in_quiet(s); cnt = {"extract": 0, "undated": 0, "ad": 0, "ai_ad": 0, "low": 0}; best = 0.0; details = []; ai_err = None; i = 0; stop = False
-    # مانده‌ی صف ready از چرخه‌های قبلی اول منتشر می‌شود تا FIFO حفظ شود؛ داخل سقف همان چرخه (posts_per_cycle) و فقط در حالت خودکار خارج از خاموشی
-    drained = 0
-    if not test_mode and s["mode"] == "auto" and not quiet:
-        backlog = [r["id"] for r in articles_by_status(cid, "ready", 50, automatic=True)]
-        rem_now = remaining(uid, "posts")
-        if backlog and (rem_now is None or rem_now > 0):
-            D.add("leftover", n=len(backlog)); D.stage = "publish"
-            for aid_b in backlog:
-                if (rem_now is not None and rem_now <= 0) or res["published"] >= target: break
-                try:
-                    ok, out = await _publish_article_locked(bot, aid_b, count_usage=True)
-                except asyncio.CancelledError:
-                    a_b = get_article(aid_b)
-                    if a_b and a_b["status"] == "ready": article_update(aid_b, reason="cancelled")
-                    raise
-                if ok:
-                    res["published"] += 1; res["links"].append(out); res["pub"].append(((get_article(aid_b)["title"] or "")[:60], article_src_name(aid_b), out))
-                    rem_now = None if rem_now is None else rem_now - 1; drained += 1
-                elif out != "duplicate":
-                    break
-    target -= drained
     while i < len(candidates) and not stop:
         chunk = candidates[i:i + 3]; i += len(chunk); D.stage = "extract"
         await p(40 + int(50 * i / len(candidates)), P["extract"].format(i=i, n=len(candidates), t=(chunk[0]["title"] or chunk[0]["url"])[:40]))
@@ -2107,12 +1792,9 @@ async def _cycle(bot, uid, cid, test_mode, progress):
             if not art["title"]: art["title"] = c["title"] or hostname(c["url"])
             if not art["media"] and c["media"]: art["media"] = c["media"]
             D.stage = "filter"
-            # هر نامزد (کشف‌شده، مانده‌ی صف یا تلاش مجدد) بلافاصله پیش از تولید دوباره با پنجره‌ی زمانی سنجیده می‌شود
-            pub_when = art.get("published") or c.get("published")
-            if not _within_lookback(pub_when, s):
-                article_update(aid, status="skipped", reason="old" if pub_when else "undated", **({"published_at": pub_when} if pub_when else {}))
-                if not pub_when: cnt["undated"] += 1
-                continue
+            if not c["published"] and not _within_lookback(art["published"], s):
+                if art["published"]: article_update(aid, status="skipped", reason="old", published_at=art["published"]); continue
+                article_update(aid, status="skipped", reason="undated"); cnt["undated"] += 1; continue
             bad, why, _ = heuristic_ad_check(art, s["strict_ads"])
             if bad: article_update(aid, status="rejected", reason=f"ad_filter: {why}"); res["rejected"] += 1; cnt["ad"] += 1; details.append((art["title"], "ad: " + why)); continue
             D.stage = "ai"; pct = min(94, 40 + int(50 * i / len(candidates))); await p(pct, P["ai"].format(t=art["title"][:40]))
@@ -2128,16 +1810,10 @@ async def _cycle(bot, uid, cid, test_mode, progress):
             sname = article_src_name(aid)
             if sname: res["src"] = sname; D.add("from_src", name=sname)
             if test_mode or (s["mode"] == "auto" and not quiet):
-                D.stage = "publish"
-                try:
-                    await p(96, P["pub"])
-                    ok, out = await _publish_article_locked(bot, aid, count_usage=not test_mode, test_user=uid if test_mode else None)
-                except asyncio.CancelledError:
-                    a = get_article(aid)
-                    if a and a["status"] == "ready": article_update(aid, reason="cancelled")
-                    raise
+                D.stage = "publish"; await p(96, P["pub"]); ok, out = await publish_article(bot, aid, count_usage=not test_mode)
                 if ok:
                     res["published"] += 1; res["links"].append(out); res["pub"].append(((gen.get("title") or art["title"] or "")[:60], sname, out))
+                    if test_mode: usage_inc(uid, "tests")
                 else:
                     res["errors"] += 1; D.add("pub_fail", err=_pub_err(out, lang))
                     if out == "bot_not_admin": D.hint("hint_admin"); stop = True; break
@@ -2167,20 +1843,14 @@ async def run_admin_cycle(bot, uid, test_mode=False, progress=None):
         except Exception as e: log_event("ERROR", f"چرخه کانال {ch['title']}: {e}", uid)
     return out
 async def flush_ready(bot, uid, cid, max_n=2):
-    lk = ch_lock(cid)
-    if lk.locked(): return 0
-    async with lk:
-        s = get_settings(cid); ch = get_channel(cid)
-        if not ch or ch["admin_id"] != uid or not admin_limits(uid)["active"]: return 0
-        if s["mode"] != "auto" or in_quiet(s) or not s["enabled"]: return 0
-        rem = remaining(uid, "posts"); sent = 0
-        for a in articles_by_status(cid, "ready", max_n, automatic=True):
-            if rem is not None and rem <= 0: break
-            operation_checkpoint()
-            ok, out = await _publish_article_locked(bot, a["id"])
-            if ok: sent += 1; rem = None if rem is None else rem - 1
-            elif out != "duplicate": break
-        return sent
+    s = get_settings(cid)
+    if s["mode"] != "auto" or in_quiet(s) or not s["enabled"]: return 0
+    rem = remaining(uid, "posts"); sent = 0
+    for a in articles_by_status(cid, "ready", max_n):
+        if rem is not None and rem <= 0: break
+        ok, _ = await publish_article(bot, a["id"])
+        if ok: sent += 1; rem = None if rem is None else rem - 1
+    return sent
 # ============================================================
 # زمان‌بند هوشمند: عادلانه (قدیمی‌ترین اجرا اول)، سقف چرخه در هر تیک، توقف وقتی هیچ مدلی در دسترس نیست
 _tick_lock = asyncio.Lock()
@@ -2242,7 +1912,7 @@ async def scheduler_tick(bot):
                 if not lr or (now_utc() - lr) >= timedelta(minutes=int(s["interval_minutes"])): due.append((lr.isoformat() if lr else "", uid, ch, s))
         gset("load_due", len(due))
         if not due: return
-        if not any(any_model_available(uid) for _, uid, _, _ in due): log_event("WARN", f"{len(due)} کانال در انتظار؛ هیچ مدل AI در دسترس نیست"); return
+        if not any_model_available(): log_event("WARN", f"{len(due)} کانال در انتظار؛ هیچ مدل AI در دسترس نیست"); return
         due.sort(key=lambda x: x[0]); batch = due[:MAX_CYCLES_PER_TICK]
         gset("last_cycle_start", now_iso()); await asyncio.gather(*[_scheduled(bot, uid, ch, s) for _, uid, ch, s in batch]); gset("last_cycle_end", now_iso())
 # ============================================================
@@ -2442,10 +2112,7 @@ def U(t, url): return InlineKeyboardButton(t, url=url)
 def esc(x): return html.escape(str(x if x is not None else ""))
 def onoff(v): return "✅" if v else "❌"
 def bar(p): f = int(p // 10); return "█" * f + "░" * (10 - f)
-def to_int(s):
-    text = str(s).strip().translate(_FA_DIGITS)
-    if not re.fullmatch(r"[+-]?[0-9]+", text): raise ValueError("Expected an integer")
-    return int(text)
+def to_int(s): return int(float(str(s).strip().translate(_FA_DIGITS)))
 def pairs(btns, n=2): return [btns[i:i + n] for i in range(0, len(btns), n)]
 def uname(u): return ("@" + u["username"]) if u and u["username"] else (u["name"] if u and u["name"] else str(u["id"] if u else "?"))
 def can_admin(uid): return role_of(uid) in ("admin", "super")
@@ -2454,248 +2121,15 @@ def cap(v): return "∞" if v is None else v
 def kbm(kb):
     """[[(label, data)]] → InlineKeyboardMarkup (برای notify از هسته)"""
     return InlineKeyboardMarkup([[B(t, d) if not str(d).startswith("http") else U(t, d) for t, d in row] for row in kb]) if kb else None
-_current_operation = ContextVar("current_operation", default=None)
-_operations, _user_controls = {}, {}
-_temp_messages, _temp_tasks = set(), set()
-
-@dataclass
-class Operation:
-    user: int
-    channel: int | None
-    operation_type: str
-    chat_id: int
-    started_at: str = field(default_factory=now_iso)
-    task: asyncio.Task | None = None
-    cancelled: bool = False
-    started: bool = False
-    replaced_status: bool = False
-    published_count: int = 0
-    failed: bool = False
-    status_message_id: int | None = None
-    status_text: str = ""
-    final_status: bool = False
-    ai_popup: bool = False
-    status_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-
-
-def operation_checkpoint():
-    op = _current_operation.get()
-    if op and op.cancelled: raise asyncio.CancelledError
-
-
-def clear_interaction(context, keep=()):
-    for key in ("await", "notice", "disc", "bc_src", "qs", "qs_channel"):
-        if key not in keep: context.user_data.pop(key, None)
-
-
-def user_control(uid):
-    if uid not in _user_controls: _user_controls[uid] = asyncio.Lock()
-    return _user_controls[uid]
-
-
-def operation_text(lang, key):
-    texts = {
-        "running": ("⚙️ در حال پردازش…", "⚙️ Processing…"),
-        "completed": ("✅ عملیات انجام شد", "✅ Operation completed"),
-        "cancelled": ("⛔ عملیات لغو شد", "⛔ Operation cancelled"),
-        "cancelled_after_publish": ("ادامهٔ عملیات لغو شد؛ {n} مطلب پیش از توقف منتشر شده و حذف نشده است.", "Further work cancelled; {n} post(s) were published before stopping and have not been removed."),
-        "failed": ("⚠️ عملیات انجام نشد؛ دوباره تلاش کنید.", "⚠️ Operation failed; please try again."),
-        "busy": ("عملیات قبلی در حال اجراست؛ برای توقف /cancel را بفرستید.", "An operation is running; use /cancel to stop it."),
-        "fallback": ("⚠️ مدل پاسخ قابل‌استفاده نداد؛ در حال بررسی مدل بعدی…", "⚠️ Model unavailable; trying the next model…"),
-    }
-    return texts[key][1 if lang == "en" else 0]
-
-
-async def delete_temp(bot, chat_id, mid, seconds=8):
-    key = (chat_id, mid)
-    try:
-        if seconds: await asyncio.sleep(seconds)
-        if key in _temp_messages: await bot.delete_message(chat_id, mid)
-    except Exception:
-        log.debug("temporary message deletion failed", exc_info=True)
-    finally: _temp_messages.discard(key)
-
-
-def expire_temp(bot, chat_id, mid, seconds=8):
-    task = asyncio.create_task(delete_temp(bot, chat_id, mid, seconds))
-    _temp_tasks.add(task); task.add_done_callback(_temp_tasks.discard)
-
-
-async def create_temp(bot, chat_id, text, temporary=True):
-    task = asyncio.create_task(bot.send_message(chat_id, text[:4000], parse_mode=HTML, disable_web_page_preview=True))
-    try: msg = await asyncio.shield(task)
-    except asyncio.CancelledError:
-        try:
-            msg = await task
-            if temporary:
-                _temp_messages.add((chat_id, msg.message_id))
-                expire_temp(bot, chat_id, msg.message_id, 0)
-            else:
-                op = _current_operation.get()
-                if op: op.status_message_id = msg.message_id
-        except Exception: log.debug("cancelled status delivery failed", exc_info=True)
-        raise
-    if temporary: _temp_messages.add((chat_id, msg.message_id))
-    return msg.message_id
-
-
-async def operation_status(context, text, failed=False, terminal=False):
-    op = _current_operation.get()
-    if not op: return False
-    if not terminal: operation_checkpoint()
-    op.failed = op.failed or failed
-    async with op.status_lock:
-        text = text[:4000]
-        if text == op.status_text: return True
-        try:
-            if op.status_message_id is None:
-                op.status_message_id = context.user_data.get("status_message_id")
-            if op.status_message_id is None:
-                op.status_message_id = await create_temp(context.bot, op.chat_id, text, temporary=False)
-                context.user_data["status_message_id"] = op.status_message_id
-            else:
-                await context.bot.edit_message_text(text, chat_id=op.chat_id, message_id=op.status_message_id, parse_mode=HTML, disable_web_page_preview=True)
-            op.status_text = text
-        except BadRequest as e:
-            if "not modified" in str(e).lower(): op.status_text = text
-            else: log.debug("operation status rejected", exc_info=True)
-        except Exception: log.debug("operation status unavailable", exc_info=True)
-    return True
-
-
-async def run_user_operation(update, context, kind, channel, work, show_status=False, replace=False, keep=()):
-    uid = update.effective_user.id; lang = L(update)
-    async with user_control(uid):
-        replaced_status = False
-        if replace:
-            replaced_status = await cancel_user_operation(uid)
-            clear_interaction(context, keep=keep)
-        if uid in _operations:
-            await popup(update, context, operation_text(lang, "busy"), alert=True)
-            return
-        op = Operation(uid, channel, kind, update.effective_chat.id, replaced_status=replaced_status)
-        async def run():
-            token = _current_operation.set(op)
-            outcome = "completed"
-            try:
-                op.started = True
-                log_event("INFO", f"operation start type={kind} channel={channel}", uid)
-                operation_checkpoint()
-                if show_status: await operation_status(context, operation_text(lang, "running"))
-                result = await work()
-                operation_checkpoint()
-                if op.failed: outcome = "failed"
-                return result
-            except asyncio.CancelledError:
-                op.cancelled = True; outcome = "cancelled"
-                raise
-            except Exception:
-                op.failed = True; outcome = "failed"
-                op.final_status = False
-                log.exception("operation failed user=%s type=%s channel=%s", uid, kind, channel)
-                clear_interaction(context)
-            finally:
-                try:
-                    if outcome == "cancelled":
-                        clear_interaction(context)
-                        key = "cancelled_after_publish" if op.published_count else "cancelled"
-                        await operation_status(context, operation_text(lang, key).format(n=op.published_count), terminal=True)
-                    elif outcome == "failed" and not op.final_status:
-                        await operation_status(context, operation_text(lang, outcome), failed=True, terminal=True)
-                    elif op.status_message_id is not None and not op.final_status:
-                        await operation_status(context, operation_text(lang, "completed"), terminal=True)
-                    log_event("ERROR" if outcome == "failed" else "INFO", f"operation {outcome} type={kind} channel={channel}", uid)
-                finally:
-                    if op.status_message_id is not None: context.user_data["status_message_id"] = op.status_message_id
-                    if _operations.get(uid) is op: _operations.pop(uid, None)
-                    _current_operation.reset(token)
-        op.task = asyncio.create_task(run(), name=f"user:{uid}:{kind}")
-        _operations[uid] = op
-    try: return await asyncio.shield(op.task)
-    except asyncio.CancelledError:
-        if not op.cancelled:
-            op.cancelled = True
-            if op.started: op.task.cancel()
-        if op.started:
-            try: await asyncio.shield(op.task)
-            except asyncio.CancelledError: pass
-    finally:
-        if op.task.done() and _operations.get(uid) is op: _operations.pop(uid, None)
-
-
-async def cancel_user_operation(uid):
-    op = _operations.get(uid)
-    if not op: return False
-    if not op.cancelled and not op.task.done():
-        op.cancelled = True
-        if op.started: op.task.cancel()
-    try: await asyncio.shield(op.task)
-    except asyncio.CancelledError:
-        if not op.task.done(): raise
-    if _operations.get(uid) is op: _operations.pop(uid, None)
-    return op.status_message_id is not None
-
-
-def _ai_status_reporter(context, lang):
-    async def report(event, label, code):
-        name = esc(label); en = lang == "en"
-        texts = {
-            "busy": f"Model busy; waiting: {name}" if en else f"مدل مشغول است؛ در انتظار: {name}",
-            "start": f"Testing/using model: {name}" if en else f"در حال فراخوانی مدل: {name}",
-            "failure": (f"{name}: {ai_err_text(code, lang)}; checking the next model…" if en else f"{name}: {ai_err_text(code, lang)}؛ بررسی مدل بعدی…"),
-            "unavailable": f"Model unavailable: {name}; checking the next model…" if en else f"مدل قابل استفاده نیست: {name}؛ بررسی مدل بعدی…",
-            "no_test": "Selected Test Model is unset or unavailable; checking public models." if en else "Test Model منتخب تعیین نشده یا قابل استفاده نیست؛ بررسی مدل‌های عمومی.",
-            "success": f"AI response received — model: {name}" if en else f"پاسخ معتبر دریافت شد — مدل: {name}",
-            "failed": ai_err_text(code, lang),
-        }
-        await operation_status(context, texts[event])
-    return report
-
-
-async def run_model_test(update, context, mid, personal=False):
-    uid = update.effective_user.id; lang = L(update); m = get_model(mid)
-    op = _current_operation.get()
-    if op: op.ai_popup = True
-    if not m or (personal and m["owner_id"] != uid):
-        return await popup(update, context, tr(lang, "notfound"), alert=True)
-    started = time.monotonic(); label = _model_label(m, uid if personal else None)
-    token = _ai_events.set(_ai_status_reporter(context, lang))
-    try:
-        if personal:
-            out, label, error = await ai_chat("You are a health-check. Reply with exactly one word.", "Say: READY",
-                                             owner_id=uid, selected_id=mid, validate=_validate_ready)
-            ok = out is not None
-        else:
-            ok, out, elapsed = await test_model(mid)
-            error = None if ok else out
-        elapsed = round(time.monotonic() - started, 1)
-        if ok:
-            result = f"Test successful — model: {esc(label)} ({elapsed}s)" if lang == "en" else f"تست موفق — مدل: {esc(label)} ({elapsed}s)"
-        else:
-            result = ("Test failed — " if lang == "en" else "تست ناموفق — ") + ai_err_text(error, lang)
-        await operation_status(context, result, failed=not ok, terminal=True)
-        if op: op.final_status = True
-        await popup(update, context, result, alert=True)
-        return ok
-    finally:
-        _ai_events.reset(token)
-
-
 async def popup(update, context, text, alert=False):
-    op = _current_operation.get()
-    if op and op.status_message_id is not None and not op.ai_popup:
-        op.final_status = True
-        await operation_status(context, text)
-        return
     qy = update.callback_query
     if qy:
-        try: await qy.answer(strip_tags(text)[:200], show_alert=alert); context._callback_answered = True; return
+        try: await qy.answer(text[:200], show_alert=alert); context.user_data["_answered"] = True; return
         except Exception: pass
-    await send_temp(context, update.effective_chat.id, text)
+    context.user_data["notice"] = text
 async def render(update, context, text, kb=None, force_new=False):
-    operation_checkpoint()
     notice = context.user_data.pop("notice", None)
-    if notice: await popup(update, context, notice)
+    if notice: text = f"{notice}\n\n{text}"
     text = text[:4000]; markup = InlineKeyboardMarkup(kb) if kb else None; qy = update.callback_query; chat_id = update.effective_chat.id
     if qy and qy.message and not force_new:
         try: await qy.edit_message_text(text, reply_markup=markup, parse_mode=HTML, disable_web_page_preview=True); context.user_data["panel"] = qy.message.message_id; return
@@ -2712,12 +2146,7 @@ async def ask(update, context, prompt, kind, back, **extra):
     await render(update, context, f"✏️ {prompt}\n\n<i>{tr(lang, 'send_value')}</i>", [[B(tr(lang, "cancel"), "c:cancel")]])
 async def wiz_start(update, context, wiz, back, **data): context.user_data["await"] = {"kind": "wiz", "wiz": wiz, "step": 0, "data": data, "back": back}; await wiz_prompt(update, context)
 async def wiz_prompt(update, context):
-    lang = L(update); st = context.user_data.get("await")
-    if not isinstance(st, dict) or st.get("kind") != "wiz": return
-    steps = WIZ.get(st.get("wiz"), ()); i = st.get("step")
-    if type(i) is not int or not 0 <= i < len(steps):
-        if context.user_data.get("await") is st: context.user_data.pop("await", None)
-        return
+    lang = L(update); st = context.user_data["await"]; steps = WIZ[st["wiz"]]; i = st["step"]
     await render(update, context, f"{tr(lang, 'step', i=i + 1, n=len(steps))} ✏️ {steps[i][1][1 if lang == 'en' else 0]}\n\n<i>{tr(lang, 'send_value')}</i>", [[B(tr(lang, "cancel"), "c:cancel")]])
 async def notify_supers(text, kb=None):
     for sid in SUPER_ADMIN_IDS:
@@ -2846,7 +2275,7 @@ async def view_cats(update, context, cid):
     text = tr(lang, "cats_title") + "\n" + "".join(f"\n{c['emoji']} <b>{esc(c['name'])}</b>: {esc(c['style'][:70])}" for c in s["categories"])
     kb = pairs([B(f"{c['emoji']} {c['name'][:18]}", f"a:catv:{cid}:{i}") for i, c in enumerate(s["categories"])]) + [[B(tr(lang, "cat_add"), f"a:cata:{cid}")], [B(tr(lang, "back"), f"a:con:{cid}")]]; await render(update, context, text, kb)
 async def view_cat(update, context, cid, i):
-    lang = L(update); s = get_settings(cid); c = s["categories"][i] if 0 <= i < len(s["categories"]) else None
+    lang = L(update); s = get_settings(cid); c = s["categories"][i] if i < len(s["categories"]) else None
     if not c: return await view_cats(update, context, cid)
     await render(update, context, tr(lang, "cat_view", e=c["emoji"], name=esc(c["name"]), style=esc(c["style"])), [[B(tr(lang, "cat_edit"), f"a:cats:{cid}:{i}"), B(tr(lang, "delete"), f"a:catd:{cid}:{i}")], [B(tr(lang, "back"), f"a:cat:{cid}")]])
 async def view_crits(update, context, cid):
@@ -2854,7 +2283,7 @@ async def view_crits(update, context, cid):
     text = tr(lang, "crits_title", m=s["min_score"]) + "\n" + "".join(tr(lang, "crit_line", name=esc(c["name"]), w=c["weight"], p=f"{float(c['weight']) / tot * 100:.0f}") for c in s["criteria"])
     kb = pairs([B(tr(lang, "crit_btn", name=c["name"][:16], w=c["weight"]), f"a:criv:{cid}:{i}") for i, c in enumerate(s["criteria"])]) + [[B(tr(lang, "crit_add"), f"a:cria:{cid}")], [B(tr(lang, "back"), f"a:con:{cid}")]]; await render(update, context, text, kb)
 async def view_crit(update, context, cid, i):
-    lang = L(update); s = get_settings(cid); c = s["criteria"][i] if 0 <= i < len(s["criteria"]) else None
+    lang = L(update); s = get_settings(cid); c = s["criteria"][i] if i < len(s["criteria"]) else None
     if not c: return await view_crits(update, context, cid)
     await render(update, context, tr(lang, "crit_view", name=esc(c["name"]), w=c["weight"]), [[B(tr(lang, "crit_w"), f"a:criw:{cid}:{i}"), B(tr(lang, "delete"), f"a:crid:{cid}:{i}")], [B(tr(lang, "back"), f"a:cri:{cid}")]])
 # ============================================================
@@ -2940,40 +2369,26 @@ async def run_test(update, context, cid):
     if rem is not None and rem <= 0: await popup(update, context, tr(lang, "limit_tests", n=admin_limits(uid)["daily_tests"]), alert=True); return await view_channel(update, context, cid)
     if ch_lock(cid).locked(): await popup(update, context, tr(lang, "test_busy"), alert=True); return await view_channel(update, context, cid)
     if not is_super(uid) and not rate_free(f"test:{cid}", TEST_COOLDOWN_SEC): await popup(update, context, tr(lang, "test_wait", n=rate_left(f"test:{cid}", TEST_COOLDOWN_SEC)), alert=True); return await view_channel(update, context, cid)
-    try: await qy.answer(); context._callback_answered = True
+    try: await qy.answer(); context.user_data["_answered"] = True
     except Exception: pass
     last = [0.0]; head = tr(lang, "test_head", title=esc(ch["title"]))
     async def progress(pct, txt):
         if time.time() - last[0] < 1.6 and pct < 100: return
         last[0] = time.time()
-        await operation_status(context, f"{head}\n\n{bar(pct)} <b>{pct}%</b>\n{esc(txt)}")
+        try: await qy.edit_message_text(f"{head}\n\n{bar(pct)} <b>{pct}%</b>\n⏳ {esc(txt)}", parse_mode=HTML)
+        except Exception: pass
     await progress(1, tr(lang, "preparing"))
-    model_labels = []; report_ai = _ai_status_reporter(context, lang)
-    async def ai_progress(event, label, code):
-        if event == "success" and label not in model_labels: model_labels.append(label)
-        await report_ai(event, label, code)
-    ai_token = _ai_events.set(ai_progress)
     try: res = await run_channel_cycle(context.bot, uid, cid, test_mode=True, progress=progress)
     except Exception as e:
         log_event("ERROR", f"تست کانال {ch['title']}: {e}", uid); d = Diag(); d.add("ai_fail", err=ai_err_text(err_code(e), lang)); res = {"published": 0, "queued": 0, "links": [], "diag": d, "src": ""}
-    except asyncio.CancelledError:
-        raise
-    finally:
-        _ai_events.reset(ai_token)
     ok = bool(res["published"] or res.get("queued"))
-    if ok and not res.get("published"): rate_mark(f"test:{cid}")  # تستِ موفقِ صف‌شده
-    elif not ok: rate_clear(f"test:{cid}")
+    if ok: rate_mark(f"test:{cid}")            # محدودیت زمانی فقط پس از تستِ موفق اعمال می‌شود
+    else: rate_clear(f"test:{cid}")            # تستِ ناموفق ⇒ بدون محدودیت، بلافاصله دوباره قابل اجراست
     diag = esc(res["diag"].render(lang)); kb = []
     src = (res.get("src") or "").strip(); src_line = ("\n" + tr(lang, "test_src", name=esc(src[:60]))) if src else ""
     if res["published"]: text = f"{tr(lang, 'test_ok')}{src_line}\n\n{tr(lang, 'test_log', d=diag)}"; kb.append([U(f"{tr(lang, 'art_view')} {i + 1}", l) for i, l in enumerate(res["links"][:3])])
     elif res.get("queued"): text = f"{tr(lang, 'test_queued')}{src_line}\n\n{tr(lang, 'test_log', d=diag)}"; kb.append([B(tr(lang, "queue", n=ready_count(cid)), f"a:que:{cid}")])
     else: text = f"{tr(lang, 'test_fail')}{src_line}\n\n{tr(lang, 'test_log', d=diag)}\n\n{tr(lang, 'test_retry_note')}"; kb.append([B(tr(lang, "rejected"), f"a:rej:{cid}"), B(tr(lang, "sched"), f"a:sch:{cid}")])
-    op = _current_operation.get()
-    model_line = ("Model: " if lang == "en" else "مدل: ") + esc(", ".join(model_labels)) if model_labels else ""
-    if model_line: text += "\n" + model_line
-    final = ("Test successful" if ok else "Test failed") if lang == "en" else ("تست موفق" if ok else "تست ناموفق")
-    await operation_status(context, final + (" — " + model_line if model_line else ""), failed=not ok, terminal=True)
-    if op: op.failed = not ok; op.final_status = True
     kb.append([B(tr(lang, "back_panel"), f"a:ch:{cid}")]); await render(update, context, text, kb)
 # ---------- پایان پنل مدیر میانی ----------
 # ============================================================
@@ -3075,11 +2490,6 @@ async def view_s_model(update, context, mid):
     key = m["api_key"] or ""; masked = (key[:5] + "…" + key[-4:]) if len(key) > 12 else "—"
     text = tr(lang, "s_model_view", name=esc(m["name"]), kind=m["kind"], model=esc(m["model"]), base=esc(m["base_url"]), key=esc(masked), pr=m["priority"], temp=m["temperature"], mx=m["max_tokens"], st=tr(lang, "s_m_off" if not m["active"] else "s_m_ok" if m["status"] == "ok" else "s_m_down"), ok=m["ok_count"], fc=m["fail_count"], lo=ago_text(m["last_ok"], lang), lf=ago_text(m["last_fail"], lang), err=f"\n<code>{esc((m['last_error'] or '')[:150])}</code>" if m["last_error"] else "")
     kb = [[B(tr(lang, "s_model_test"), f"s:model_test:{mid}"), B(tr(lang, "toggle"), f"s:model_t:{mid}")]] + pairs([B(f"✏️ {f[2] if lang == 'en' else f[1]}", f"s:model_e:{mid}:{f[0]}") for f in MODEL_FIELDS]) + [[B(tr(lang, "s_model_del"), f"s:model_d:{mid}")], [B(tr(lang, "back"), "s:models")]]
-    if m["owner_id"] is None:
-        selected = gget("test_model_id") == mid
-        label = ("Unset Test Model" if selected else "Use as Test Model") if lang == "en" else ("برداشتن انتخاب Test Model" if selected else "استفاده به‌عنوان Test Model")
-        text += "\nTest Model: " + (("Selected" if selected else "Not selected") if lang == "en" else ("منتخب" if selected else "انتخاب نشده"))
-        kb.insert(1, [B(label, f"s:model_test_pick:{mid}")])
     await render(update, context, text, kb)
 async def view_s_pays(update, context):
     lang = L(update); ps = pay_pending()
@@ -3094,14 +2504,7 @@ async def decide_pay(update, context, rid, approve, from_list):
     if not r or r["status"] != "pending": await popup(update, context, tr(lang, "s_pay_seen")); return await view_s_pays(update, context) if from_list else None
     ul = user_lang(r["user_id"]) or "fa"; p = get_plan(r["plan_id"])
     if approve:
-        if not p:
-            await popup(update, context, tr(lang, "notfound"), alert=True)
-            return await view_s_pays(update, context) if from_list else None
-        exp, queued = assign_plan(r["user_id"], r["plan_id"])
-        if exp is None:
-            await popup(update, context, tr(lang, "notfound"), alert=True)
-            return await view_s_pays(update, context) if from_list else None
-        pay_set(rid, "approved")
+        exp, queued = assign_plan(r["user_id"], r["plan_id"]); pay_set(rid, "approved")
         if r["discount"]: disc_use(r["discount"])
         await notify_user_fn(r["user_id"], tr(ul, "pay_approved", name=esc(plan_txt(p, "name", ul)), when=tr(ul, "pay_when_queued" if queued else "pay_when_now", d=fmt_date(exp, admin_offset(r["user_id"]))))); await popup(update, context, tr(lang, "s_pay_done_ok"))
     else: pay_set(rid, "rejected"); await notify_user_fn(r["user_id"], tr(ul, "pay_rejected")); await popup(update, context, tr(lang, "s_pay_done_no"))
@@ -3145,8 +2548,8 @@ async def dispatch(update, context, data):
             if b == "myai_o": update_model(mid, active=0 if m["active"] else 1, status="ok", fail_count=0); await popup(update, context, tr(lang, "s_model_off" if m["active"] else "s_model_on")); return await view_my_ai_model(update, context, mid)
             if b == "myai_d": delete_model(mid); await popup(update, context, tr(lang, "deleted")); return await view_my_ai(update, context)
             if b == "myai_e": return await ask(update, context, tr(lang, "s_field_prompt", f=fl(MODEL_FIELDS, d, lang)), "model_field", f"a:myai_v:{mid}", mid=mid, field=d, own=1)
-            await run_model_test(update, context, mid, personal=True)
-            return await view_my_ai_model(update, context, mid)
+            await render(update, context, tr(lang, "s_model_testing")); ok, out, t = await test_model(mid)
+            await popup(update, context, tr(lang, "s_model_res", i="✅" if ok else "❌", t=t, out=out[:120]), alert=True); return await view_my_ai_model(update, context, mid)
         if b == "logs":
             if c.lstrip("-").isdigit() and channel_owned(int(c), uid): return await view_logs(update, context, admin_id=uid, back=f"a:ch:{c}", refresh=f"a:logs:{c}")
             return await view_logs(update, context, admin_id=uid)
@@ -3173,10 +2576,6 @@ async def dispatch(update, context, data):
             aid = int(c); art = get_article(aid)
             if not art or (art["admin_id"] != uid and not is_super(uid)): await popup(update, context, tr(lang, "notfound")); return await view_admin_home(update, context)
             cid = art["channel_id"]
-            if b in ("arte", "artd", "artr") and publication_pending(cid):
-                return await popup(update, context, tr(lang, "test_busy"), alert=True)
-            if b == "artr" and art["status"] not in ("rejected", "failed", "skipped"):
-                return await popup(update, context, tr(lang, "notfound"), alert=True)
             if b == "art": return await view_article(update, context, aid)
             if b == "arte": return await ask(update, context, tr(lang, "art_edit_prompt"), "art_edit", f"a:art:{aid}", aid=aid)
             if b == "artd": delete_article(aid, art["admin_id"]); await popup(update, context, tr(lang, "deleted")); return await view_queue(update, context, cid, "ready" if art["status"] in ("ready", "published") else "rejected")
@@ -3184,7 +2583,7 @@ async def dispatch(update, context, data):
             if b == "artf":
                 if art["full_html"]:
                     fv = art["full_html"]
-                    if len(fv) > BOT_FULL_MAX: fv, _ = fit_html(fv, BOT_FULL_MAX)
+                    if len(fv) > BOT_FULL_MAX: fv, _ = fit_html(fv, BOT_FULL_MAX, True)
                     for chunk in split_html(tr(lang, "full_head") + fv): await context.bot.send_message(uid, chunk, parse_mode=HTML, disable_web_page_preview=True)
                 return await view_article(update, context, aid)
             if b == "pub":
@@ -3192,7 +2591,7 @@ async def dispatch(update, context, data):
                 if rem is not None and rem <= 0: await popup(update, context, tr(lang, "limit_posts", n=lim["daily_posts"]), alert=True); return await view_queue(update, context, cid)
                 if ch_lock(cid).locked(): await popup(update, context, tr(lang, "test_busy"), alert=True); return await view_queue(update, context, cid)
                 await render(update, context, tr(lang, "publishing"))
-                ok, out = await publish_article(context.bot, aid)
+                async with ch_lock(cid): ok, out = await publish_article(context.bot, aid)
                 await popup(update, context, tr(lang, "published_ok") if ok else tr(lang, "pub_failed", e=_pub_err(out, lang)), alert=not ok); return await view_queue(update, context, cid)
         cid = int(c) if c.lstrip("-").isdigit() else 0; ch = channel_owned(cid, uid)
         if not ch: await popup(update, context, tr(lang, "notfound")); return await view_admin_home(update, context)
@@ -3202,8 +2601,6 @@ async def dispatch(update, context, data):
         if b == "test": return await run_test(update, context, cid)
         if b == "lock": return await view_lock(update, context, cid)
         if b == "lockre": return await render(update, context, tr(lang, "lock_reset_q"), [[B(tr(lang, "yes"), f"a:lockre2:{cid}"), B(tr(lang, "no"), f"a:lock:{cid}")]])
-        if b in ("lockre2", "chdel2") and publication_pending(cid):
-            return await popup(update, context, tr(lang, "test_busy"), alert=True)
         if b == "lockre2":
             code, n = reset_channel_link(cid); log_event("WARN", f"ریست امنیتی کانال {ch['title']}", uid)
             await popup(update, context, tr(lang, "lock_reset_ok", n=n), alert=True); return await view_lock(update, context, cid)
@@ -3233,7 +2630,7 @@ async def dispatch(update, context, data):
         if b == "cats": return await ask(update, context, tr(lang, "cat_style_prompt"), "cat_style", f"a:cat:{cid}", cid=cid, idx=int(d))
         if b == "catd":
             cats = s["categories"]; i = int(d)
-            if 0 <= i < len(cats) and len(cats) > 1: cats.pop(i); update_settings(cid, categories=cats); await popup(update, context, tr(lang, "deleted"))
+            if i < len(cats) and len(cats) > 1: cats.pop(i); update_settings(cid, categories=cats); await popup(update, context, tr(lang, "deleted"))
             else: await popup(update, context, tr(lang, "cat_min"), alert=True)
             return await view_cats(update, context, cid)
         if b == "cri": return await view_crits(update, context, cid)
@@ -3242,7 +2639,7 @@ async def dispatch(update, context, data):
         if b == "criw": return await ask(update, context, tr(lang, "crit_w_prompt"), "crit_weight", f"a:cri:{cid}", cid=cid, idx=int(d))
         if b == "crid":
             cr = s["criteria"]; i = int(d)
-            if 0 <= i < len(cr) and len(cr) > 1: cr.pop(i); update_settings(cid, criteria=cr); await popup(update, context, tr(lang, "deleted"))
+            if i < len(cr) and len(cr) > 1: cr.pop(i); update_settings(cid, criteria=cr); await popup(update, context, tr(lang, "deleted"))
             else: await popup(update, context, tr(lang, "crit_min"), alert=True)
             return await view_crits(update, context, cid)
         if b == "src": return await view_sources(update, context, cid)
@@ -3277,10 +2674,7 @@ async def dispatch(update, context, data):
         if b == "plan": return await view_s_plan(update, context, int(c))
         if b == "plan_new": return await wiz_start(update, context, "plan_new", "s:plans")
         if b == "plan_e": return await ask(update, context, tr(lang, "s_field_prompt", f=fl(PLAN_FIELDS, d, lang)), "plan_field", f"s:plan:{c}", pid=int(c), field=d)
-        if b == "plan_t":
-            pl = get_plan(int(c))
-            if not pl: await popup(update, context, tr(lang, "notfound"), alert=True); return await view_s_plans(update, context)
-            update_plan(int(c), active=0 if pl["active"] else 1); await popup(update, context, tr(lang, "saved")); return await view_s_plan(update, context, int(c))
+        if b == "plan_t": pl = get_plan(int(c)); update_plan(int(c), active=0 if pl["active"] else 1); await popup(update, context, tr(lang, "saved")); return await view_s_plan(update, context, int(c))
         if b == "plan_free": q("UPDATE plans SET is_free=0", commit=True); update_plan(int(c), is_free=1); await popup(update, context, tr(lang, "s_plan_free_done")); return await view_s_plan(update, context, int(c))
         if b == "plan_d": delete_plan(int(c)); await popup(update, context, tr(lang, "s_plan_deleted")); return await view_s_plans(update, context)
         if b == "discs": return await view_s_discs(update, context)
@@ -3312,25 +2706,13 @@ async def dispatch(update, context, data):
         if b == "models": return await view_s_models(update, context)
         if b == "model": return await view_s_model(update, context, int(c))
         if b == "model_add": return await wiz_start(update, context, "model_add", "s:models")
-        if b == "model_t":
-            m = get_model(int(c))
-            if not m: await popup(update, context, tr(lang, "notfound"), alert=True); return await view_s_models(update, context)
-            update_model(int(c), active=0 if m["active"] else 1, status="ok", fail_count=0); await popup(update, context, tr(lang, "s_model_off" if m["active"] else "s_model_on")); return await view_s_model(update, context, int(c))
+        if b == "model_t": m = get_model(int(c)); update_model(int(c), active=0 if m["active"] else 1, status="ok", fail_count=0); await popup(update, context, tr(lang, "s_model_off" if m["active"] else "s_model_on")); return await view_s_model(update, context, int(c))
         if b == "model_d": delete_model(int(c)); await popup(update, context, tr(lang, "deleted")); return await view_s_models(update, context)
         if b == "model_e": return await ask(update, context, tr(lang, "s_field_prompt", f=fl(MODEL_FIELDS, d, lang)), "model_field", f"s:model:{c}", mid=int(c), field=d)
         if b == "model_test":
-            await run_model_test(update, context, int(c))
-            return await view_s_model(update, context, int(c))
-        if b == "model_test_pick":
-            m = get_model(int(c))
-            if not m or m["owner_id"] is not None:
-                return await popup(update, context, tr(lang, "notfound"), alert=True)
-            selected = gget("test_model_id") == m["id"]
-            gset("test_model_id", None if selected else m["id"])
-            await popup(update, context, ("Test Model cleared" if selected else "Test Model selected") if lang == "en" else ("انتخاب Test Model برداشته شد" if selected else "Test Model انتخاب شد"))
-            return await view_s_model(update, context, m["id"])
+            await render(update, context, tr(lang, "s_model_testing")); ok, out, t = await test_model(int(c)); await popup(update, context, tr(lang, "s_model_res", i="✅" if ok else "❌", t=t, out=out[:120]), alert=True); return await view_s_model(update, context, int(c))
         if b == "models_test":
-            await operation_status(context, tr(lang, "s_model_testing")); res = []
+            await render(update, context, tr(lang, "s_model_testing")); res = []
             for m in list_models(): ok, out, t = await test_model(m["id"]); res.append(f"{'✅' if ok else '❌'} {esc(m['name'])} ({t}s)" + ("" if ok else f": {esc(out[:60])}"))
             ud["notice"] = "\n".join(res) or "—"; return await view_s_models(update, context)
         if b == "pays": return await view_s_pays(update, context)
@@ -3344,347 +2726,174 @@ async def dispatch(update, context, data):
         return await view_super_home(update, context)
     return await go_home(update, context)
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    qy = update.callback_query; u = update.effective_user; context._callback_answered = False
-    if qy.data != "c:cancel" and not rate_ok(f"cb:{u.id}", CB_RATE):
+    qy = update.callback_query; u = update.effective_user; context.user_data["_answered"] = False
+    if not rate_ok(f"cb:{u.id}", CB_RATE):
         try: await qy.answer(tr(user_lang(u.id) or "fa", "busy_click"))
         except Exception: pass
         return
     ensure_user(u.id, u.username, u.full_name, premium=getattr(u, "is_premium", None))
     if get_user(u.id)["banned"] and not is_super(u.id): return await qy.answer(tr(L(update), "banned"), show_alert=True)
-    data = qy.data or "noop"
-    parts = data.split(":"); action = parts[1] if len(parts) > 1 else ""
-    navigation = data in ("home", "c:cancel") or action in (
-        "home", "plans", "plan", "myai", "myai_v", "srcv", "src", "art", "ch",
-        "sch", "con", "quiet", "tz", "cat", "catv", "cri", "criv", "que", "rej",
-        "models", "model", "users", "admins", "user", "texts", "discs", "disc",
-        "pays", "report", "rep", "logs", "lock", "man_close")
-    back = (context.user_data.get("await") or {}).get("back", "home")
-    channel = int(parts[2]) if len(parts) > 2 and parts[0] == "a" and action == "test" and parts[2].isdigit() else None
-    keep = ("disc",) if parts[0] == "u" and action in ("plan", "req", "disc", "discx") else ("bc_src",) if action == "bc_go" else ("qs", "qs_channel") if action == "qe" else ()
-    async def work():
-        if data == "noop": return
-        if data == "c:cancel":
-            if not _current_operation.get().replaced_status:
-                await send_temp(context, update.effective_chat.id, operation_text(L(update), "cancelled"))
-            return await dispatch(update, context, back)
-        clear_interaction(context, keep=keep)
-        return await dispatch(update, context, data)
-    await run_user_operation(update, context, f"callback:{data}", channel, work, replace=navigation, keep=keep)
-    if not getattr(context, "_callback_answered", False):
+    try: await dispatch(update, context, qy.data)
+    except Exception as e:
+        log_event("ERROR", f"callback {qy.data}: {e}", u.id)
+        try: await qy.answer(tr(L(update), "error", e=str(e)[:150]), show_alert=True); context.user_data["_answered"] = True
+        except Exception: pass
+    if not context.user_data.get("_answered"):
         try: await qy.answer()
         except Exception: pass
 # ============================================================
 # ورودی‌های متنی (ویزاردها، فیلدها، منبع، افزودن کانال + کد قفل، کد تخفیف، رسید …)
-def _input_url(text, explicit_scheme=False):
-    """Validate syntax only; local model providers are deliberately supported."""
-    if not text or any(c.isspace() or ord(c) < 32 or 127 <= ord(c) <= 159 for c in text): raise ValueError
-    if any(c in text for c in "\\<>\"#") or re.search(r"%(?![0-9a-fA-F]{2})", text): raise ValueError
-    if not re.match(r"(?i)^https?://", text):
-        if explicit_scheme or "://" in text or text.startswith("//"): raise ValueError
-        text = "https://" + text
-    parsed = urlparse(text)
-    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc or parsed.username is not None or parsed.password is not None: raise ValueError
-    host = parsed.hostname
-    if not host or any(c in parsed.netloc for c in "{}%") or parsed.netloc.endswith(":"): raise ValueError
-    if parsed.netloc.startswith("["):
-        if not re.fullmatch(r"\[[0-9a-fA-F:.]+\](?::[0-9]+)?", parsed.netloc): raise ValueError
-    elif parsed.netloc.count(":") > 1: raise ValueError
-    if parsed.port is not None and not 1 <= parsed.port <= 65535: raise ValueError
-    try: ipaddress.ip_address(host)
-    except ValueError:
-        host = host.rstrip(".").encode("idna").decode("ascii")
-        if host.lower() != "localhost" and "." not in host: raise ValueError
-        if len(host) > 253 or re.fullmatch(r"[0-9.]+", host): raise ValueError
-        if any(not re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", label) for label in host.split(".")): raise ValueError
-    return parsed._replace(scheme=parsed.scheme.lower()).geturl()
-
-def _input_value(field, raw, lang, name_limit=100):
-    """Validate before advancing pending input; errors are ready for a popup."""
-    def invalid(fa, en): raise ValueError(en if lang == "en" else fa)
-    text = raw.strip()
-    if field == "base_url" or field in ("source_url", "api_url"):
-        try: return _input_url(raw, explicit_scheme=field == "base_url")
-        except (ValueError, TypeError, UnicodeError):
-            invalid("نشانی معتبر HTTP(S) بدون فاصله، نام کاربری، رمز یا # وارد کنید." + (" برای مدل http:// یا https:// الزامی است." if field == "base_url" else ""), "Enter a valid HTTP(S) URL without spaces, credentials or #." + (" Model URLs require http:// or https://." if field == "base_url" else ""))
-    if field in ("api_key", "model", "code"):
-        limit = 256 if field == "model" else 24 if field == "code" else None
-        if not raw or any(c.isspace() or ord(c) < 32 or 127 <= ord(c) <= 159 for c in raw) or (limit and len(raw) > limit):
-            if field == "api_key": invalid("کلید نباید خالی یا دارای فاصله باشد؛ برای سرویس بدون کلید، - بفرستید.", "Enter a nonempty key without whitespace, or - for an unauthenticated service.")
-            if field == "model": invalid("شناسه مدل باید ۱ تا ۲۵۶ نویسه و بدون فاصله باشد.", "Model ID must contain 1–256 characters without whitespace.")
-            invalid("کد تخفیف باید ۱ تا ۲۴ نویسه و بدون فاصله باشد.", "Discount code must contain 1–24 characters without whitespace.")
-        # callback_data تلگرام سقف ۶۴ بایت دارد؛ بلندترین قالب s:disc_e:<code>:max_uses است
-        if field == "code":
-            if ":" in raw: invalid("کد تخفیف نمی‌تواند شامل «:» باشد.", "Discount code cannot contain ':'.")
-            if len(raw.upper().encode("utf-8")) > 46: invalid("کد برای دکمه‌های مدیریت بیش از حد بلند است.", "Code is too long for the admin buttons; use a shorter one.")
-        return "" if field == "api_key" and raw == "-" else raw
-    if field in ("name", "name_en"):
-        if not text or len(text) > name_limit or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in text): invalid(f"نام باید ۱ تا {name_limit} نویسه و بدون نویسه کنترلی باشد.", f"Name must contain 1–{name_limit} characters without control characters.")
-        return text
-    if field == "expires":
-        value = text.translate(_FA_DIGITS); now = now_utc()
-        try:
-            if re.fullmatch(r"[+]?[0-9]+", value):
-                days = int(value)
-                if days <= 0: raise ValueError
-                exp = now + timedelta(days=days)
-            else:
-                match = re.fullmatch(r"([0-9]{4})[-/]([0-9]{1,2})[-/]([0-9]{1,2})", value)
-                if not match: raise ValueError
-                exp = datetime(*(int(x) for x in match.groups()), 23, 59, tzinfo=UTC)
-            if exp <= now: raise ValueError
-        except (ValueError, TypeError, OverflowError): invalid("انقضا باید تعداد روز مثبت یا تاریخ معتبر آینده به صورت YYYY-MM-DD باشد.", "Expiry must be positive days or a valid future date in YYYY-MM-DD format.")
-        return exp.isoformat()
-    if field == "channel":
-        value = text.translate(_FA_DIGITS)
-        if re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{4,31}", value): return value
-        if re.fullmatch(r"-[0-9]+", value):
-            number = int(value)
-            if -(2 ** 63) <= number < 0: return number
-        invalid("یوزرنیم معتبر کانال با @ یا شناسه عددی منفی کانال را بفرستید.", "Send a valid @channel_username or a negative integer channel ID.")
-    if field == "temperature":
-        try: value = float(text.translate(_FA_DIGITS))
-        except (ValueError, TypeError): invalid("دما باید عددی بین ۰ و ۲ باشد.", "Temperature must be a finite number between 0 and 2.")
-        if not 0 <= value <= 2: invalid("دما باید عددی بین ۰ و ۲ باشد.", "Temperature must be a finite number between 0 and 2.")
-        return value
-    if field in INT_FIELDS or field in ("days", "daily_posts", "max_sources", "max_channels", "daily_tests", "max_tokens", "max_uses", "priority", "weight", "percent"):
-        try: value = to_int(text)
-        except (ValueError, TypeError): invalid("عدد صحیح وارد کنید؛ اعشار مجاز نیست.", "Enter an integer; decimals are not allowed.")
-        lo, hi = INT_FIELDS.get(field, (1 if field in ("days", "max_tokens", "weight", "percent") else -(2 ** 63) if field == "priority" else 0, 100 if field in ("weight", "percent") else 2 ** 63 - 1))
-        if field == "days": hi = (datetime.max.replace(tzinfo=UTC) - now_utc()).days
-        if not lo <= value <= hi: invalid(f"عدد صحیح بین {lo} و {hi} وارد کنید.", f"Enter an integer between {lo} and {hi}.")
-        return value
-    if not text: invalid("مقدار نمی‌تواند خالی باشد.", "The value cannot be empty.")
-    return text
-
-def _input_access(st, uid, lang):
-    kind = st.get("kind"); wiz = st.get("wiz") if kind == "wiz" else None
-    user = get_user(uid)
-    if user and user["banned"] and not is_super(uid): return tr(lang, "banned")
-    if kind in ("plan_field", "disc_field", "gtext", "umsg", "bc") or wiz in ("plan_new", "model_add", "disc_add") or (kind == "model_field" and not st.get("own")):
-        if not is_super(uid): return tr(lang, "no_admin")
-    if kind in ("field", "cat_style", "crit_weight", "src_add", "src_api_url", "src_api_key", "ch_add", "lockcode", "art_edit") or wiz in ("cat_add", "crit_add", "my_ai_add") or (kind == "model_field" and st.get("own")):
-        if not can_admin(uid): return tr(lang, "no_admin")
-    cid = st.get("data", {}).get("cid") if wiz in ("cat_add", "crit_add") else st.get("cid") if kind in ("field", "cat_style", "crit_weight", "src_add") else None
-    if cid is not None and not channel_owned(cid, uid): return tr(lang, "notfound")
-    if kind in ("src_api_url", "src_api_key", "art_edit"):
-        item = get_article(st["aid"]) if kind == "art_edit" else get_source(st["sid"])
-        if not item or (item["admin_id"] != uid and not is_super(uid)) or not channel_owned(item["channel_id"], uid): return tr(lang, "notfound")
-    if kind == "model_field":
-        model = get_model(st["mid"])
-        if not model or (st.get("own") and model["owner_id"] != uid): return tr(lang, "notfound")
-    if kind in ("src_add", "ch_add", "lockcode"):
-        lim = admin_limits(uid)
-        if not lim["active"]: return tr(lang, "plan_inactive")
-        if kind == "src_add" and lim["max_sources"] is not None and count_sources(uid) >= lim["max_sources"]: return tr(lang, "limit_sources", n=lim["max_sources"])
-    return None
-
 async def handle_input(update, context, st):
-    ud = context.user_data
-    if not isinstance(st, dict) or ud.get("await") is not st: return
-    msg = update.message; uid = update.effective_user.id; lang = L(update); kind = st["kind"]; back = st["back"]
-    raw_text = msg.text or msg.caption or ""; text = raw_text.strip(); text_html = (msg.text_html or msg.caption_html or "").strip()
+    msg = update.message; uid = update.effective_user.id; lang = L(update); ud = context.user_data; kind = st["kind"]; back = st["back"]
+    text = (msg.text or msg.caption or "").strip(); text_html = (msg.text_html or msg.caption_html or "").strip()
     if kind not in ("bc", "receipt"):
         try: await msg.delete()
         except Exception: pass
-    if ud.get("await") is not st: return
     def done(notice=None):
-        current = ud.get("await")
-        if current is st: ud.pop("await", None)
-        if notice and (current is st or current is None): ud["notice"] = notice
-    denied = _input_access(st, uid, lang)
-    if denied: return await popup(update, context, denied, alert=True)
+        ud.pop("await", None)
+        if notice: ud["notice"] = notice
     # ---- ویزاردها
     if kind == "wiz":
-        steps = WIZ.get(st.get("wiz"), ()); step = st.get("step")
-        if type(step) is not int or not 0 <= step < len(steps): done(); return
-        key, _, typ = steps[step]
-        try: val = _input_value(key, raw_text, lang, name_limit=40 if st["wiz"] in ("cat_add", "crit_add") else 100)
-        except (ValueError, TypeError) as e: return await popup(update, context, str(e), alert=True)
+        steps = WIZ[st["wiz"]]; key, _, typ = steps[st["step"]]
+        if not text: await popup(update, context, tr(lang, "empty")); return await wiz_prompt(update, context)
+        if typ == "int":
+            try: val = to_int(text)
+            except Exception: await popup(update, context, tr(lang, "need_int")); return await wiz_prompt(update, context)
+        else: val = text
         st["data"][key] = val; st["step"] += 1
         if st["step"] < len(steps): return await wiz_prompt(update, context)
-        # Consume the terminal state before the first finalization await.
-        done(); dta = st["data"]
-        if st["wiz"] == "cat_add": s = get_settings(dta["cid"]); s["categories"].append({"name": dta["name"], "emoji": dta["emoji"][:4], "style": dta["style"][:400]}); save_settings(dta["cid"], s); done(tr(lang, "cat_added"))
-        elif st["wiz"] == "crit_add": s = get_settings(dta["cid"]); s["criteria"].append({"name": dta["name"], "weight": dta["weight"]}); save_settings(dta["cid"], s); done(tr(lang, "crit_added"))
+        dta = st["data"]
+        if st["wiz"] == "cat_add": s = get_settings(dta["cid"]); s["categories"].append({"name": dta["name"][:40], "emoji": dta["emoji"][:4], "style": dta["style"][:400]}); save_settings(dta["cid"], s); done(tr(lang, "cat_added"))
+        elif st["wiz"] == "crit_add": s = get_settings(dta["cid"]); s["criteria"].append({"name": dta["name"][:40], "weight": max(1, min(100, dta["weight"]))}); save_settings(dta["cid"], s); done(tr(lang, "crit_added"))
         elif st["wiz"] == "plan_new": create_plan(**dta); done(tr(lang, "s_plan_created", name=esc(dta["name"])))
-        elif st["wiz"] in ("model_add", "my_ai_add"):
-            own = st["wiz"] == "my_ai_add"
-            mid = add_model(dta["base_url"], dta["api_key"], dta["model"], owner_id=uid if own else None)
-            model = get_model(mid); name = model["name"] if model else dta["model"]
-            await operation_status(context, tr(lang, "s_model_testing"))
-            if not get_model(mid):
-                await popup(update, context, tr(lang, "notfound"), alert=True)
-                return await dispatch(update, context, back)
-            ok, out, t = await test_model(mid)
-            model = get_model(mid)
-            if not model:
-                await popup(update, context, tr(lang, "notfound"), alert=True)
-                return await dispatch(update, context, back)
-            result = tr(lang, "my_ai_added" if own else "s_model_added", name=esc(name), res=(tr(lang, "saved") if ok else ai_err_text(err_code(out), lang)) + f" ({t}s)")
-            await operation_status(context, result, failed=not ok)
-            await popup(update, context, result, alert=not ok)
-            return await dispatch(update, context, f"a:myai_v:{mid}" if own else back)
+        elif st["wiz"] == "model_add":
+            base_url, model = dta["base_url"].strip(), dta["model"].strip()
+            if not base_url.startswith("http") or not model: done(tr(lang, "s_model_need")); return await dispatch(update, context, back)
+            mid = add_model(base_url, dta["api_key"], model); ok, out, t = await test_model(mid); name = get_model(mid)["name"]
+            done(tr(lang, "s_model_added", name=esc(name), res=("✅" if ok else "❌ " + esc(out[:80])) + f" ({t}s)"))
+        elif st["wiz"] == "my_ai_add":
+            base_url, model = dta["base_url"].strip(), dta["model"].strip()
+            if not base_url.startswith("http") or not model: done(tr(lang, "s_model_need")); return await dispatch(update, context, back)
+            mid = add_model(base_url, dta["api_key"], model, owner_id=uid); ok, out, t = await test_model(mid); name = get_model(mid)["name"]
+            done(tr(lang, "my_ai_added", name=esc(name), res=("✅" if ok else "❌ " + esc(out[:80])) + f" ({t}s)"))
+            return await dispatch(update, context, f"a:myai_v:{mid}")
         elif st["wiz"] == "disc_add":
-            exp = parse_dt(dta["expires"])
-            if not exp or exp <= now_utc():
-                st["step"] = next(i for i, item in enumerate(steps) if item[0] == "expires")
-                ud["await"] = st
-                return await popup(update, context, "انقضا گذشته است؛ تاریخ آینده وارد کنید." if lang != "en" else "Expiry has passed; enter a future date.", alert=True)
-            code = disc_create(dta["code"], dta["percent"], dta["expires"], dta["max_uses"]); done(tr(lang, "s_disc_created", code=code) if code else tr(lang, "s_disc_dup"))
+            exp = parse_expiry(dta["expires"])
+            if not exp: done(tr(lang, "s_disc_exp_bad")); return await dispatch(update, context, back)
+            code = disc_create(dta["code"][:24], dta["percent"], exp, dta["max_uses"]); done(tr(lang, "s_disc_created", code=code) if code else tr(lang, "s_disc_dup"))
         return await dispatch(update, context, back)
     # ---- فیلد تنظیمات کانال
     if kind == "field":
-        f = st["field"]; cid = st["cid"]
-        if f not in FIELD_LABEL: return await popup(update, context, tr(lang, "notfound"), alert=True)
-        label = FIELD_LABEL[f][1 if lang == "en" else 0]
-        try: v = _input_value(f, raw_text, lang)
-        except (ValueError, TypeError) as e: return await popup(update, context, str(e), alert=True)
-        if f == "signature": v = sanitize_html(text_html)[:200]
-        elif f not in INT_FIELDS: v = v[:3000]
+        f = st["field"]; cid = st["cid"]; label = FIELD_LABEL[f][1 if lang == "en" else 0]
+        if not text: await popup(update, context, tr(lang, "empty")); return await ask(update, context, label, "field", back, cid=cid, field=f)
+        if f in INT_FIELDS:
+            lo, hi = INT_FIELDS[f]
+            try: v = to_int(text)
+            except Exception: await popup(update, context, tr(lang, "need_int")); return await ask(update, context, label, "field", back, cid=cid, field=f)
+            if not lo <= v <= hi: await popup(update, context, tr(lang, "range", lo=lo, hi=hi), alert=True); return await ask(update, context, label, "field", back, cid=cid, field=f)
+        elif f == "signature": v = sanitize_html(text_html, premium=True)[:200]
+        else: v = text[:3000]
         update_settings(cid, **{f: v}); done(f"{tr(lang, 'saved')} · {label}: {esc(strip_tags(str(v))[:40])}"); return await dispatch(update, context, back)
     if kind == "cat_style":
         s = get_settings(st["cid"]); i = st["idx"]
-        if not text: return await popup(update, context, tr(lang, "empty"), alert=True)
-        if not 0 <= i < len(s["categories"]): return await popup(update, context, tr(lang, "notfound"), alert=True)
-        s["categories"][i]["style"] = text[:400]; save_settings(st["cid"], s); done(tr(lang, "cat_updated"))
+        if text and i < len(s["categories"]): s["categories"][i]["style"] = text[:400]; save_settings(st["cid"], s); done(tr(lang, "cat_updated"))
+        else: done(tr(lang, "empty"))
         return await dispatch(update, context, back)
     if kind == "crit_weight":
         s = get_settings(st["cid"]); i = st["idx"]
-        if not 0 <= i < len(s["criteria"]): return await popup(update, context, tr(lang, "notfound"), alert=True)
-        try: weight = _input_value("weight", raw_text, lang)
-        except (ValueError, TypeError) as e: return await popup(update, context, str(e), alert=True)
-        s["criteria"][i]["weight"] = weight; save_settings(st["cid"], s); done(tr(lang, "crit_updated"))
+        try:
+            if i < len(s["criteria"]): s["criteria"][i]["weight"] = max(1, min(100, to_int(text))); save_settings(st["cid"], s); done(tr(lang, "crit_updated"))
+        except Exception: done(tr(lang, "need_int"))
         return await dispatch(update, context, back)
     # ---- منبع
     if kind == "src_add":
-        cid = st["cid"]
-        try: url = _input_value("source_url", raw_text, lang).rstrip("/")
-        except (ValueError, TypeError) as e: return await popup(update, context, str(e), alert=True)
+        cid = st["cid"]; url = normalize_url(text)
+        if not text or "." not in urlparse(url).netloc: done(tr(lang, "src_bad")); return await dispatch(update, context, back)
         sid = add_source(uid, cid, url)
-        if not sid: return await popup(update, context, tr(lang, "src_dup"), alert=True)
-        done()
-        await operation_status(context, tr(lang, "src_checking"))
-        source = get_source(sid)
-        if not source or not channel_owned(cid, uid): return await popup(update, context, tr(lang, "notfound"), alert=True)
-        ok, note = await probe_source(source, lang, added=True)
-        source = get_source(sid)
-        if not source or not channel_owned(cid, uid): return await popup(update, context, tr(lang, "notfound"), alert=True)
+        if not sid: done(tr(lang, "src_dup")); return await dispatch(update, context, back)
+        await render(update, context, tr(lang, "src_checking"))
+        ok, note = await probe_source(get_source(sid), lang, added=True)
         if ok: q("UPDATE sources SET title=? WHERE id=?", (hostname(url), sid), commit=True)
         else: log_event("WARN", f"منبع جدید {hostname(url)}: تست بارگذاری ناموفق", uid)
-        await operation_status(context, note, failed=not ok)
-        await popup(update, context, note, alert=not ok)
-        return await dispatch(update, context, f"a:srcv:{sid}")
+        await send_temp(context, uid, note)      # پیام بلندِ نتیجه‌ی تست، موقت است و خودش پاک می‌شود
+        done(note); return await dispatch(update, context, f"a:srcv:{sid}")
     if kind == "src_api_url":
-        sid = st["sid"]
+        sid = st["sid"]; s = get_source(sid)
+        if not s or (s["admin_id"] != uid and not is_super(uid)): done(tr(lang, "notfound")); return await dispatch(update, context, back)
         if text in ("-", "—", "‑"): set_source_api(sid, "", "", ""); done(tr(lang, "src_api_del")); return await dispatch(update, context, back)
-        try: api = _input_value("api_url", raw_text, lang)
-        except (ValueError, TypeError) as e: return await popup(update, context, str(e), alert=True)
+        api = text if text.startswith(("http://", "https://")) else "https://" + text
+        if "." not in urlparse(api.replace("{key}", "k")).netloc: done(tr(lang, "src_bad")); return await dispatch(update, context, back)
         ud["await"] = {"kind": "src_api_key", "sid": sid, "api": api, "back": back}
         return await render(update, context, f"✏️ {tr(lang, 'src_api_key')}\n\n<i>{tr(lang, 'send_value')}</i>", [[B(tr(lang, "cancel"), "c:cancel")]])
     if kind == "src_api_key":
-        sid = st["sid"]
-        try:
-            key = _input_value("api_key", raw_text, lang)
-            api = _input_value("api_url", st["api"], lang)
-        except (ValueError, TypeError) as e: return await popup(update, context, str(e), alert=True)
-        set_source_api(sid, api, key, ""); done()
-        await operation_status(context, tr(lang, "src_checking"))
-        source = get_source(sid)
-        if not source or (source["admin_id"] != uid and not is_super(uid)) or not channel_owned(source["channel_id"], uid): return await popup(update, context, tr(lang, "notfound"), alert=True)
-        try: items, _, _ = await _api_discover(source, 10); n = len(items)
-        except (httpx.HTTPError, FetchError, RuntimeError, ValueError, TypeError, KeyError) as e: n = 0; log_event("WARN", f"API منبع {hostname(api)}: {err_code(e)}", uid)
-        source = get_source(sid)
-        if not source or (source["admin_id"] != uid and not is_super(uid)) or not channel_owned(source["channel_id"], uid): return await popup(update, context, tr(lang, "notfound"), alert=True)
+        sid = st["sid"]; s = get_source(sid)
+        if not s or (s["admin_id"] != uid and not is_super(uid)): done(tr(lang, "notfound")); return await dispatch(update, context, back)
+        key = "" if text in ("-", "—", "‑") else text
+        set_source_api(sid, st["api"], key, "")
+        await render(update, context, tr(lang, "src_checking"))
+        try: items, _, _ = await _api_discover(get_source(sid), 10); n = len(items)
+        except Exception as e: n = 0; log_event("WARN", f"API منبع {hostname(st['api'])}: {err_code(e)}", uid)
         if not n: set_source_active(sid, False, "active")
-        note = tr(lang, "src_api_ok", n=n) if n else tr(lang, "src_api_bad")
-        await operation_status(context, note, failed=not n)
-        await popup(update, context, note, alert=not n)
-        return await dispatch(update, context, f"a:srcv:{sid}")
+        done(tr(lang, "src_api_ok", n=n) if n else tr(lang, "src_api_bad")); return await dispatch(update, context, f"a:srcv:{sid}")
     # ---- افزودن کانال + لایه‌ی امنیتی
     if kind == "ch_add":
-        chat = None; fo = getattr(msg, "forward_origin", None)
-        if fo and getattr(fo, "chat", None) and fo.chat.type == ChatType.CHANNEL: chat = fo.chat
-        else:
-            try: identifier = _input_value("channel", raw_text, lang)
-            except (ValueError, TypeError) as e: return await popup(update, context, str(e), alert=True)
-            try: chat = await context.bot.get_chat(identifier)
-            except Exception:
-                log.warning("channel lookup failed for %s", uid, exc_info=True)
-                return await popup(update, context, "به کانال دسترسی ندارم؛ شناسه و دسترسی ربات را بررسی کنید." if lang != "en" else "Cannot access this channel; check its ID and the bot's access.", alert=True)
-        if ud.get("await") is not st: return
-        if not chat or chat.type != ChatType.CHANNEL: return await popup(update, context, tr(lang, "ch_need_fwd"), alert=True)
-        if not await bot_can_post(context.bot, chat.id): return await popup(update, context, tr(lang, "ch_bot_not_admin"), alert=True)
-        if ud.get("await") is not st: return
+        chat = None
+        try:
+            fo = getattr(msg, "forward_origin", None)
+            if fo and getattr(fo, "chat", None) and fo.chat.type == ChatType.CHANNEL: chat = fo.chat
+            elif text: chat = await context.bot.get_chat(text if text.startswith("@") else to_int(text))
+        except Exception as e: done(tr(lang, "ch_no_access", e=esc(str(e)[:80]))); return await dispatch(update, context, back)
+        if not chat or chat.type != ChatType.CHANNEL: done(tr(lang, "ch_need_fwd")); return await dispatch(update, context, back)
+        if not await bot_can_post(context.bot, chat.id): done(tr(lang, "ch_bot_not_admin")); return await dispatch(update, context, back)
         user_is_admin = False
         try: user_is_admin = any(m.user.id == uid for m in await context.bot.get_chat_administrators(chat.id))
         except Exception:
             try: mem = await context.bot.get_chat_member(chat.id, uid); user_is_admin = mem.status in ("administrator", "creator")
             except Exception: user_is_admin = False
-        if ud.get("await") is not st: return
         if not user_is_admin:
-            log_event("WARN", f"ثبت کانال «{chat.title}» ({chat.id}) بدون ادمین‌بودن", uid)
-            await notify_supers(f"<b>هشدار امنیتی</b>\n<code>{uid}</code> تلاش کرد «{esc(chat.title)}» را بدون ادمین‌بودن ثبت کند.")
-            return await popup(update, context, tr(lang, "ch_user_not_admin"), alert=True)
-        denied = _input_access(st, uid, lang)
-        if denied: return await popup(update, context, denied, alert=True)
+            log_event("WARN", f"🚫 ثبت کانال «{chat.title}» ({chat.id}) بدون ادمین‌بودن", uid)
+            await notify_supers(f"🚨 <b>هشدار امنیتی</b>\n<code>{uid}</code> تلاش کرد «{esc(chat.title)}» را بدون ادمین‌بودن ثبت کند.")
+            done(tr(lang, "ch_user_not_admin")); return await dispatch(update, context, back)
         existing = channel_by_chat(chat.id)
         if existing:
             if existing["admin_id"] == uid: update_channel_meta(existing["id"], chat.title, chat.username or ""); done(tr(lang, "ch_exists_mine")); return await dispatch(update, context, f"a:ch:{existing['id']}")
             ud["await"] = {"kind": "lockcode", "cid": existing["id"], "back": back, "tries": 0, "title": chat.title}
             return await render(update, context, tr(lang, "ch_locked"), [[B(tr(lang, "cancel"), "c:cancel")]])
         lim = admin_limits(uid)
-        if lim["max_channels"] is not None and len(list_channels(uid)) >= lim["max_channels"]: return await popup(update, context, tr(lang, "limit_channels", n=lim["max_channels"]), alert=True)
+        if lim["max_channels"] is not None and len(list_channels(uid)) >= lim["max_channels"]: done(tr(lang, "limit_channels", n=lim["max_channels"])); return await dispatch(update, context, back)
         cid = add_channel(uid, chat.id, chat.title or str(chat.id), chat.username or "", uid, lang); log_event("INFO", f"کانال ثبت شد: {chat.title} ({chat.id})", uid)
         done(tr(lang, "ch_added", title=esc(chat.title))); return await dispatch(update, context, f"a:ch:{cid}")
     if kind == "lockcode":
         cid = st["cid"]; ch = get_channel(cid); me = get_user(uid); who = f"{esc(uname(me))} (<code>{uid}</code>)"
-        if not ch: return await popup(update, context, tr(lang, "notfound"), alert=True)
-        if check_lock(cid, text):
-            if not await bot_can_post(context.bot, ch["chat_id"]): return await popup(update, context, tr(lang, "ch_bot_not_admin"), alert=True)
-            try: mem = await context.bot.get_chat_member(ch["chat_id"], uid); user_is_admin = mem.status in ("administrator", "creator")
-            except Exception: user_is_admin = False
-            if ud.get("await") is not st: return
-            if not user_is_admin: return await popup(update, context, tr(lang, "ch_user_not_admin"), alert=True)
-            denied = _input_access(st, uid, lang)
-            if denied: return await popup(update, context, denied, alert=True)
-            ch = get_channel(cid)
-            if not ch or not check_lock(cid, text): return await popup(update, context, tr(lang, "ch_lock_bad"), alert=True)
-            lim = admin_limits(uid)
-            if lim["max_channels"] is not None and len(list_channels(uid)) >= lim["max_channels"]: return await popup(update, context, tr(lang, "limit_channels", n=lim["max_channels"]), alert=True)
-            if publication_pending(cid): return await popup(update, context, tr(lang, "test_busy"), alert=True)
-            old_uid = ch["admin_id"]; ol = user_lang(old_uid) or "fa"
-            transfer_channel(cid, uid, lang); done(); log_event("WARN", f"کانال {ch['title']} از {old_uid} به {uid} منتقل شد", uid)
-            await notify_user_fn(old_uid, tr(ol, "ch_owner_moved", title=esc(ch["title"]), who=who)); await notify_supers(f"«{esc(ch['title'])}» transferred {old_uid} → {uid}")
-            done(tr(lang, "ch_lock_ok", title=esc(ch["title"]))); return await dispatch(update, context, f"a:ch:{cid}")
+        if not ch: done(tr(lang, "notfound")); return await dispatch(update, context, back)
         old_uid = ch["admin_id"]; ol = user_lang(old_uid) or "fa"
-        st["tries"] += 1
-        if st["tries"] >= 3: done()
-        await notify_user_fn(old_uid, tr(ol, "ch_owner_alert", title=esc(ch["title"]), who=who)); log_event("WARN", f"کد قفل اشتباه برای {ch['title']} توسط {uid}", uid)
-        await popup(update, context, tr(lang, "ch_lock_bad"), alert=True)
-        if st["tries"] >= 3: return await dispatch(update, context, back)
-        if ud.get("await") is st: return await render(update, context, tr(lang, "ch_locked"), [[B(tr(lang, "cancel"), "c:cancel")]])
+        if check_lock(cid, text):
+            lim = admin_limits(uid)
+            if lim["max_channels"] is not None and len(list_channels(uid)) >= lim["max_channels"]: done(tr(lang, "limit_channels", n=lim["max_channels"])); return await dispatch(update, context, back)
+            transfer_channel(cid, uid, lang); log_event("WARN", f"کانال {ch['title']} از {old_uid} به {uid} منتقل شد", uid)
+            await notify_user_fn(old_uid, tr(ol, "ch_owner_moved", title=esc(ch["title"]), who=who)); await notify_supers(f"🔁 «{esc(ch['title'])}» transferred {old_uid} → {uid}")
+            done(tr(lang, "ch_lock_ok", title=esc(ch["title"]))); return await dispatch(update, context, f"a:ch:{cid}")
+        st["tries"] += 1; await notify_user_fn(old_uid, tr(ol, "ch_owner_alert", title=esc(ch["title"]), who=who)); log_event("WARN", f"کد قفل اشتباه برای {ch['title']} توسط {uid}", uid)
+        if st["tries"] >= 3: done(tr(lang, "ch_lock_bad")); return await dispatch(update, context, back)
+        ud["notice"] = tr(lang, "ch_lock_bad"); return await render(update, context, tr(lang, "ch_locked"), [[B(tr(lang, "cancel"), "c:cancel")]])
     # ---- مقاله
     if kind == "art_edit":
-        art = get_article(st["aid"])
-        if not art or (art["admin_id"] != uid and not is_super(uid)) or art["status"] == "published":
-            return await popup(update, context, tr(lang, "notfound"), alert=True)
-        if publication_pending(art["channel_id"]): return await popup(update, context, tr(lang, "test_busy"), alert=True)
-        if not text_html: return await popup(update, context, tr(lang, "empty"), alert=True)
-        article_update(st["aid"], post_html=sanitize_html(text_html)); done(tr(lang, "art_updated"))
+        a = get_article(st["aid"])
+        if a and (a["admin_id"] == uid or is_super(uid)) and text_html: article_update(st["aid"], post_html=sanitize_html(text_html, premium=True)); done(tr(lang, "art_updated"))
+        else: done(tr(lang, "empty"))
         return await dispatch(update, context, back)
     # ---- کد تخفیف
     if kind == "disc":
         d, why = disc_valid(text); pid = str(st["pid"])
-        if not d: return await popup(update, context, tr(lang, {"expired": "disc_expired", "exhausted": "disc_exhausted"}.get(why, "disc_bad")), alert=True)
-        ud.setdefault("disc", {})[pid] = d["code"]; done(tr(lang, "disc_ok", p=d["percent"]))
+        if d: ud.setdefault("disc", {})[pid] = d["code"]; done(tr(lang, "disc_ok", p=d["percent"]))
+        else: done(tr(lang, {"expired": "disc_expired", "exhausted": "disc_exhausted"}.get(why, "disc_bad")))
         return await dispatch(update, context, back)
     # ---- رسید پرداخت
     if kind == "receipt":
         pid = st["pid"]; p = get_plan(pid); u = get_user(uid)
-        if not p or not p["active"]: return await popup(update, context, tr(lang, "notfound"), alert=True)
         if not (msg.photo or msg.document or text): await popup(update, context, tr(lang, "receipt_empty")); return
         if pay_pending_for(uid, pid): done(tr(lang, "req_pending")); return await dispatch(update, context, back)
-        rid = pay_create(uid, pid, msg.chat_id, msg.message_id, text, st.get("disc"), st.get("final")); done(); ud.get("disc", {}).pop(str(pid), None)
+        rid = pay_create(uid, pid, msg.chat_id, msg.message_id, text, st.get("disc"), st.get("final")); ud.pop("await", None); ud.get("disc", {}).pop(str(pid), None)
         disc = f"\n🎟 {esc(st['disc'])}" if st.get("disc") else ""; note = f"\n📝 {esc(text[:400])}" if text else ""
         header = tr("fa", "s_pay_new", id=rid, who=esc(uname(u)), uid=uid, plan=esc(p["name"]), price=esc(st.get("final") or p["price"]), disc=disc, note=note); kb = InlineKeyboardMarkup([[B("✅ تأیید / Approve", f"s:pay_ok:{rid}"), B("❌ رد / Reject", f"s:pay_no:{rid}")]])
         for sid in SUPER_ADMIN_IDS:
@@ -3695,36 +2904,40 @@ async def handle_input(update, context, st):
         log_event("INFO", f"درخواست پرداخت #{rid} برای پلن {p['name']}", uid); return await view_receipt_ok(update, context)
     # ---- مدیر کلان
     if kind == "plan_field":
-        f = st["field"]
-        if f not in {item[0] for item in PLAN_FIELDS} or not get_plan(st["pid"]): return await popup(update, context, tr(lang, "notfound"), alert=True)
-        try: v = _input_value(f, raw_text, lang)
-        except (ValueError, TypeError) as e: return await popup(update, context, str(e), alert=True)
+        f = st["field"]; v = text
+        if f in ("days", "daily_posts", "max_sources", "max_channels", "daily_tests"):
+            try: v = to_int(text)
+            except Exception: done(tr(lang, "need_int")); return await dispatch(update, context, back)
         update_plan(st["pid"], **{f: v}); done(tr(lang, "saved")); return await dispatch(update, context, back)
     if kind == "disc_field":
         f = st["field"]; code = st["code"]
-        if f not in ("percent", "max_uses", "expires") or not disc_get(code): return await popup(update, context, tr(lang, "notfound"), alert=True)
-        try: v = _input_value(f, raw_text, lang)
-        except (ValueError, TypeError) as e: return await popup(update, context, str(e), alert=True)
-        disc_update(code, **{f: v}); done(tr(lang, "saved"))
+        try:
+            if f == "percent": disc_update(code, percent=max(1, min(100, to_int(text))))
+            elif f == "max_uses": disc_update(code, max_uses=max(0, to_int(text)))
+            else:
+                exp = parse_expiry(text)
+                if not exp: done(tr(lang, "s_disc_exp_bad")); return await dispatch(update, context, back)
+                disc_update(code, expires=exp)
+            done(tr(lang, "saved"))
+        except Exception: done(tr(lang, "need_int"))
         return await dispatch(update, context, back)
     if kind == "model_field":
-        f = st["field"]
-        if f not in {item[0] for item in MODEL_FIELDS}: return await popup(update, context, tr(lang, "notfound"), alert=True)
-        try: v = _input_value(f, raw_text, lang)
-        except (ValueError, TypeError) as e: return await popup(update, context, str(e), alert=True)
+        f = st["field"]; v = text
+        if st.get("own"):      # مدل شخصی: فقط مالک خودش اجازه‌ی ویرایش دارد
+            om = get_model(st["mid"])
+            if not om or om["owner_id"] != uid: done(tr(lang, "notfound")); return await dispatch(update, context, back)
+        try:
+            if f in ("priority", "max_tokens"): v = to_int(text)
+            elif f == "temperature": v = max(0.0, min(2.0, float(text.translate(_FA_DIGITS))))
+        except Exception: done(tr(lang, "need_int")); return await dispatch(update, context, back)
         update_model(st["mid"], **{f: v}); done(tr(lang, "saved")); return await dispatch(update, context, back)
-    if kind == "gtext":
-        if st["key"] not in TEXT_KEYS or st["lg"] not in LANGS: return await popup(update, context, tr(lang, "notfound"), alert=True)
-        gtext_set(st["key"], st["lg"], sanitize_html(text_html)); done(tr(lang, "s_text_saved")); return await dispatch(update, context, back)
+    if kind == "gtext": gtext_set(st["key"], st["lg"], sanitize_html(text_html, premium=True)); done(tr(lang, "s_text_saved")); return await dispatch(update, context, back)
     if kind == "umsg":
-        if not text_html: return await popup(update, context, tr(lang, "empty"), alert=True)
         tl = user_lang(st["target"]) or "fa"
-        try: await context.bot.send_message(st["target"], tr(tl, "s_umsg_head") + sanitize_html(text_html), parse_mode=HTML)
-        except Exception:
-            log.warning("admin message send failed for %s", uid, exc_info=True)
-            return await popup(update, context, "پیام ارسال نشد؛ دوباره تلاش کنید." if lang != "en" else "Message could not be sent; please try again.", alert=True)
-        done(tr(lang, "s_umsg_sent")); return await dispatch(update, context, back)
-    if kind == "bc": done(); ud["bc_src"] = (msg.chat_id, msg.message_id); return await render(update, context, tr(lang, "s_bc_confirm", n=len(list_users())), [[B(tr(lang, "s_bc_go"), "s:bc_go"), B(tr(lang, "cancel"), "s:home")]], force_new=True)
+        try: await context.bot.send_message(st["target"], tr(tl, "s_umsg_head") + sanitize_html(text_html, premium=True), parse_mode=HTML); done(tr(lang, "s_umsg_sent"))
+        except Exception as e: done(tr(lang, "error", e=esc(str(e)[:80])))
+        return await dispatch(update, context, back)
+    if kind == "bc": ud.pop("await", None); ud["bc_src"] = (msg.chat_id, msg.message_id); return await render(update, context, tr(lang, "s_bc_confirm", n=len(list_users())), [[B(tr(lang, "s_bc_go"), "s:bc_go"), B(tr(lang, "cancel"), "s:home")]], force_new=True)
     done(); return await dispatch(update, context, back)
 # ============================================================
 # پشتیبانی تک‌پیامی
@@ -3754,11 +2967,14 @@ async def _ack(msg, fallback_text, kb=None):
         try: await msg.reply_text(fallback_text, reply_markup=kb)
         except Exception: pass
 async def send_temp(context, chat_id, text, seconds=10):
-    try: mid = await create_temp(context.bot, chat_id, text)
-    except Exception:
-        log.debug("temporary message send failed", exc_info=True)
-        return
-    expire_temp(context.bot, chat_id, mid, seconds)
+    """پیام بلندِ گذرا (خطا/اطلاع) پس از چند لحطه حذف می‌شود تا محیط چت تمیز بماند."""
+    try: m = await context.bot.send_message(chat_id, text[:4000], parse_mode=HTML, disable_web_page_preview=True)
+    except Exception: return
+    async def _rm():
+        await asyncio.sleep(seconds)
+        try: await context.bot.delete_message(chat_id, m.message_id)
+        except Exception: pass
+    asyncio.create_task(_rm())
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message; u = update.effective_user; uid = u.id
     if not msg or msg.chat.type != ChatType.PRIVATE: return
@@ -3766,9 +2982,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user["banned"] and not is_super(uid): return
     lang = L(update); st = context.user_data.get("await")
     if st:
-        return await run_user_operation(update, context, f"input:{st.get('kind')}", st.get("cid") or st.get("data", {}).get("cid"), lambda: handle_input(update, context, st))
-    if uid in _operations:
-        return await popup(update, context, operation_text(lang, "busy"), alert=True)
+        try: return await handle_input(update, context, st)
+        except Exception as e: log_event("ERROR", f"input {st.get('kind')}: {e}", uid); context.user_data.pop("await", None); return await msg.reply_text(tr(lang, "error", e=str(e)[:150]))
     if is_super(uid) and msg.reply_to_message:
         target = support_map_get(uid * 10 ** 8 + msg.reply_to_message.message_id)
         if target:
@@ -3782,12 +2997,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["panel"] = None; await go_home(update, context)
 # ============================================================
 # دستورات و دیپ‌لینک
-def managed_command(handler):
-    async def command(update, context):
-        return await run_user_operation(update, context, f"command:{handler.__name__}", None, lambda: handler(update, context), replace=True)
-    return command
-
-
 async def _prep(update, context):
     u = update.effective_user; ensure_user(u.id, u.username, u.full_name, premium=getattr(u, "is_premium", None)); context.user_data.pop("await", None); context.user_data["panel"] = None
     return user_lang(u.id)
@@ -3796,7 +3005,7 @@ async def send_deeplink(update, context, key):
     if not data: return await update.message.reply_text(tr(lang, "dl_notfound"))
     short = data.get("short") or ""; full = data.get("full"); media = data.get("media") or {}
     body = full if full and str(full).lower() != "null" else short
-    if len(body) > BOT_FULL_MAX: body, _ = fit_html(body, BOT_FULL_MAX)
+    if len(body) > BOT_FULL_MAX: body, _ = fit_html(body, BOT_FULL_MAX, True)
     if data.get("url") and data.get("show_source", True): body += f'\n\n<a href="{html.escape(data["url"], quote=True)}">{tr(lang, "dl_source")}</a>'
     if media.get("kind") in ("photo", "video", "animation"):
         try: await getattr(context.bot, f"send_{media['kind']}")(chat_id, media["url"], caption=preview_text(short, 100), parse_mode=HTML)
@@ -3835,11 +3044,8 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_lang(update: Update, context: ContextTypes.DEFAULT_TYPE): await _prep(update, context); await view_lang(update, context)
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = await _prep(update, context)
-    op = _current_operation.get()
-    if not op or not op.replaced_status:
-        await send_temp(context, update.effective_chat.id, operation_text(lang or "fa", "cancelled"))
     if not lang: return await view_lang(update, context)
-    await go_home(update, context)
+    await update.message.reply_text(tr(lang, "cancelled")); await go_home(update, context)
 async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = await _prep(update, context)
     if not lang: return await view_lang(update, context)
@@ -3870,10 +3076,9 @@ def main():
     if not BOT_TOKEN: raise SystemExit("BOT_TOKEN تنظیم نشده است.")
     if not SUPER_ADMIN_IDS: raise SystemExit("SUPER_ADMIN_IDS تنظیم نشده است.")
     init_core(); APP = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).concurrent_updates(True).build()
-    for cmd, fn in (("start", cmd_start), ("create", cmd_create), ("admin", cmd_admin), ("man", cmd_man), ("help", cmd_help), ("about", cmd_about), ("lang", cmd_lang), ("cancel", cmd_cancel)): APP.add_handler(CommandHandler(cmd, managed_command(fn)))
-    APP.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.COMMAND, managed_command(cmd_unknown)))
+    for cmd, fn in (("start", cmd_start), ("create", cmd_create), ("admin", cmd_admin), ("man", cmd_man), ("help", cmd_help), ("about", cmd_about), ("lang", cmd_lang), ("cancel", cmd_cancel)): APP.add_handler(CommandHandler(cmd, fn))
+    APP.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.COMMAND, cmd_unknown))
     APP.add_handler(CallbackQueryHandler(on_callback)); APP.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_message)); APP.add_error_handler(on_error)
     log.info("در حال اجرا…"); APP.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
 if __name__ == "__main__": main()
 # ---------- پایان فایل newsbot.py ----------
-
