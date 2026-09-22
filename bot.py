@@ -53,6 +53,7 @@ CB_RATE = float(os.getenv("CB_RATE", "0.6"))                    # حداقل ف�
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("core")
+logging.getLogger("TEST_DEBUG").setLevel(logging.DEBUG)
 # ============================================================
 # ابزار زمان (فقط بر پایه‌ی آفست UTC)
 TZ_ZONES = [("tehran", 3.5), ("istanbul", 3), ("dubai", 4), ("kabul", 4.5), ("karachi", 5), ("delhi", 5.5), ("moscow", 3), ("berlin", 1), ("london", 0),
@@ -2076,9 +2077,12 @@ PROG = {"fa": {"start": "شروع…", "src": "بررسی {n} منبع…", "fou
 def _res(D): return {"found": 0, "processed": 0, "accepted": 0, "rejected": 0, "queued": 0, "published": 0, "errors": 0, "links": [], "src": "", "pub": [], "diag": D, "msg": ""}
 async def run_channel_cycle(bot, uid, cid, test_mode=False, progress=None):
     lk = ch_lock(cid)
+    _dbg(f"run_channel_cycle ENTER cid={cid} test_mode={test_mode} ch_lock_locked={lk.locked()}")
     if lk.locked():
+        _dbg(f"run_channel_cycle BLOCKED ch_lock locked")
         D = Diag(); D.add("busy"); r = _res(D); r["msg"] = D.render(get_settings(cid)["ui_lang"], False); return r
     async with lk:
+        _dbg(f"run_channel_cycle ACQUIRED ch_lock")
         async with CYCLE_SEM: return await _cycle(bot, uid, cid, test_mode, progress)
 async def _cycle(bot, uid, cid, test_mode, progress):
     D = Diag(); res = _res(D); s = get_settings(cid); ch = get_channel(cid); lim = admin_limits(uid); lang = s["ui_lang"]; P = PROG[lang if lang in PROG else "fa"]
@@ -2531,6 +2535,25 @@ _current_operation = ContextVar("current_operation", default=None)
 _operations, _user_controls = {}, {}
 _temp_messages, _temp_tasks = set(), set()
 
+# --- TEMP DEBUG INSTRUMENTATION (will be removed after root-cause confirmation) ---
+import os as _os
+_DEBUG_TEST = _os.getenv("DEBUG_TEST", "").lower() in ("1", "true", "yes")
+_test_run_counter = {"n": 0}
+if _DEBUG_TEST:
+    _test_dbg_handler = logging.FileHandler("test_debug.log", mode="w", encoding="utf-8")
+    _test_dbg_handler.setLevel(logging.DEBUG)
+    _test_dbg_handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d | %(levelname)s | %(message)s", datefmt="%H:%M:%S"))
+    _test_dbg_logger = logging.getLogger("TEST_DEBUG")
+    _test_dbg_logger.setLevel(logging.DEBUG)
+    _test_dbg_logger.addHandler(_test_dbg_handler)
+    _test_dbg_logger.propagate = False
+else:
+    _test_dbg_logger = logging.getLogger("TEST_DEBUG")
+
+def _dbg(msg):
+    if _DEBUG_TEST:
+        _test_dbg_logger.info(msg)
+
 @dataclass
 class Operation:
     user: int
@@ -2549,6 +2572,7 @@ class Operation:
     final_status: bool = False
     ai_popup: bool = False
     status_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    debug_tag: str = ""
 
 
 def operation_checkpoint():
@@ -2558,7 +2582,10 @@ def operation_checkpoint():
 
 def clear_interaction(context, keep=()):
     for key in ("await", "notice", "disc", "bc_src", "qs", "qs_channel", "status_message_id"):
-        if key not in keep: context.user_data.pop(key, None)
+        if key not in keep:
+            _old = context.user_data.get(key, "<absent>")
+            context.user_data.pop(key, None)
+            _dbg(f"clear_interaction: popped key={key} old_value={_old}")
 
 
 def user_control(uid):
@@ -2583,10 +2610,15 @@ async def delete_temp(bot, chat_id, mid, seconds=5):
     key = (chat_id, mid)
     try:
         if seconds: await asyncio.sleep(seconds)
-        if key in _temp_messages: await bot.delete_message(chat_id, mid)
-    except Exception:
+        if key in _temp_messages:
+            _dbg(f"delete_temp: DELETING message_id={mid} chat_id={chat_id} after {seconds}s")
+            await bot.delete_message(chat_id, mid)
+    except Exception as e:
+        _dbg(f"delete_temp: FAILED to delete message_id={mid} chat_id={chat_id}: {type(e).__name__}: {e}")
         log.debug("temporary message deletion failed", exc_info=True)
-    finally: _temp_messages.discard(key)
+    finally:
+        _temp_messages.discard(key)
+        _dbg(f"delete_temp: DONE message_id={mid} in_temp_messages={key in _temp_messages}")
 
 
 def expire_temp(bot, chat_id, mid, seconds=5):
@@ -2595,9 +2627,11 @@ def expire_temp(bot, chat_id, mid, seconds=5):
 
 
 async def create_temp(bot, chat_id, text, temporary=True):
+    _dbg(f"create_temp: sending message to chat_id={chat_id} temporary={temporary} text={text[:60]!r}")
     task = asyncio.create_task(bot.send_message(chat_id, text[:4000], parse_mode=HTML, disable_web_page_preview=True))
     try: msg = await asyncio.shield(task)
     except asyncio.CancelledError:
+        _dbg(f"create_temp: CANCELLED during send to chat_id={chat_id}")
         try:
             msg = await task
             if temporary:
@@ -2606,57 +2640,119 @@ async def create_temp(bot, chat_id, text, temporary=True):
             else:
                 op = _current_operation.get()
                 if op: op.status_message_id = msg.message_id
-        except Exception: log.debug("cancelled status delivery failed", exc_info=True)
+                _dbg(f"create_temp: cancel-but-delivered message_id={msg.message_id} op.sm set")
+        except Exception as e:
+            _dbg(f"create_temp: cancel delivery failed: {e}")
+            log.debug("cancelled status delivery failed", exc_info=True)
         raise
     if temporary: _temp_messages.add((chat_id, msg.message_id))
+    _dbg(f"create_temp: SENT message_id={msg.message_id} temporary={temporary}")
     return msg.message_id
 
 
 async def operation_status(context, text, failed=False, terminal=False):
     op = _current_operation.get()
-    if not op: return False
+    if not op:
+        _dbg(f"operation_status: NO OP — _current_operation.get() is None, text={text[:60]!r}")
+        return False
     if not terminal: operation_checkpoint()
     op.failed = op.failed or failed
     async with op.status_lock:
         text = text[:4000]
-        if text == op.status_text: return True
+        if text == op.status_text:
+            _dbg(f"operation_status: SKIP (same text) op.status_message_id={op.status_message_id} user_data_sm={context.user_data.get('status_message_id')}")
+            return True
         try:
             if op.status_message_id is None:
-                op.status_message_id = context.user_data.get("status_message_id")
+                candidate_id = context.user_data.get("status_message_id")
+                if candidate_id is not None:
+                    try:
+                        await context.bot.edit_message_text(text, chat_id=op.chat_id, message_id=candidate_id, parse_mode=HTML, disable_web_page_preview=True)
+                    except BadRequest as check_err:
+                        err_msg = str(check_err).lower()
+                        if "not found" in err_msg or "deleted" in err_msg or "message to edit not found" in err_msg:
+                            _dbg(f"operation_status: stale status_message_id={candidate_id} - message deleted/not found")
+                            candidate_id = None
+                        elif "not modified" in err_msg:
+                            _dbg(f"operation_status: STATUS_MSG EXISTS (unchanged) id={candidate_id}")
+                            op.status_message_id = candidate_id
+                            op.status_text = text
+                            if terminal:
+                                _temp_messages.add((op.chat_id, candidate_id))
+                                expire_temp(context.bot, op.chat_id, candidate_id, 5)
+                            return True
+                        else:
+                            _dbg(f"operation_status: other BadRequest for candidate_id={candidate_id}: {check_err}")
+                            candidate_id = None
+                    else:
+                        _dbg(f"operation_status: STATUS_MSG EXISTS id={candidate_id}")
+                        op.status_message_id = candidate_id
+                        op.status_text = text
+                        if terminal:
+                            _temp_messages.add((op.chat_id, candidate_id))
+                            expire_temp(context.bot, op.chat_id, candidate_id, 5)
+                        return True
+                op.status_message_id = candidate_id
             if op.status_message_id is None:
+                _dbg(f"operation_status: CREATE NEW status message (op.sm={op.status_message_id}, ud_sm={context.user_data.get('status_message_id')}) text={text[:60]!r}")
                 op.status_message_id = await create_temp(context.bot, op.chat_id, text, temporary=False)
                 context.user_data["status_message_id"] = op.status_message_id
+                _dbg(f"operation_status: CREATED message_id={op.status_message_id}")
             else:
+                _dbg(f"operation_status: EDIT existing message_id={op.status_message_id} text={text[:60]!r}")
                 await context.bot.edit_message_text(text, chat_id=op.chat_id, message_id=op.status_message_id, parse_mode=HTML, disable_web_page_preview=True)
             op.status_text = text
             if terminal and op.status_message_id is not None:
                 _temp_messages.add((op.chat_id, op.status_message_id))
                 expire_temp(context.bot, op.chat_id, op.status_message_id, 5)
+                _dbg(f"operation_status: TERMINAL — scheduled 5s deletion of message_id={op.status_message_id}")
         except BadRequest as e:
+            _dbg(f"operation_status: BadRequest: {e} — message_id={op.status_message_id} text={text[:60]!r}")
             if "not modified" in str(e).lower(): op.status_text = text
+            elif "not found" in str(e).lower() or "deleted" in str(e).lower() or "message to edit not found" in str(e).lower():
+                _dbg(f"operation_status: message_id={op.status_message_id} deleted, creating new")
+                old_id = op.status_message_id
+                op.status_message_id = await create_temp(context.bot, op.chat_id, text, temporary=False)
+                context.user_data["status_message_id"] = op.status_message_id
+                op.status_text = text
+                _temp_messages.discard((op.chat_id, old_id))
+                if terminal:
+                    _temp_messages.add((op.chat_id, op.status_message_id))
+                    expire_temp(context.bot, op.chat_id, op.status_message_id, 5)
             else: log.debug("operation status rejected", exc_info=True)
-        except Exception: log.debug("operation status unavailable", exc_info=True)
+        except Exception as e:
+            _dbg(f"operation_status: EXCEPTION {type(e).__name__}: {e} — message_id={op.status_message_id}")
+            log.debug("operation status unavailable", exc_info=True)
     return True
 
 
 async def run_user_operation(update, context, kind, channel, work, show_status=False, replace=False, keep=()):
     uid = update.effective_user.id; lang = L(update)
+    _test_run_counter["n"] += 1
+    tag = f"TEST-{_test_run_counter['n']}"
+    _dbg(f"[{tag}] ENTER run_user_operation kind={kind} channel={channel} replace={replace} uid={uid} "
+         f"uid_in_ops={uid in _operations} status_msg_id={context.user_data.get('status_message_id')}")
     async with user_control(uid):
+        _dbg(f"[{tag}] ACQUIRED user_control lock uid={uid}")
         replaced_status = False
         if replace:
             replaced_status = await cancel_user_operation(uid)
+            _dbg(f"[{tag}] cancel_user_operation returned replaced_status={replaced_status}")
             clear_interaction(context, keep=keep)
         if uid in _operations:
+            _dbg(f"[{tag}] BLOCKED: uid {uid} still in _operations — op.status_message_id={getattr(_operations.get(uid), 'status_message_id', 'N/A')}")
             await popup(update, context, operation_text(lang, "busy"), alert=True)
             return
-        op = Operation(uid, channel, kind, update.effective_chat.id, replaced_status=replaced_status)
+        op = Operation(uid, channel, kind, update.effective_chat.id, replaced_status=replaced_status, debug_tag=tag)
         context.user_data.pop("status_message_id", None)  # clear stale status message from prior operation
+        _dbg(f"[{tag}] op created status_message_id={op.status_message_id} final_status={op.final_status}")
         async def run():
             token = _current_operation.set(op)
             outcome = "completed"
             try:
                 op.started = True
                 log_event("INFO", f"operation start type={kind} channel={channel}", uid)
+                _dbg(f"[{tag}] OPERATION START work={work}")
                 operation_checkpoint()
                 if show_status: await operation_status(context, operation_text(lang, "running"))
                 result = await work()
@@ -2664,14 +2760,18 @@ async def run_user_operation(update, context, kind, channel, work, show_status=F
                 if op.failed: outcome = "failed"
                 return result
             except asyncio.CancelledError:
+                _dbg(f"[{tag}] CancelledError in run_user_operation")
                 op.cancelled = True; outcome = "cancelled"
                 raise
-            except Exception:
+            except Exception as e:
+                _dbg(f"[{tag}] Exception in run: {type(e).__name__}: {e}")
                 op.failed = True; outcome = "failed"
                 op.final_status = False
                 log.exception("operation failed user=%s type=%s channel=%s", uid, kind, channel)
                 clear_interaction(context)
             finally:
+                _dbg(f"[{tag}] FINALLY: outcome={outcome} op.status_message_id={op.status_message_id} op.final_status={op.final_status} op.failed={op.failed} _operations_has_uid={uid in _operations}")
+                _dbg(f"[{tag}] OPERATION END outcome={outcome} status_message_id={op.status_message_id}")
                 try:
                     if outcome == "cancelled":
                         clear_interaction(context)
@@ -2683,13 +2783,18 @@ async def run_user_operation(update, context, kind, channel, work, show_status=F
                         await operation_status(context, operation_text(lang, "completed"), terminal=True)
                     log_event("ERROR" if outcome == "failed" else "INFO", f"operation {outcome} type={kind} channel={channel}", uid)
                 finally:
-                    if op.status_message_id is not None: context.user_data["status_message_id"] = op.status_message_id
+                    if op.status_message_id is not None:
+                        _dbg(f"[{tag}] Stashing status_message_id={op.status_message_id} into user_data before pop")
+                        context.user_data["status_message_id"] = op.status_message_id
                     if _operations.get(uid) is op: _operations.pop(uid, None)
+                    _dbg(f"[{tag}] AFTER POP: uid in _operations={uid in _operations} user_data status_msg_id={context.user_data.get('status_message_id')}")
                     _current_operation.reset(token)
         op.task = asyncio.create_task(run(), name=f"user:{uid}:{kind}")
         _operations[uid] = op
+        _dbg(f"[{tag}] _operations[{uid}] = op (status_message_id={op.status_message_id})")
     try: return await asyncio.shield(op.task)
     except asyncio.CancelledError:
+        _dbg(f"[{tag}] CancelledError at shield level")
         if not op.cancelled:
             op.cancelled = True
             if op.started: op.task.cancel()
@@ -2697,6 +2802,7 @@ async def run_user_operation(update, context, kind, channel, work, show_status=F
             try: await asyncio.shield(op.task)
             except asyncio.CancelledError: pass
     finally:
+        _dbg(f"[{tag}] EXIT run_user_operation. _operations has uid={uid in _operations}")
         if op.task.done() and _operations.get(uid) is op: _operations.pop(uid, None)
 
 
@@ -2770,20 +2876,28 @@ async def popup(update, context, text, alert=False):
         except Exception: pass
     await send_temp(context, update.effective_chat.id, text)
 async def render(update, context, text, kb=None, force_new=False):
+    op = _current_operation.get()
+    tag = getattr(op, 'debug_tag', '?')
     operation_checkpoint()
     notice = context.user_data.pop("notice", None)
+    _dbg(f"[{tag}] render ENTER text={text[:60]!r} force_new={force_new} has_qy={update.callback_query is not None} panel_msg={context.user_data.get('panel')}")
     if notice: await popup(update, context, notice)
     text = text[:4000]; markup = InlineKeyboardMarkup(kb) if kb else None; qy = update.callback_query; chat_id = update.effective_chat.id
     if qy and qy.message and not force_new:
-        try: await qy.edit_message_text(text, reply_markup=markup, parse_mode=HTML, disable_web_page_preview=True); context.user_data["panel"] = qy.message.message_id; return
+        _dbg(f"[{tag}] render: editing callback message_id={qy.message.message_id}")
+        try: await qy.edit_message_text(text, reply_markup=markup, parse_mode=HTML, disable_web_page_preview=True); context.user_data["panel"] = qy.message.message_id; _dbg(f"[{tag}] render: edited callback message OK"); return
         except BadRequest as e:
+            _dbg(f"[{tag}] render: BadRequest on qy.message.edit: {e}")
             if "not modified" in str(e).lower(): return
     mid = context.user_data.get("panel")
     if mid and not force_new:
-        try: await context.bot.edit_message_text(text, chat_id=chat_id, message_id=mid, reply_markup=markup, parse_mode=HTML, disable_web_page_preview=True); return
+        _dbg(f"[{tag}] render: editing panel message_id={mid}")
+        try: await context.bot.edit_message_text(text, chat_id=chat_id, message_id=mid, reply_markup=markup, parse_mode=HTML, disable_web_page_preview=True); _dbg(f"[{tag}] render: edited panel OK"); return
         except BadRequest as e:
+            _dbg(f"[{tag}] render: BadRequest on panel.edit: {e}")
             if "not modified" in str(e).lower(): return
-    m = await context.bot.send_message(chat_id, text, reply_markup=markup, parse_mode=HTML, disable_web_page_preview=True); context.user_data["panel"] = m.message_id
+    _dbg(f"[{tag}] render: SENDING NEW message (no panel)")
+    m = await context.bot.send_message(chat_id, text, reply_markup=markup, parse_mode=HTML, disable_web_page_preview=True); context.user_data["panel"] = m.message_id; _dbg(f"[{tag}] render: sent new message_id={m.message_id}")
 async def ask(update, context, prompt, kind, back, **extra):
     lang = L(update); context.user_data["await"] = {"kind": kind, "back": back, **extra}
     await render(update, context, f"✏️ {prompt}\n\n<i>{tr(lang, 'send_value')}</i>", [[B(tr(lang, "cancel"), "c:cancel")]])
@@ -3058,10 +3172,17 @@ async def run_test(update, context, cid):
     if not is_super(uid) and not rate_free(f"test:{cid}", TEST_COOLDOWN_SEC): await popup(update, context, tr(lang, "test_wait", n=rate_left(f"test:{cid}", TEST_COOLDOWN_SEC)), alert=True); return await view_channel(update, context, cid)
     try: await qy.answer(); context._callback_answered = True
     except Exception: pass
+    _op_dbg = _current_operation.get()
+    tag = _op_dbg.debug_tag if _op_dbg else "unknown"
+    _dbg(f"TEST START run_test tag={tag} cid={cid} uid={uid} op.status_message_id={getattr(_op_dbg, 'status_message_id', 'N/A')}")
     last = [0.0]; head = tr(lang, "test_head", title=esc(ch["title"]))
+    _dbg(f"[{tag}] ENTER run_test cid={cid} uid={uid} head={head[:40]!r} op.status_message_id={getattr(_op_dbg, 'status_message_id', 'N/A')}")
     async def progress(pct, txt):
-        if time.time() - last[0] < 1.6 and pct < 100: return
+        if time.time() - last[0] < 1.6 and pct < 100:
+            _dbg(f"[{tag}] progress SKIP rate-limited (last={last[0]:.1f} pct={pct} txt={txt[:40]!r})")
+            return
         last[0] = time.time()
+        _dbg(f"[{tag}] progress({pct}, {txt[:50]!r})")
         await operation_status(context, f"{head}\n\n{bar(pct)} <b>{pct}%</b>\n{esc(txt)}")
     await progress(1, tr(lang, "preparing"))
     model_labels = []; report_ai = _ai_status_reporter(context, lang)
@@ -3069,10 +3190,14 @@ async def run_test(update, context, cid):
         if event == "success" and label not in model_labels: model_labels.append(label)
         await report_ai(event, label, code)
     ai_token = _ai_events.set(ai_progress)
-    try: res = await run_channel_cycle(context.bot, uid, cid, test_mode=True, progress=progress)
+    try:
+        res = await run_channel_cycle(context.bot, uid, cid, test_mode=True, progress=progress)
+        _dbg(f"[{tag}] run_channel_cycle returned published={res.get('published')} queued={res.get('queued')}")
     except Exception as e:
+        _dbg(f"[{tag}] run_test EXCEPTION: {type(e).__name__}: {e}")
         log_event("ERROR", f"تست کانال {ch['title']}: {e}", uid); d = Diag(); d.add("ai_fail", err=ai_err_text(err_code(e), lang)); res = {"published": 0, "queued": 0, "links": [], "diag": d, "src": ""}
     except asyncio.CancelledError:
+        _dbg(f"[{tag}] run_test CancelledError")
         raise
     finally:
         _ai_events.reset(ai_token)
@@ -3088,9 +3213,13 @@ async def run_test(update, context, cid):
     model_line = ("Model: " if lang == "en" else "مدل: ") + esc(", ".join(model_labels)) if model_labels else ""
     if model_line: text += "\n" + model_line
     final = ("Test successful" if ok else "Test failed") if lang == "en" else ("تست موفق" if ok else "تست ناموفق")
+    _dbg(f"[{tag}] run_test sending terminal status: final={final!r} ok={ok} op={op} op.status_message_id={getattr(op, 'status_message_id', 'N/A')}")
     await operation_status(context, final + (" — " + model_line if model_line else ""), failed=not ok, terminal=True)
     if op: op.failed = not ok; op.final_status = True
+    _dbg(f"[{tag}] run_test set op.final_status=True op.status_message_id={op.status_message_id if op else 'N/A'}")
     kb.append([B(tr(lang, "back_panel"), f"a:ch:{cid}")]); await render(update, context, text, kb)
+    _dbg(f"[{tag}] EXIT run_test — render done, returning to run_user_operation finally block")
+    _dbg(f"TEST END run_test tag={tag} cid={cid} op.status_message_id={op.status_message_id if op else 'N/A'} final_status={getattr(op, 'final_status', 'N/A') if op else 'N/A'}")
 # ---------- پایان پنل مدیر میانی ----------
 # ============================================================
 # پنل مدیر کلان، dispatch (با محدودکننده‌ی نرخ)، ورودی‌ها، پشتیبانی، دیپ‌لینک، main
