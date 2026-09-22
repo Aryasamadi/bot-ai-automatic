@@ -2557,7 +2557,7 @@ def operation_checkpoint():
 
 
 def clear_interaction(context, keep=()):
-    for key in ("await", "notice", "disc", "bc_src", "qs", "qs_channel"):
+    for key in ("await", "notice", "disc", "bc_src", "qs", "qs_channel", "status_message_id"):
         if key not in keep: context.user_data.pop(key, None)
 
 
@@ -2579,7 +2579,7 @@ def operation_text(lang, key):
     return texts[key][1 if lang == "en" else 0]
 
 
-async def delete_temp(bot, chat_id, mid, seconds=8):
+async def delete_temp(bot, chat_id, mid, seconds=5):
     key = (chat_id, mid)
     try:
         if seconds: await asyncio.sleep(seconds)
@@ -2589,7 +2589,7 @@ async def delete_temp(bot, chat_id, mid, seconds=8):
     finally: _temp_messages.discard(key)
 
 
-def expire_temp(bot, chat_id, mid, seconds=8):
+def expire_temp(bot, chat_id, mid, seconds=5):
     task = asyncio.create_task(delete_temp(bot, chat_id, mid, seconds))
     _temp_tasks.add(task); task.add_done_callback(_temp_tasks.discard)
 
@@ -2629,6 +2629,9 @@ async def operation_status(context, text, failed=False, terminal=False):
             else:
                 await context.bot.edit_message_text(text, chat_id=op.chat_id, message_id=op.status_message_id, parse_mode=HTML, disable_web_page_preview=True)
             op.status_text = text
+            if terminal and op.status_message_id is not None:
+                _temp_messages.add((op.chat_id, op.status_message_id))
+                expire_temp(context.bot, op.chat_id, op.status_message_id, 5)
         except BadRequest as e:
             if "not modified" in str(e).lower(): op.status_text = text
             else: log.debug("operation status rejected", exc_info=True)
@@ -2647,6 +2650,7 @@ async def run_user_operation(update, context, kind, channel, work, show_status=F
             await popup(update, context, operation_text(lang, "busy"), alert=True)
             return
         op = Operation(uid, channel, kind, update.effective_chat.id, replaced_status=replaced_status)
+        context.user_data.pop("status_message_id", None)  # clear stale status message from prior operation
         async def run():
             token = _current_operation.set(op)
             outcome = "completed"
