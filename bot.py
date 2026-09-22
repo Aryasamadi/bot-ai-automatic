@@ -2574,6 +2574,7 @@ class Operation:
     ai_popup: bool = False
     status_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     debug_tag: str = ""
+    thinking_step: int = 0  # for Thinking... animation during operation
 
 
 def operation_checkpoint():
@@ -2598,6 +2599,24 @@ def thinking_animation(step):
     """Generate Thinking... animation with 1-3 dots based on step."""
     dots = "." * (1 + (step % 3))
     return f"Thinking{dots}"
+
+
+def strip_thinking_prefix(text):
+    """Remove Thinking... / فکر می‌کته... prefix from text for terminal status."""
+    # English patterns: Thinking., Thinking.., Thinking...
+    for dots in ["...", "..", "."]:
+        prefix = f"Thinking{dots}\n"
+        if text.startswith(prefix):
+            return text[len(prefix):]
+    # Persian patterns (matching make_status output)
+    # f"فکر می‌کته{dots.replace('.', '…')}\n" if "." in dots else f"فکر می‌کته{dots}\n"
+    # For dots=".", "..", "..." -> after replace becomes "..." -> فکر می‌کته…\n
+    # For other cases -> فکر می‌کته\n
+    persian_patterns = ["فکر می‌کته…\n", "فکر می‌کته\n"]
+    for pattern in persian_patterns:
+        if text.startswith(pattern):
+            return text[len(pattern):]
+    return text
 
 
 def make_status(lang, text, step=None):
@@ -2684,6 +2703,9 @@ async def operation_status(context, text, failed=False, terminal=False):
         if not hasattr(op, '_last_status_update'): op._last_status_update = 0
 
         text = text[:4000]
+        # When terminal, strip any Thinking prefix to ensure clean final status
+        if terminal:
+            text = strip_thinking_prefix(text)
         if text == op.status_text:
             _dbg(f"operation_status: SKIP (same text) op.status_message_id={op.status_message_id} user_data_sm={context.user_data.get('status_message_id')}")
             return True
@@ -2854,13 +2876,16 @@ async def cancel_user_operation(uid):
 def _ai_status_reporter(context, lang):
     async def report(event, label, code):
         name = esc(label); en = lang == "en"
+        # Human-readable model names: never show "public/default"
+        if name in ("مدل عمومی/پیش‌فرض", "Public/default model"):
+            name = "مدل عمومی" if lang != "en" else "Public model"
         texts = {
-            "busy": f"Model busy; waiting: {name}" if en else f"مدل مشغول است؛ در انتظار: {name}",
-            "start": f"Testing/using model: {name}" if en else f"در حال فراخوانی مدل: {name}",
-            "failure": (f"{name}: {ai_err_text(code, lang)}; checking the next model…" if en else f"{name}: {ai_err_text(code, lang)}؛ بررسی مدل بعدی…"),
-            "unavailable": f"Model unavailable: {name}; checking the next model…" if en else f"مدل قابل استفاده نیست: {name}؛ بررسی مدل بعدی…",
-            "no_test": "Selected Test Model is unset or unavailable; checking public models." if en else "Test Model منتخب تعیین نشده یا قابل استفاده نیست؛ بررسی مدل‌های عمومی.",
-            "success": f"AI response received — model: {name}" if en else f"پاسخ معتبر دریافت شد — مدل: {name}",
+            "busy": f"Waiting: {name}" if en else f"در انتظار: {name}",
+            "start": f"Using model: {name}" if en else f"در حال استفاده از مدل: {name}",
+            "failure": (f"{name}: {ai_err_text(code, lang)}; trying next…" if en else f"{name}: {ai_err_text(code, lang)}؛ مدل دیگر در حال بررسی…"),
+            "unavailable": f"Model unavailable: {name}" if en else f"مدل موجود نیست: {name}",
+            "no_test": "Using public models." if en else "مدل‌های عمومی در استفاده." if lang != "en" else "Using public models.",
+            "success": f"Response from: {name}" if en else f"پاسخ دریافت شد از: {name}",
             "failed": ai_err_text(code, lang),
         }
         await operation_status(context, texts[event])
@@ -3247,11 +3272,11 @@ async def run_test(update, context, cid):
     op = _current_operation.get()
     model_line = ("Model: " if lang == "en" else "مدل: ") + esc(", ".join(model_labels)) if model_labels else ""
     links_count = len(res.get('links', []))
-    # Terminal status: same message, just with final result
+    # Terminal status: clean final message (Thinking prefix will be stripped by operation_status)
     if ok:
-        final = f"✅ {thinking_animation(0)}\n{tr(lang, 'test_summary_ok', n=links_count)}"
+        final = tr(lang, 'test_summary_ok', n=links_count)
     else:
-        final = f"⚠️ {thinking_animation(2)}\n{tr(lang, 'test_summary_fail')}"
+        final = tr(lang, 'test_summary_fail')
     if model_line: final += "\n\n" + model_line
     _dbg(f"[{tag}] run_test sending terminal status: final={final!r} ok={ok} op={op} op.status_message_id={getattr(op, 'status_message_id', 'N/A')}")
     await operation_status(context, final, failed=not ok, terminal=True)
