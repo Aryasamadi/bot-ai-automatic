@@ -4,7 +4,6 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: write
   contents: read
 
 jobs:
@@ -30,18 +29,11 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           SUPER_ADMIN_IDS: ${{ secrets.SUPER_ADMIN_IDS }}
+
+          # Cloudflare
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_D1_ID: ${{ secrets.CF_D1_ID }}
+          CF_KV_ID: ${{ secrets.CF_KV_ID }}
+
         run: python bot.py
-
-  restart:
-    if: always()
-    needs: run-bot
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Restart bot workflow
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh workflow run bot.yml \
-            --repo "${{ github.repository }}" \
-            --ref "${{ github.ref_name }}"
