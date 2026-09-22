@@ -27,7 +27,7 @@ jobs:
 
       - name: Run bot
         env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           SUPER_ADMIN_IDS: ${{ secrets.SUPER_ADMIN_IDS }}
 
           # Cloudflare
