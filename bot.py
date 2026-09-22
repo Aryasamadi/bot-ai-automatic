@@ -2469,6 +2469,7 @@ TXT = {
     # ---- تست
     "test_head": ("🧪 <b>تست — {title}</b>", "🧪 <b>Test — {title}</b>"), "preparing": ("آماده‌سازی…", "Preparing…"), "test_wait": ("⏳ تست بعدی تا {n} ثانیه دیگر", "⏳ Next test in {n}s"), "test_busy": ("⏳ چرخه‌ای روی این کانال در حال اجراست", "⏳ A cycle is already running on this channel"),
     "test_ok": ("✅ <b>منتشر شد</b>", "✅ <b>Published</b>"), "test_queued": ("📝 در <b>صف انتشار</b> منتظر تأیید (حالت بازبینی)", "📝 Waiting in <b>publish queue</b> (review mode)"), "test_fail": ("⚠️ <b>چیزی منتشر نشد</b>", "⚠️ <b>Nothing published</b>"),
+    "test_summary_ok": ("{n} مقاله موفقانه منتشر شد", "{n} articles published successfully"), "test_summary_fail": ("تست ناموفق بود", "Test failed"),
     "test_log": ("📋 {d}", "📋 {d}"), "test_quota_note": ("ℹ️ سهمیه‌ی تست فقط با انتشار موفق کسر می‌شود", "ℹ️ Test quota is deducted only on success"), "back_panel": ("🔙 پنل کانال", "🔙 Channel panel"),
     "test_retry_note": ("ℹ️ سهمیه و محدودیت زمانی اعمال نشد؛ می‌توانید همین حالا دوباره تست کنید.", "ℹ️ No quota or cooldown was applied; you can retry right away."),
     "test_src": ("🌐 تولید از منبع: <b>{name}</b>", "🌐 Generated from source: <b>{name}</b>"),
@@ -2593,6 +2594,22 @@ def user_control(uid):
     return _user_controls[uid]
 
 
+def thinking_animation(step):
+    """Generate Thinking... animation with 1-3 dots based on step."""
+    dots = "." * (1 + (step % 3))
+    return f"Thinking{dots}"
+
+
+def make_status(lang, text, step=None):
+    """Format status with Thinking animation."""
+    if step is not None:
+        dots = "." * (1 + (step % 3))
+        prefix = f"Thinking{dots}\n" if lang == "en" else f"فکر می‌کند{dots.replace('.', '…')}\n" if "." in dots else f"فکر می‌کند{dots}\n"
+    else:
+        prefix = ""
+    return f"{prefix}{text}"
+
+
 def operation_text(lang, key):
     texts = {
         "running": ("⚙️ در حال پردازش…", "⚙️ Processing…"),
@@ -2658,6 +2675,14 @@ async def operation_status(context, text, failed=False, terminal=False):
     if not terminal: operation_checkpoint()
     op.failed = op.failed or failed
     async with op.status_lock:
+        # Rate-limit status updates to avoid Telegram flood
+        now = time.time()
+        if hasattr(op, '_last_status_update') and now - op._last_status_update < 0.5:
+            if text == op.status_text:
+                _dbg(f"operation_status: SKIP (rate-limited, same text) op.status_message_id={op.status_message_id}")
+                return True
+        if not hasattr(op, '_last_status_update'): op._last_status_update = 0
+
         text = text[:4000]
         if text == op.status_text:
             _dbg(f"operation_status: SKIP (same text) op.status_message_id={op.status_message_id} user_data_sm={context.user_data.get('status_message_id')}")
@@ -2677,6 +2702,7 @@ async def operation_status(context, text, failed=False, terminal=False):
                             _dbg(f"operation_status: STATUS_MSG EXISTS (unchanged) id={candidate_id}")
                             op.status_message_id = candidate_id
                             op.status_text = text
+                            op._last_status_update = time.time()
                             if terminal:
                                 _temp_messages.add((op.chat_id, candidate_id))
                                 expire_temp(context.bot, op.chat_id, candidate_id, 5)
@@ -2688,6 +2714,7 @@ async def operation_status(context, text, failed=False, terminal=False):
                         _dbg(f"operation_status: STATUS_MSG EXISTS id={candidate_id}")
                         op.status_message_id = candidate_id
                         op.status_text = text
+                        op._last_status_update = time.time()
                         if terminal:
                             _temp_messages.add((op.chat_id, candidate_id))
                             expire_temp(context.bot, op.chat_id, candidate_id, 5)
@@ -2697,10 +2724,12 @@ async def operation_status(context, text, failed=False, terminal=False):
                 _dbg(f"operation_status: CREATE NEW status message (op.sm={op.status_message_id}, ud_sm={context.user_data.get('status_message_id')}) text={text[:60]!r}")
                 op.status_message_id = await create_temp(context.bot, op.chat_id, text, temporary=False)
                 context.user_data["status_message_id"] = op.status_message_id
+                op._last_status_update = time.time()
                 _dbg(f"operation_status: CREATED message_id={op.status_message_id}")
             else:
                 _dbg(f"operation_status: EDIT existing message_id={op.status_message_id} text={text[:60]!r}")
                 await context.bot.edit_message_text(text, chat_id=op.chat_id, message_id=op.status_message_id, parse_mode=HTML, disable_web_page_preview=True)
+                op._last_status_update = time.time()
             op.status_text = text
             if terminal and op.status_message_id is not None:
                 _temp_messages.add((op.chat_id, op.status_message_id))
@@ -2708,13 +2737,16 @@ async def operation_status(context, text, failed=False, terminal=False):
                 _dbg(f"operation_status: TERMINAL — scheduled 5s deletion of message_id={op.status_message_id}")
         except BadRequest as e:
             _dbg(f"operation_status: BadRequest: {e} — message_id={op.status_message_id} text={text[:60]!r}")
-            if "not modified" in str(e).lower(): op.status_text = text
+            if "not modified" in str(e).lower():
+                op.status_text = text
+                op._last_status_update = time.time()
             elif "not found" in str(e).lower() or "deleted" in str(e).lower() or "message to edit not found" in str(e).lower():
                 _dbg(f"operation_status: message_id={op.status_message_id} deleted, creating new")
                 old_id = op.status_message_id
                 op.status_message_id = await create_temp(context.bot, op.chat_id, text, temporary=False)
                 context.user_data["status_message_id"] = op.status_message_id
                 op.status_text = text
+                op._last_status_update = time.time()
                 _temp_messages.discard((op.chat_id, old_id))
                 if terminal:
                     _temp_messages.add((op.chat_id, op.status_message_id))
@@ -3183,7 +3215,10 @@ async def run_test(update, context, cid):
             return
         last[0] = time.time()
         _dbg(f"[{tag}] progress({pct}, {txt[:50]!r})")
-        await operation_status(context, f"{head}\n\n{bar(pct)} <b>{pct}%</b>\n{esc(txt)}")
+        # Use friendly status messages with Thinking animation
+        dots = "." * (1 + (int(pct / 20) % 3))
+        thinking = f"Thinking{dots}"
+        await operation_status(context, f"{thinking}\n{txt}")
     await progress(1, tr(lang, "preparing"))
     model_labels = []; report_ai = _ai_status_reporter(context, lang)
     async def ai_progress(event, label, code):
@@ -3211,10 +3246,15 @@ async def run_test(update, context, cid):
     else: text = f"{tr(lang, 'test_fail')}{src_line}\n\n{tr(lang, 'test_log', d=diag)}\n\n{tr(lang, 'test_retry_note')}"; kb.append([B(tr(lang, "rejected"), f"a:rej:{cid}"), B(tr(lang, "sched"), f"a:sch:{cid}")])
     op = _current_operation.get()
     model_line = ("Model: " if lang == "en" else "مدل: ") + esc(", ".join(model_labels)) if model_labels else ""
-    if model_line: text += "\n" + model_line
-    final = ("Test successful" if ok else "Test failed") if lang == "en" else ("تست موفق" if ok else "تست ناموفق")
+    links_count = len(res.get('links', []))
+    # Terminal status: same message, just with final result
+    if ok:
+        final = f"✅ {thinking_animation(0)}\n{tr(lang, 'test_summary_ok', n=links_count)}"
+    else:
+        final = f"⚠️ {thinking_animation(2)}\n{tr(lang, 'test_summary_fail')}"
+    if model_line: final += "\n\n" + model_line
     _dbg(f"[{tag}] run_test sending terminal status: final={final!r} ok={ok} op={op} op.status_message_id={getattr(op, 'status_message_id', 'N/A')}")
-    await operation_status(context, final + (" — " + model_line if model_line else ""), failed=not ok, terminal=True)
+    await operation_status(context, final, failed=not ok, terminal=True)
     if op: op.failed = not ok; op.final_status = True
     _dbg(f"[{tag}] run_test set op.final_status=True op.status_message_id={op.status_message_id if op else 'N/A'}")
     kb.append([B(tr(lang, "back_panel"), f"a:ch:{cid}")]); await render(update, context, text, kb)
