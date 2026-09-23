@@ -1487,7 +1487,27 @@ def _html_links(soup, base_url, limit):
         if a.find_parent(["nav", "header", "footer", "aside"]): sc -= 3
         if sc < 4: continue
         seen.add(href); scored.append((sc, {"url": href, "title": title[:200], "published": None, "html": "", "media": None}))
-    scored.sort(key=lambda x: -x[0]); return [x[1] for x in scored[:limit]]
+    scored.sort(key=lambda x: -x[0])
+    if scored:
+        return [x[1] for x in scored[:limit]]
+    # Fallback برای سایت‌هایی که ساختار لینک‌شان استاندارد خبر نیست:
+    # شکست امتیازدهی نباید کل منبع را «غیرقابل استفاده» اعلام کند.
+    fallback, seen = [], set()
+    blocked = re.compile(r"^(tag|tags|category|categories|author|page|login|search|feed|rss|about|contact|privacy|terms|account|subscribe|signup|register)(/|$)", re.I)
+    for a in soup.find_all("a", href=True):
+        try: href = clean_url(urljoin(base_url, a["href"]))
+        except Exception: continue
+        if href in seen or hostname(href) != base: continue
+        p = urlparse(href); path = p.path.strip("/")
+        if not path or len(path) < 4 or blocked.search(path): continue
+        if re.search(r"\.(jpe?g|png|gif|pdf|mp4|zip|xml|css|js)(?:$|\?)", path, re.I): continue
+        title = re.sub(r"\s+", " ", a.get_text(" ", strip=True))
+        if not title and a.img: title = (a.img.get("alt") or a.img.get("title") or "").strip()
+        if len(title) < 10: continue
+        seen.add(href)
+        fallback.append({"url": href, "title": title[:200], "published": None, "html": "", "media": None})
+        if len(fallback) >= limit: break
+    return fallback
 # --- منابع API (برای سایت‌هایی که مدیر خودش API می‌دهد) — نقشه‌بردار عمومی: هر ساختار JSON را می‌فهمد
 API_ARRAY_KEYS = ("articles", "items", "results", "data", "posts", "news", "response", "docs", "entries", "stories", "hits", "records", "list", "feed")
 def _api_pick_list(j, depth=0):
@@ -1613,16 +1633,24 @@ def _probe_status(e):
     r = getattr(e, "response", None); st = getattr(r, "status_code", None)
     return int(st) if isinstance(st, int) else 0
 async def probe_source(src, lang="fa", added=False):
-    """تستِ بارگذاریِ منبع؛ خروجی: (ok, متنِ پاپ‌آپ). هر شکستی ⇒ منبع 🔴 خاموش می‌شود و دلیلِ کوتاه اعلام می‌گردد."""
-    off = tr(lang, "src_added_off" if added else "src_now_off")
+    """تست منبع بدون خاموش‌کردن خودکار در خطاهای موقت یا کشف‌نشدن مقاله.
+    فقط پاسخ‌های صریحاً مسدود/ناموجود منبع را خاموش می‌کنیم؛ خطای DNS، timeout، 5xx
+    یا ساختار غیرمعمول سایت نباید منبع سالم را برای همیشه 🔴 کند.
+    """
     try:
         items, _, m = await discover_source(src, use_cache=False)
     except Exception as e:
-        set_source_active(src["id"], False, "active")
-        return False, tr(lang, "src_403" if _probe_status(e) in (401, 403, 406, 451) else "src_dead") + off
+        status = _probe_status(e)
+        if status in (401, 403, 406, 410, 451):
+            set_source_active(src["id"], False, "active")
+            off = tr(lang, "src_added_off" if added else "src_now_off")
+            return False, tr(lang, "src_403" if status in (401, 403, 406, 451) else "src_dead") + off
+        # خطاهای موقت/شبکه‌ای: منبع را خاموش نکن.
+        source_fail(src["id"], e)
+        return False, ("⚠️ تست موقتاً ناموفق بود؛ منبع خاموش نشد. بعداً دوباره امتحان می‌شود." if lang != "en" else "⚠️ The temporary test failed; the source was not turned off. It will be retried later.")
     if not items:
-        set_source_active(src["id"], False, "active")
-        return False, tr(lang, "src_dead") + off
+        # نبودن آیتم در تستِ صفحه‌ی اصلی به‌تنهایی ثابت نمی‌کند منبع خراب است.
+        return False, ("⚠️ سایت پاسخ داد، اما فعلاً مقاله‌ای قابل شناسایی پیدا نشد؛ منبع خاموش نشد. RSS/API یا آدرس بخش خبر را می‌توانید تنظیم کنید." if lang != "en" else "⚠️ The site responded, but no recognizable articles were found yet; the source was not turned off. You can set its RSS/API or news-section URL.")
     return True, tr(lang, "src_added", n=len(items), m=m)
 # ============================================================
 # استخراج متن مقاله — trafilatura → بلوک‌های HTML → محتوای فید (در ترد جدا تا حلقه‌ی رویداد مسدود نشود)
@@ -3942,7 +3970,12 @@ async def handle_input(update, context, st):
                 await popup(update, context, tr(lang, "notfound"), alert=True)
                 return await dispatch(update, context, back)
             result = tr(lang, "my_ai_added" if own else "s_model_added", name=esc(name), res=(tr(lang, "saved") if ok else ai_err_text(err_code(out), lang)) + f" ({t}s)")
-            await operation_status(context, result, failed=not ok)
+            # نتیجه‌ی تست مدل باید پایان واقعی وضعیت باشد؛ نباید پیام نهایی دوباره
+            # با Thinking... بازنویسی شود یا animation بعد از پایان ادامه پیدا کند.
+            op = _current_operation.get()
+            if op:
+                await operation_status(context, result, failed=not ok, terminal=True)
+                op.final_status = True
             await popup(update, context, result, alert=not ok)
             return await dispatch(update, context, f"a:myai_v:{mid}" if own else back)
         elif st["wiz"] == "disc_add":
@@ -4304,4 +4337,5 @@ def main():
     APP.add_handler(CallbackQueryHandler(on_callback)); APP.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_message)); APP.add_error_handler(on_error)
     log.info("در حال اجرا…"); APP.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
 if __name__ == "__main__": main()
-# ---------- پایان فایل newsbot.py ---------
+# ---------- پایان فایل newsbot.py ----------
+
