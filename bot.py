@@ -3,7 +3,7 @@
 NewsBot v3 — یک‌فایل کامل: هسته‌ی داده، موتور محتوا، رابط کاربری، پنل مدیر کلان
 نیازمندی‌ها: python-telegram-bot[job-queue]>=21, httpx, feedparser, trafilatura, beautifulsoup4, lxml
 """
-import os, re, json, html, time, random, asyncio, logging, sqlite3, hashlib, secrets, tempfile, threading, ipaddress, socket
+import os, re, json, html, time, random, asyncio, logging, sqlite3, hashlib, secrets, tempfile, threading, ipaddress, socket, gzip
 from datetime import datetime, timedelta, timezone
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -24,9 +24,15 @@ MAX_ARTICLE_CHARS = int(os.getenv("MAX_ARTICLE_CHARS", "28000"))
 MAX_ARTICLE_PAGES = int(os.getenv("MAX_ARTICLE_PAGES", "3"))
 AI_INPUT_TEXT_CHARS = int(os.getenv("AI_INPUT_TEXT_CHARS", "8000"))  # limit on article text sent to the model
 CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "")
-CF_KV_NAMESPACE_ID = os.getenv("CF_KV_NAMESPACE_ID", "")
+CF_D1_ID = os.getenv("CF_D1_ID", "") or os.getenv("CF_DATABASE_ID", "")
+CF_KV_NAMESPACE_ID = os.getenv("CF_KV_NAMESPACE_ID", "") or os.getenv("CF_KV_ID", "")
 CF_API_TOKEN = os.getenv("CF_API_TOKEN", "")
 CF_ENABLED = bool(CF_ACCOUNT_ID and CF_KV_NAMESPACE_ID and CF_API_TOKEN)
+CF_D1_ENABLED = bool(CF_ACCOUNT_ID and CF_D1_ID and CF_API_TOKEN)
+CF_DB_SNAPSHOT_KEY = "newsbot:v3:db:latest"
+CF_DB_BACKUP_SECONDS = max(60, int(os.getenv("CF_DB_BACKUP_SECONDS", "300")))
+_last_cloud_db_backup = 0.0
+_last_cloud_db_mtime = 0.0
 DEFAULT_UTC_OFFSET = float(os.getenv("DEFAULT_UTC_OFFSET", "3.5"))   # تهران
 BOT_USERNAME = ""
 NOTIFY_SUPER = None          # async fn(text, kb=None)   — پایین‌تر در لایه‌ی پشتیبانی ست می‌شود
@@ -762,19 +768,25 @@ def http():
 _PRIVATE_HOSTS = ("localhost", "metadata.google.internal")
 _host_ok = {}
 def public_url(u):
-    """آدرس بیرونی و امن است؟ DNS ناموفق یا هر IP غیرعمومی ⇒ رد می‌شود (SSRF fail-closed)."""
+    """آدرس HTTP/HTTPS قابل دریافت است؟
+
+    منابع این ربات توسط مدیر ثبت می‌شوند. قبلاً اینجا قبل از هر درخواست DNS
+    را با socket.getaddrinfo بررسی می‌کردیم؛ روی runnerهای GitHub این بررسی
+    گاهی به‌علت DNS/proxy شکست می‌خورد و حتی سایت‌های کاملاً عمومی را رد می‌کرد.
+    برای حفظ دسترسی به سایت‌های واقعی، فقط hostname/IPهای صریحاً محلی را
+    رد می‌کنیم و DNS را دوباره در لایه HTTP به عهده می‌گذاریم.
+    """
     try: p = urlparse(str(u))
     except Exception: return False
     if p.scheme not in ("http", "https") or not p.hostname: return False
     host = p.hostname.rstrip(".").lower()
     if host in _PRIVATE_HOSTS or host.endswith((".local", ".internal", ".localhost")): return False
-    try: addrs = [i[4][0] for i in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)]
-    except Exception: return False
-    if not addrs: return False
-    for a in addrs:
-        try: ip = ipaddress.ip_address(a)
-        except Exception: return False
+    try:
+        ip = ipaddress.ip_address(host)
         if not ip.is_global: return False
+    except ValueError:
+        # Domain names are intentionally allowed without a second local DNS lookup.
+        pass
     return True
 
 async def fetch(url, **kw):
@@ -820,6 +832,86 @@ async def kv_get(key):
     try:
         r = await http().get(CF_BASE + key, headers={"Authorization": f"Bearer {CF_API_TOKEN}"}); return r.text if r.status_code == 200 else None
     except Exception as e: log_event("ERROR", f"KV get: {e}"); return None
+async def kv_put_bytes(key, value):
+    try:
+        r = await http().put(CF_BASE + key, content=value, headers={"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/octet-stream"})
+        return r.status_code == 200
+    except Exception as e:
+        log_event("ERROR", f"KV binary put: {e}"); return False
+async def kv_get_bytes(key):
+    try:
+        r = await http().get(CF_BASE + key, headers={"Authorization": f"Bearer {CF_API_TOKEN}"})
+        return r.content if r.status_code == 200 else None
+    except Exception as e:
+        log_event("ERROR", f"KV binary get: {e}"); return None
+async def cloud_db_restore():
+    """بازیابی DB محلیِ runner از آخرین snapshot دائمی KV، فقط وقتی DB تازه/خالی است."""
+    global _conn
+    if not CF_ENABLED: return False
+    try:
+        if q("SELECT COUNT(*) c FROM users", one=True)["c"] or q("SELECT COUNT(*) c FROM channels", one=True)["c"] or q("SELECT COUNT(*) c FROM ai_models", one=True)["c"]:
+            return False
+        packed = await kv_get_bytes(CF_DB_SNAPSHOT_KEY)
+        if not packed: return False
+        raw = await asyncio.to_thread(gzip.decompress, packed)
+        mem = sqlite3.connect(":memory:")
+        try:
+            mem.deserialize(raw)
+            with _lock:
+                if _conn is not None:
+                    _conn.close(); _conn = None
+                for suffix in ("", "-wal", "-shm"):
+                    try: os.remove(DB_FILE + suffix)
+                    except FileNotFoundError: pass
+                dst = sqlite3.connect(DB_FILE)
+                mem.backup(dst)
+                dst.close()
+                db()
+        finally:
+            mem.close()
+        log.info("Cloudflare KV: local database restored")
+        return True
+    except Exception as e:
+        log_event("WARN", f"Cloud DB restore failed: {e}")
+        return False
+async def cloud_db_backup(force=False):
+    """ذخیره‌ی snapshot فشرده‌ی SQLite در KV تا restart runner داده‌ها را از بین نبرد."""
+    global _last_cloud_db_backup, _last_cloud_db_mtime
+    if not CF_ENABLED or not os.path.exists(DB_FILE): return False
+    now = time.time(); mtime = os.path.getmtime(DB_FILE)
+    if not force and now - _last_cloud_db_backup < CF_DB_BACKUP_SECONDS and mtime <= _last_cloud_db_mtime: return False
+    try:
+        with _lock:
+            mem = sqlite3.connect(":memory:")
+            try:
+                db().execute("PRAGMA wal_checkpoint(PASSIVE)")
+                db().backup(mem)
+                raw = mem.serialize()
+            finally:
+                mem.close()
+        packed = await asyncio.to_thread(gzip.compress, raw, 6)
+        if await kv_put_bytes(CF_DB_SNAPSHOT_KEY, packed):
+            _last_cloud_db_backup = now; _last_cloud_db_mtime = mtime
+            log.info("Cloudflare KV: database snapshot saved (%d -> %d bytes)", len(raw), len(packed))
+            return True
+    except Exception as e:
+        log_event("WARN", f"Cloud DB backup failed: {e}")
+    return False
+async def cloud_d1_check():
+    """فقط اتصال D1 را بررسی می‌کند؛ داده‌های ربات همچنان در SQLite محلی + snapshot KV نگهداری می‌شوند."""
+    if not CF_D1_ENABLED: return False
+    try:
+        url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/d1/database/{CF_D1_ID}/query"
+        r = await http().post(url, json={"sql": "SELECT 1 AS ok"}, headers={"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"})
+        ok = r.status_code == 200 and bool(r.json().get("success"))
+        if not ok: log_event("WARN", f"Cloudflare D1 check failed: HTTP {r.status_code} {r.text[:180]}")
+        else: log.info("Cloudflare D1: connection OK")
+        return ok
+    except Exception as e:
+        log_event("WARN", f"Cloudflare D1 check failed: {e}"); return False
+async def cloud_db_backup_job(context):
+    try: await cloud_db_backup()
+    except Exception as e: log_event("WARN", f"cloud backup job: {e}")
 async def store_deeplink(admin_id, payload):
     """payload: {short, full, title, url, show_source, media:{url,kind}|None, ts}"""
     key = secrets.token_urlsafe(6); data = json.dumps(payload, ensure_ascii=False); saved_cf = CF_ENABLED and await kv_put(key, data)
@@ -2836,9 +2928,8 @@ async def run_user_operation(update, context, kind, channel, work, show_status=F
                     op.terminalized = True
                     if op.thinking_task and not op.thinking_task.done(): op.thinking_task.cancel()
                     op.thinking_task = None
-                    if op.status_message_id is not None:
-                        _dbg(f"[{tag}] Stashing status_message_id={op.status_message_id} into user_data before pop")
-                        context.user_data["status_message_id"] = op.status_message_id
+                    # The terminal status is temporary. Never carry its message id into the next operation.
+                    context.user_data.pop("status_message_id", None)
                     if _operations.get(uid) is op: _operations.pop(uid, None)
                     _dbg(f"[{tag}] AFTER POP: uid in _operations={uid in _operations} user_data status_msg_id={context.user_data.get('status_message_id')}")
                     _current_operation.reset(token)
@@ -4085,7 +4176,7 @@ async def _ack(msg, fallback_text, kb=None):
     except Exception:
         try: await msg.reply_text(fallback_text, reply_markup=kb)
         except Exception: pass
-async def send_temp(context, chat_id, text, seconds=10):
+async def send_temp(context, chat_id, text, seconds=5):
     try: mid = await create_temp(context.bot, chat_id, text)
     except Exception:
         log.debug("temporary message send failed", exc_info=True)
@@ -4183,13 +4274,19 @@ async def job_tick(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e: log_event("ERROR", f"scheduler: {e}")
 async def post_init(app: Application):
     global BOT_USERNAME, NOTIFY_SUPER, NOTIFY_USER
+    restored = await cloud_db_restore()
+    d1_ok = await cloud_d1_check()
     me = await app.bot.get_me(); BOT_USERNAME = me.username; NOTIFY_SUPER = notify_supers; NOTIFY_USER = notify_user_fn
     await app.bot.set_my_commands([BotCommand("start", "منوی اصلی"), BotCommand("create", "پنل مدیریت / پلن"), BotCommand("man", "پشتیبانی"), BotCommand("about", "درباره"), BotCommand("lang", "زبان"), BotCommand("help", "راهنما"), BotCommand("cancel", "لغو عملیات")], language_code="fa")
     await app.bot.set_my_commands([BotCommand("start", "Main menu"), BotCommand("create", "Admin panel / plan"), BotCommand("man", "Support"), BotCommand("about", "About"), BotCommand("lang", "Language"), BotCommand("help", "Help"), BotCommand("cancel", "Cancel action")])
-    app.job_queue.run_repeating(job_tick, interval=TICK_SECONDS, first=15, name="tick"); log_event("INFO", f"ربات @{me.username} راه‌اندازی شد")
-    await notify_supers(f"🚀 @{me.username} راه‌اندازی شد · 🤖 مدل‌های فعال {len(list_models(True))} · CF KV {'✅' if CF_ENABLED else '❌'} · تیک هر {TICK_SECONDS}s · AI×{AI_CONCURRENCY} CYCLE×{CYCLE_CONCURRENCY}")
+    app.job_queue.run_repeating(job_tick, interval=TICK_SECONDS, first=15, name="tick")
+    if CF_ENABLED: app.job_queue.run_repeating(cloud_db_backup_job, interval=CF_DB_BACKUP_SECONDS, first=60, name="cloud-db-backup")
+    log_event("INFO", f"ربات @{me.username} راه‌اندازی شد")
+    await notify_supers(f"🚀 @{me.username} راه‌اندازی شد · 🤖 مدل‌های فعال {len(list_models(True))} · CF KV {'✅' if CF_ENABLED else '❌'} · D1 {'✅' if d1_ok else '❌'} · DB restore {'✅' if restored else '—'} · تیک هر {TICK_SECONDS}s · AI×{AI_CONCURRENCY} CYCLE×{CYCLE_CONCURRENCY}")
 async def post_shutdown(app: Application):
     global _http
+    try: await cloud_db_backup(force=True)
+    except Exception as e: log_event("WARN", f"final cloud backup: {e}")
     if _http:
         try: await _http.aclose()
         except Exception: pass
@@ -4207,5 +4304,4 @@ def main():
     APP.add_handler(CallbackQueryHandler(on_callback)); APP.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_message)); APP.add_error_handler(on_error)
     log.info("در حال اجرا…"); APP.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
 if __name__ == "__main__": main()
-# ---------- پایان فایل newsbot.py ----------
-
+# ---------- پایان فایل newsbot.py ---------
