@@ -13,7 +13,7 @@ import httpx, feedparser, trafilatura
 from bs4 import BeautifulSoup
 #  ============================================================
 # تنظیمات محیطی
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN", "")
 SUPER_ADMIN_IDS = {int(x) for x in os.getenv("SUPER_ADMIN_IDS", "").split(",") if x.strip().isdigit() and int(x) > 0}
 DB_FILE = os.getenv("DB_FILE", "newsbot.db")
 DATA_TTL_HOURS = int(os.getenv("DATA_TTL_HOURS", "24"))
@@ -24,15 +24,9 @@ MAX_ARTICLE_CHARS = int(os.getenv("MAX_ARTICLE_CHARS", "28000"))
 MAX_ARTICLE_PAGES = int(os.getenv("MAX_ARTICLE_PAGES", "3"))
 AI_INPUT_TEXT_CHARS = int(os.getenv("AI_INPUT_TEXT_CHARS", "8000"))  # limit on article text sent to the model
 CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "")
-CF_D1_ID = os.getenv("CF_D1_ID", "") or os.getenv("CF_DATABASE_ID", "")
-CF_KV_NAMESPACE_ID = os.getenv("CF_KV_NAMESPACE_ID", "") or os.getenv("CF_KV_ID", "")
+CF_KV_NAMESPACE_ID = os.getenv("CF_KV_NAMESPACE_ID") or os.getenv("CF_KV_ID", "")
 CF_API_TOKEN = os.getenv("CF_API_TOKEN", "")
 CF_ENABLED = bool(CF_ACCOUNT_ID and CF_KV_NAMESPACE_ID and CF_API_TOKEN)
-CF_D1_ENABLED = bool(CF_ACCOUNT_ID and CF_D1_ID and CF_API_TOKEN)
-CF_DB_SNAPSHOT_KEY = "newsbot:v3:db:latest"
-CF_DB_BACKUP_SECONDS = max(60, int(os.getenv("CF_DB_BACKUP_SECONDS", "300")))
-_last_cloud_db_backup = 0.0
-_last_cloud_db_mtime = 0.0
 DEFAULT_UTC_OFFSET = float(os.getenv("DEFAULT_UTC_OFFSET", "3.5"))   # تهران
 BOT_USERNAME = ""
 NOTIFY_SUPER = None          # async fn(text, kb=None)   — پایین‌تر در لایه‌ی پشتیبانی ست می‌شود
@@ -41,6 +35,8 @@ SCHED_NOTIF_FAILURES = False # when True, notify_user() re-raises send failures 
 UTC = timezone.utc
 CAPTION_LIMIT, MSG_LIMIT = 1024, 4096
 SOURCE_COOLDOWN_MIN = 10     # حداقل فاصله‌ی دو بررسی یک منبع در حالت خودکار
+SOURCE_FAIL_LIMIT = 3         # فقط پس از چند شکست متوالی، منبع خاموش می‌شود
+PERSIST_INTERVAL_SECONDS = max(60, int(os.getenv("PERSIST_INTERVAL_SECONDS", "300")))
 MODEL_PROBE_MIN = 10
 MIN_INTERVAL = 30            # حداقل فاصله‌ی چرخه (دقیقه)
 MAX_LOOKBACK = 48            # حداکثر بازه‌ی مقالات (ساعت)
@@ -763,30 +759,24 @@ def http():
     global _http
     if _http is None:
         _http = httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(25, connect=10), limits=httpx.Limits(max_connections=FETCH_CONCURRENCY + 8, max_keepalive_connections=8),
-                                  headers={"User-Agent": UA_BROWSER, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language": "fa,en;q=0.8"})
+                                  headers={"User-Agent": UA_BROWSER, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language": "fa,en;q=0.8", "Accept-Encoding": "identity"})
     return _http
 _PRIVATE_HOSTS = ("localhost", "metadata.google.internal")
 _host_ok = {}
 def public_url(u):
-    """آدرس HTTP/HTTPS قابل دریافت است؟
-
-    منابع این ربات توسط مدیر ثبت می‌شوند. قبلاً اینجا قبل از هر درخواست DNS
-    را با socket.getaddrinfo بررسی می‌کردیم؛ روی runnerهای GitHub این بررسی
-    گاهی به‌علت DNS/proxy شکست می‌خورد و حتی سایت‌های کاملاً عمومی را رد می‌کرد.
-    برای حفظ دسترسی به سایت‌های واقعی، فقط hostname/IPهای صریحاً محلی را
-    رد می‌کنیم و DNS را دوباره در لایه HTTP به عهده می‌گذاریم.
-    """
+    """آدرس بیرونی و امن است؟ DNS ناموفق یا هر IP غیرعمومی ⇒ رد می‌شود (SSRF fail-closed)."""
     try: p = urlparse(str(u))
     except Exception: return False
     if p.scheme not in ("http", "https") or not p.hostname: return False
     host = p.hostname.rstrip(".").lower()
     if host in _PRIVATE_HOSTS or host.endswith((".local", ".internal", ".localhost")): return False
-    try:
-        ip = ipaddress.ip_address(host)
+    try: addrs = [i[4][0] for i in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)]
+    except Exception: return False
+    if not addrs: return False
+    for a in addrs:
+        try: ip = ipaddress.ip_address(a)
+        except Exception: return False
         if not ip.is_global: return False
-    except ValueError:
-        # Domain names are intentionally allowed without a second local DNS lookup.
-        pass
     return True
 
 async def fetch(url, **kw):
@@ -832,86 +822,6 @@ async def kv_get(key):
     try:
         r = await http().get(CF_BASE + key, headers={"Authorization": f"Bearer {CF_API_TOKEN}"}); return r.text if r.status_code == 200 else None
     except Exception as e: log_event("ERROR", f"KV get: {e}"); return None
-async def kv_put_bytes(key, value):
-    try:
-        r = await http().put(CF_BASE + key, content=value, headers={"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/octet-stream"})
-        return r.status_code == 200
-    except Exception as e:
-        log_event("ERROR", f"KV binary put: {e}"); return False
-async def kv_get_bytes(key):
-    try:
-        r = await http().get(CF_BASE + key, headers={"Authorization": f"Bearer {CF_API_TOKEN}"})
-        return r.content if r.status_code == 200 else None
-    except Exception as e:
-        log_event("ERROR", f"KV binary get: {e}"); return None
-async def cloud_db_restore():
-    """بازیابی DB محلیِ runner از آخرین snapshot دائمی KV، فقط وقتی DB تازه/خالی است."""
-    global _conn
-    if not CF_ENABLED: return False
-    try:
-        if q("SELECT COUNT(*) c FROM users", one=True)["c"] or q("SELECT COUNT(*) c FROM channels", one=True)["c"] or q("SELECT COUNT(*) c FROM ai_models", one=True)["c"]:
-            return False
-        packed = await kv_get_bytes(CF_DB_SNAPSHOT_KEY)
-        if not packed: return False
-        raw = await asyncio.to_thread(gzip.decompress, packed)
-        mem = sqlite3.connect(":memory:")
-        try:
-            mem.deserialize(raw)
-            with _lock:
-                if _conn is not None:
-                    _conn.close(); _conn = None
-                for suffix in ("", "-wal", "-shm"):
-                    try: os.remove(DB_FILE + suffix)
-                    except FileNotFoundError: pass
-                dst = sqlite3.connect(DB_FILE)
-                mem.backup(dst)
-                dst.close()
-                db()
-        finally:
-            mem.close()
-        log.info("Cloudflare KV: local database restored")
-        return True
-    except Exception as e:
-        log_event("WARN", f"Cloud DB restore failed: {e}")
-        return False
-async def cloud_db_backup(force=False):
-    """ذخیره‌ی snapshot فشرده‌ی SQLite در KV تا restart runner داده‌ها را از بین نبرد."""
-    global _last_cloud_db_backup, _last_cloud_db_mtime
-    if not CF_ENABLED or not os.path.exists(DB_FILE): return False
-    now = time.time(); mtime = os.path.getmtime(DB_FILE)
-    if not force and now - _last_cloud_db_backup < CF_DB_BACKUP_SECONDS and mtime <= _last_cloud_db_mtime: return False
-    try:
-        with _lock:
-            mem = sqlite3.connect(":memory:")
-            try:
-                db().execute("PRAGMA wal_checkpoint(PASSIVE)")
-                db().backup(mem)
-                raw = mem.serialize()
-            finally:
-                mem.close()
-        packed = await asyncio.to_thread(gzip.compress, raw, 6)
-        if await kv_put_bytes(CF_DB_SNAPSHOT_KEY, packed):
-            _last_cloud_db_backup = now; _last_cloud_db_mtime = mtime
-            log.info("Cloudflare KV: database snapshot saved (%d -> %d bytes)", len(raw), len(packed))
-            return True
-    except Exception as e:
-        log_event("WARN", f"Cloud DB backup failed: {e}")
-    return False
-async def cloud_d1_check():
-    """فقط اتصال D1 را بررسی می‌کند؛ داده‌های ربات همچنان در SQLite محلی + snapshot KV نگهداری می‌شوند."""
-    if not CF_D1_ENABLED: return False
-    try:
-        url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/d1/database/{CF_D1_ID}/query"
-        r = await http().post(url, json={"sql": "SELECT 1 AS ok"}, headers={"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"})
-        ok = r.status_code == 200 and bool(r.json().get("success"))
-        if not ok: log_event("WARN", f"Cloudflare D1 check failed: HTTP {r.status_code} {r.text[:180]}")
-        else: log.info("Cloudflare D1: connection OK")
-        return ok
-    except Exception as e:
-        log_event("WARN", f"Cloudflare D1 check failed: {e}"); return False
-async def cloud_db_backup_job(context):
-    try: await cloud_db_backup()
-    except Exception as e: log_event("WARN", f"cloud backup job: {e}")
 async def store_deeplink(admin_id, payload):
     """payload: {short, full, title, url, show_source, media:{url,kind}|None, ts}"""
     key = secrets.token_urlsafe(6); data = json.dumps(payload, ensure_ascii=False); saved_cf = CF_ENABLED and await kv_put(key, data)
@@ -923,6 +833,66 @@ async def load_deeplink(key):
     row = q("SELECT local_json FROM deeplinks WHERE key=?", (key,), one=True); data = row["local_json"] if row and row["local_json"] else (await kv_get(key) if CF_ENABLED else None)
     if data: q("INSERT OR REPLACE INTO kv_cache VALUES(?,?,?)", (key, data, now_iso()), commit=True); return json.loads(data)
     return None
+
+CF_STATE_KEY = "__newsbot_sqlite_state_v3__"
+CF_STATE_MAX = 24 * 1024 * 1024
+
+def _db_snapshot_bytes():
+    fd, path = tempfile.mkstemp(prefix="newsbot-snapshot-", suffix=".db")
+    os.close(fd)
+    try:
+        with _lock:
+            conn = db(); dst = sqlite3.connect(path)
+            try: conn.backup(dst)
+            finally: dst.close()
+        with open(path, "rb") as f: return gzip.compress(f.read(), compresslevel=6)
+    finally:
+        try: os.unlink(path)
+        except OSError: pass
+
+def _restore_db_snapshot():
+    if not CF_ENABLED or (os.path.exists(DB_FILE) and os.path.getsize(DB_FILE) > 0): return False
+    try:
+        with httpx.Client(timeout=httpx.Timeout(25, connect=10)) as client:
+            r = client.get(CF_BASE + CF_STATE_KEY, headers={"Authorization": f"Bearer {CF_API_TOKEN}"})
+        if r.status_code != 200 or not r.content: return False
+        raw = gzip.decompress(r.content)
+        if not raw or len(raw) > 100 * 1024 * 1024: return False
+        folder = os.path.dirname(os.path.abspath(DB_FILE)); os.makedirs(folder, exist_ok=True)
+        fd, path = tempfile.mkstemp(prefix="newsbot-restore-", suffix=".db", dir=folder); os.close(fd)
+        try:
+            with open(path, "wb") as f: f.write(raw)
+            check = sqlite3.connect(path)
+            try:
+                ok = check.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            finally: check.close()
+            if not ok: return False
+            os.replace(path, DB_FILE)
+        finally:
+            if os.path.exists(path):
+                try: os.unlink(path)
+                except OSError: pass
+        log.info("Cloudflare KV: SQLite state restored")
+        return True
+    except Exception as e:
+        log.warning(f"Cloudflare KV restore skipped: {e}")
+        return False
+
+async def persist_db():
+    if not CF_ENABLED: return False
+    try:
+        blob = await asyncio.to_thread(_db_snapshot_bytes)
+        if len(blob) > CF_STATE_MAX:
+            log.warning("Cloudflare KV: database snapshot is too large; persistence skipped")
+            return False
+        r = await http().put(CF_BASE + CF_STATE_KEY, content=blob, headers={"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/octet-stream"})
+        ok = r.status_code in (200, 201)
+        if not ok: log.warning(f"Cloudflare KV persistence failed: HTTP {r.status_code}")
+        return ok
+    except Exception as e:
+        log.warning(f"Cloudflare KV persistence failed: {e}")
+        return False
+
 def init_core():
     db(); seed_plans(); recover_publications()
     if gget("automation_enabled") is None: gset("automation_enabled", True)
@@ -1096,11 +1066,12 @@ def _validate_ready(text):
 def _validate_generation(text):
     _validate_output(text)
     j = parse_json(text)
-    if isinstance(j, dict):
-        if j.get("is_ad") is True: return
-        post = j.get("post")
-        if not isinstance(post, str) or not strip_tags(post).strip(): raise AIResponseError("invalid empty post")
-    elif not strip_tags(salvage_post(text)).strip(): raise AIResponseError("empty AI output")
+    if not isinstance(j, dict): raise AIResponseError("invalid AI JSON")
+    if j.get("is_ad") is True: return
+    post = j.get("post")
+    scores = j.get("scores")
+    if not isinstance(post, str) or not strip_tags(post).strip(): raise AIResponseError("invalid empty post")
+    if not isinstance(scores, dict) or not scores: raise AIResponseError("missing scores")
 
 
 async def _try_models(groups, system, user, owner_id=None, on_queue=None, validate=None, explicit_id=None):
@@ -1487,27 +1458,7 @@ def _html_links(soup, base_url, limit):
         if a.find_parent(["nav", "header", "footer", "aside"]): sc -= 3
         if sc < 4: continue
         seen.add(href); scored.append((sc, {"url": href, "title": title[:200], "published": None, "html": "", "media": None}))
-    scored.sort(key=lambda x: -x[0])
-    if scored:
-        return [x[1] for x in scored[:limit]]
-    # Fallback برای سایت‌هایی که ساختار لینک‌شان استاندارد خبر نیست:
-    # شکست امتیازدهی نباید کل منبع را «غیرقابل استفاده» اعلام کند.
-    fallback, seen = [], set()
-    blocked = re.compile(r"^(tag|tags|category|categories|author|page|login|search|feed|rss|about|contact|privacy|terms|account|subscribe|signup|register)(/|$)", re.I)
-    for a in soup.find_all("a", href=True):
-        try: href = clean_url(urljoin(base_url, a["href"]))
-        except Exception: continue
-        if href in seen or hostname(href) != base: continue
-        p = urlparse(href); path = p.path.strip("/")
-        if not path or len(path) < 4 or blocked.search(path): continue
-        if re.search(r"\.(jpe?g|png|gif|pdf|mp4|zip|xml|css|js)(?:$|\?)", path, re.I): continue
-        title = re.sub(r"\s+", " ", a.get_text(" ", strip=True))
-        if not title and a.img: title = (a.img.get("alt") or a.img.get("title") or "").strip()
-        if len(title) < 10: continue
-        seen.add(href)
-        fallback.append({"url": href, "title": title[:200], "published": None, "html": "", "media": None})
-        if len(fallback) >= limit: break
-    return fallback
+    scored.sort(key=lambda x: -x[0]); return [x[1] for x in scored[:limit]]
 # --- منابع API (برای سایت‌هایی که مدیر خودش API می‌دهد) — نقشه‌بردار عمومی: هر ساختار JSON را می‌فهمد
 API_ARRAY_KEYS = ("articles", "items", "results", "data", "posts", "news", "response", "docs", "entries", "stories", "hits", "records", "list", "feed")
 def _api_pick_list(j, depth=0):
@@ -1624,7 +1575,10 @@ async def discover_source(src, limit=25, use_cache=True):
                     if rk.status_code == 200 and b"<urlset" in rk.content[:4096].lower():
                         items = _sitemap_items(rk.content.decode("utf-8", "ignore"), limit)
                         if items: source_ok(src["id"], html.unescape(ku)); return items, True, "sitemap"
-        items = _html_links(soup, src["url"], limit); source_ok(src["id"]); return items, True, "html"
+        items = _html_links(soup, src["url"], limit)
+        if items: source_ok(src["id"])
+        else: source_fail(src["id"], "no_items")
+        return items, True, "html"
     except Exception as e: source_fail(src["id"], e); raise
 def _probe_status(e):
     """کد وضعیت HTTP را از هر خطایی که بالا آمده بیرون می‌کشد (۰ اگر HTTP نبود)."""
@@ -1633,24 +1587,20 @@ def _probe_status(e):
     r = getattr(e, "response", None); st = getattr(r, "status_code", None)
     return int(st) if isinstance(st, int) else 0
 async def probe_source(src, lang="fa", added=False):
-    """تست منبع بدون خاموش‌کردن خودکار در خطاهای موقت یا کشف‌نشدن مقاله.
-    فقط پاسخ‌های صریحاً مسدود/ناموجود منبع را خاموش می‌کنیم؛ خطای DNS، timeout، 5xx
-    یا ساختار غیرمعمول سایت نباید منبع سالم را برای همیشه 🔴 کند.
-    """
+    """تست بارگذاری؛ خطای موقت منبع را غیرفعال نمی‌کند و فقط پس از شکست‌های متوالی خاموش می‌شود."""
+    off = tr(lang, "src_added_off" if added else "src_now_off")
     try:
         items, _, m = await discover_source(src, use_cache=False)
     except Exception as e:
-        status = _probe_status(e)
-        if status in (401, 403, 406, 410, 451):
-            set_source_active(src["id"], False, "active")
-            off = tr(lang, "src_added_off" if added else "src_now_off")
-            return False, tr(lang, "src_403" if status in (401, 403, 406, 451) else "src_dead") + off
-        # خطاهای موقت/شبکه‌ای: منبع را خاموش نکن.
-        source_fail(src["id"], e)
-        return False, ("⚠️ تست موقتاً ناموفق بود؛ منبع خاموش نشد. بعداً دوباره امتحان می‌شود." if lang != "en" else "⚠️ The temporary test failed; the source was not turned off. It will be retried later.")
+        current = get_source(src["id"]); failures = int((current["fail_count"] if current else 0) or 0)
+        disabled = failures >= SOURCE_FAIL_LIMIT
+        if disabled: set_source_active(src["id"], False, "active")
+        return False, tr(lang, "src_403" if _probe_status(e) in (401, 403, 406, 451) else "src_dead") + (off if disabled else "")
     if not items:
-        # نبودن آیتم در تستِ صفحه‌ی اصلی به‌تنهایی ثابت نمی‌کند منبع خراب است.
-        return False, ("⚠️ سایت پاسخ داد، اما فعلاً مقاله‌ای قابل شناسایی پیدا نشد؛ منبع خاموش نشد. RSS/API یا آدرس بخش خبر را می‌توانید تنظیم کنید." if lang != "en" else "⚠️ The site responded, but no recognizable articles were found yet; the source was not turned off. You can set its RSS/API or news-section URL.")
+        current = get_source(src["id"]); failures = int((current["fail_count"] if current else 0) or 0)
+        disabled = failures >= SOURCE_FAIL_LIMIT
+        if disabled: set_source_active(src["id"], False, "active")
+        return False, tr(lang, "src_dead") + (off if disabled else "")
     return True, tr(lang, "src_added", n=len(items), m=m)
 # ============================================================
 # استخراج متن مقاله — trafilatura → بلوک‌های HTML → محتوای فید (در ترد جدا تا حلقه‌ی رویداد مسدود نشود)
@@ -1805,10 +1755,10 @@ async def extract_article(url, fallback_html=""):
         page["text"] = _merge_text(page["text"], p2["text"])
         if not page.get("media") and p2.get("media"): page["media"] = p2["media"]
         nxt = p2.get("next") or ""
-    if len(page["text"]) < 250 and fallback_html:
+    if len(page["text"]) < 120 and fallback_html:
         fb = await asyncio.to_thread(_html_to_text, fallback_html)
         if len(fb) > len(page["text"]): page["text"] = fb
-    if len(page["text"]) < 250: return None
+    if len(page["text"]) < 120: return None
     page["url"] = url; page["pages"] = hops + 1; page["text"] = page["text"][:MAX_ARTICLE_CHARS]; return page
 # ============================================================
 # فیلتر تبلیغ — چندزبانه، منطبق با پرشمارترین زبان‌های کاربران تلگرام
@@ -1916,10 +1866,11 @@ async def generate(s, art, on_queue=None, owner_id=None):
     elif not str(j.get("post") or "").strip() and not j.get("is_ad"):
         j = {"is_ad": False, "category": s["categories"][0]["name"] if s["categories"] else "", "title": art["title"], "scores": {}, "post": clean_ai_text(salvage_post(raw), s)[:3000], "full": None}
     # تبلیغِ صریحِ مدل (حتی بدون post) هرگز با محتوای ساختگی بازنویسی نمی‌شود
+    if j.get("is_ad") is True:
+        j["score"] = 0.0; return j, model, None
     scores = j.get("scores")
-    if not isinstance(scores, dict) or not scores:
-        scores = None; j.pop("scores", None)
-    j["score"] = weighted_score(s, scores) if scores else 65.0; return j, model, None
+    if not isinstance(scores, dict) or not scores: return None, None, "missing_scores"
+    j["score"] = weighted_score(s, scores); return j, model, None
 def signature_of(s, ch):
     sig = (s.get("signature") or "").strip()
     if sig.lower() == "@channel": sig = f"@{ch['username']}" if ch and ch["username"] else ""
@@ -2083,7 +2034,7 @@ async def _publish_article_locked(bot, aid, count_usage=True, test_user=None):
         journal = release_publication(aid, journal, "delivery_unknown" if journal.get("phase") == "in_flight" else (a["reason"] or ""))
         if journal.get("phase") == "in_flight": return False, "delivery_unknown"
     if ch["admin_id"] != admin_id: return False, "no_channel"
-    if posted_before(ch["chat_id"], a["hash"]): return False, "duplicate"
+    if posted_before(ch["chat_id"], a["hash"]): article_update(aid, status="rejected", reason="duplicate"); return False, "duplicate"
     journal = reserve_publication(aid, admin_id, count_usage, test_user, journal)
     if journal is None: return False, "quota"
     media = None; published = False
@@ -2093,7 +2044,7 @@ async def _publish_article_locked(bot, aid, count_usage=True, test_user=None):
             article_update(aid, reason="bot_not_admin"); return False, "bot_not_admin"
         operation_checkpoint()
         if posted_before(ch["chat_id"], a["hash"]):
-            article_update(aid, reason="duplicate"); return False, "duplicate"
+            article_update(aid, status="rejected", reason="duplicate"); return False, "duplicate"
         media = json.loads(a["media"]) if a["media"] and s["include_media"] else None
         tail = make_tail(s, ch, a["url"]); post = re.sub(r'\s*🔗 <a href="[^"]+">Source</a>\s*', "\n", a["post_html"] or ""); post = clean_ai_text(strip_source_url(post, a["url"]), s); body = post[:-len(tail)] if tail and post.endswith(tail) else post; text = post; limit = int(s["post_limit"])
         if len(post) > limit:
@@ -2956,7 +2907,6 @@ async def run_user_operation(update, context, kind, channel, work, show_status=F
                     op.terminalized = True
                     if op.thinking_task and not op.thinking_task.done(): op.thinking_task.cancel()
                     op.thinking_task = None
-                    # The terminal status is temporary. Never carry its message id into the next operation.
                     context.user_data.pop("status_message_id", None)
                     if _operations.get(uid) is op: _operations.pop(uid, None)
                     _dbg(f"[{tag}] AFTER POP: uid in _operations={uid in _operations} user_data status_msg_id={context.user_data.get('status_message_id')}")
@@ -3970,12 +3920,7 @@ async def handle_input(update, context, st):
                 await popup(update, context, tr(lang, "notfound"), alert=True)
                 return await dispatch(update, context, back)
             result = tr(lang, "my_ai_added" if own else "s_model_added", name=esc(name), res=(tr(lang, "saved") if ok else ai_err_text(err_code(out), lang)) + f" ({t}s)")
-            # نتیجه‌ی تست مدل باید پایان واقعی وضعیت باشد؛ نباید پیام نهایی دوباره
-            # با Thinking... بازنویسی شود یا animation بعد از پایان ادامه پیدا کند.
-            op = _current_operation.get()
-            if op:
-                await operation_status(context, result, failed=not ok, terminal=True)
-                op.final_status = True
+            await operation_status(context, result, failed=not ok)
             await popup(update, context, result, alert=not ok)
             return await dispatch(update, context, f"a:myai_v:{mid}" if own else back)
         elif st["wiz"] == "disc_add":
@@ -4209,7 +4154,7 @@ async def _ack(msg, fallback_text, kb=None):
     except Exception:
         try: await msg.reply_text(fallback_text, reply_markup=kb)
         except Exception: pass
-async def send_temp(context, chat_id, text, seconds=5):
+async def send_temp(context, chat_id, text, seconds=10):
     try: mid = await create_temp(context.bot, chat_id, text)
     except Exception:
         log.debug("temporary message send failed", exc_info=True)
@@ -4305,21 +4250,21 @@ async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def job_tick(context: ContextTypes.DEFAULT_TYPE):
     try: await scheduler_tick(context.bot)
     except Exception as e: log_event("ERROR", f"scheduler: {e}")
+async def job_persist(context: ContextTypes.DEFAULT_TYPE):
+    await persist_db()
 async def post_init(app: Application):
     global BOT_USERNAME, NOTIFY_SUPER, NOTIFY_USER
-    restored = await cloud_db_restore()
-    d1_ok = await cloud_d1_check()
     me = await app.bot.get_me(); BOT_USERNAME = me.username; NOTIFY_SUPER = notify_supers; NOTIFY_USER = notify_user_fn
     await app.bot.set_my_commands([BotCommand("start", "منوی اصلی"), BotCommand("create", "پنل مدیریت / پلن"), BotCommand("man", "پشتیبانی"), BotCommand("about", "درباره"), BotCommand("lang", "زبان"), BotCommand("help", "راهنما"), BotCommand("cancel", "لغو عملیات")], language_code="fa")
     await app.bot.set_my_commands([BotCommand("start", "Main menu"), BotCommand("create", "Admin panel / plan"), BotCommand("man", "Support"), BotCommand("about", "About"), BotCommand("lang", "Language"), BotCommand("help", "Help"), BotCommand("cancel", "Cancel action")])
     app.job_queue.run_repeating(job_tick, interval=TICK_SECONDS, first=15, name="tick")
-    if CF_ENABLED: app.job_queue.run_repeating(cloud_db_backup_job, interval=CF_DB_BACKUP_SECONDS, first=60, name="cloud-db-backup")
+    if CF_ENABLED: app.job_queue.run_repeating(job_persist, interval=PERSIST_INTERVAL_SECONDS, first=30, name="persist")
     log_event("INFO", f"ربات @{me.username} راه‌اندازی شد")
-    await notify_supers(f"🚀 @{me.username} راه‌اندازی شد · 🤖 مدل‌های فعال {len(list_models(True))} · CF KV {'✅' if CF_ENABLED else '❌'} · D1 {'✅' if d1_ok else '❌'} · DB restore {'✅' if restored else '—'} · تیک هر {TICK_SECONDS}s · AI×{AI_CONCURRENCY} CYCLE×{CYCLE_CONCURRENCY}")
+    await notify_supers(f"🚀 @{me.username} راه‌اندازی شد · 🤖 مدل‌های فعال {len(list_models(True))} · CF KV {'✅' if CF_ENABLED else '❌'} · تیک هر {TICK_SECONDS}s · AI×{AI_CONCURRENCY} CYCLE×{CYCLE_CONCURRENCY}")
 async def post_shutdown(app: Application):
     global _http
-    try: await cloud_db_backup(force=True)
-    except Exception as e: log_event("WARN", f"final cloud backup: {e}")
+    try: await persist_db()
+    except Exception: pass
     if _http:
         try: await _http.aclose()
         except Exception: pass
@@ -4331,6 +4276,7 @@ def main():
     global APP
     if not BOT_TOKEN: raise SystemExit("BOT_TOKEN تنظیم نشده است.")
     if not SUPER_ADMIN_IDS: raise SystemExit("SUPER_ADMIN_IDS تنظیم نشده است.")
+    _restore_db_snapshot()
     init_core(); APP = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).concurrent_updates(True).build()
     for cmd, fn in (("start", cmd_start), ("create", cmd_create), ("admin", cmd_admin), ("man", cmd_man), ("help", cmd_help), ("about", cmd_about), ("lang", cmd_lang), ("cancel", cmd_cancel)): APP.add_handler(CommandHandler(cmd, managed_command(fn)))
     APP.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.COMMAND, managed_command(cmd_unknown)))
