@@ -43,7 +43,7 @@ MODEL_PROBE_MIN = 10
 MIN_INTERVAL = 30            # حداقل فاصله‌ی چرخه (دقیقه)
 MAX_LOOKBACK = 48            # حداکثر بازه‌ی مقالات (ساعت)
 MAX_PPC = 5                  # حداکثر پست در هر چرخه
-POST_LIMIT_DEFAULT = 3000    # سقف کاراکتر پست کانال (پیش‌فرض) — تنظیم طبق دستور مدیر فاز ۳ (قبلی 700)
+POST_LIMIT_DEFAULT = 2500    # سقف کاراکتر پست کانال (پیش‌فرض) — تنظیم طبق دستور مدیر فاز ۳ (قبلی 700)
 BOT_FULL_MAX = 2500          # سقف کاراکتر محتوای کامل داخل ربات («ادامه در ربات»)
 LANGS = ("fa", "en")
 # ---- محافظت در برابر فشار (قابل تنظیم با متغیر محیطی)
@@ -497,7 +497,7 @@ def default_settings(lang="fa", channel_username=""):
     return {"ui_lang": lang, "enabled": True, "mode": "auto", "prompt": DEFAULT_PROMPT[lang], "topic": "", "language": "فارسی" if lang == "fa" else "English",
             "categories": [dict(c) for c in DEFAULT_CATEGORIES[lang]], "criteria": [dict(c) for c in DEFAULT_CRITERIA[lang]], "min_score": 60,
             "lookback_hours": 24, "allow_undated": True, "quiet_start": None, "quiet_end": None, "utc_offset": DEFAULT_UTC_OFFSET,
-            "include_media": True, "include_link": True, "signature": f"@{channel_username}" if channel_username else "@channel", "max_words": 600, "post_limit": POST_LIMIT_DEFAULT,  # پیش‌فرض کلمات طبق دستور فاز ۳ (قبلی ۱۵۰)
+            "include_media": True, "include_link": True, "signature": f"@{channel_username}" if channel_username else "@channel", "max_words": 500, "post_limit": POST_LIMIT_DEFAULT,  # پیش‌فرض کلمات طبق دستور فاز ۳ (قبلی ۱۵۰)
             "strict_ads": False, "interval_minutes": 60, "posts_per_cycle": 2, "hashtags": True, "daily_posts_cap": None,
             "last_run": None, "last_end": None, "last_result": "", "last_diag": None, "last_notified_diag": ""}
 def get_settings(cid):
@@ -1877,7 +1877,7 @@ def heuristic_ad_check(art, strict=False):
 def build_prompt(s, art, want_full):
     cats = "\n".join(f"- {c['emoji']} {c['name']}: {c['style']}" for c in s["categories"]) or "- General"; crit = "\n".join(f"- {c['name']} (weight {c['weight']})" for c in s["criteria"])
     system = f"""You are the editor-in-chief and content evaluator of a Telegram channel. Output language: {s['language']}. EVERY word of the output MUST be written in {s['language']}, regardless of any other instruction. Channel topic: {s['topic'] or 'general'}.
-CHANNEL STYLE (editor's tone guide — apply it, but the FORMATTING RULES below ALWAYS win over it when they conflict):
+CHANNEL STYLE (editor's tone guide — apply it; FORMATTING RULES are soft defaults and exceptions are OK if the channel style explicitly asks for them):
 {sanitize_html(s['prompt'])}
 CATEGORIES (choose exactly one and apply its style):
 {cats}
@@ -1885,7 +1885,7 @@ EVALUATION CRITERIA (score each 0–10, honestly and strictly):
 {crit}
 FORMATTING RULES (mandatory, not optional — these override any conflicting style guidance above):
 - HUMAN VOICE: write like a skilled human editor, never like a bot or an AI. Vary sentence length, no meta commentary, no clichéd openings like "In today's world", and NEVER use divider lines like "---" or "***" or "⸻".
-- EMOJI: at most ONE relevant emoji in the whole post, placed on the last line next to the hashtags; no emojis inside paragraphs or bullets.
+- EMOJI: keep emojis moderate; if the channel style asks for no emoji or a specific style (e.g. per-paragraph), follow the channel style.
 - Line 1: headline inside <b>. Then a blank line, then a one-sentence lead.
 - SYMBOLS: wherever a list, step, comparison or highlight helps, start the line with a symbol from this palette (pick 1–2 kinds per post and stay consistent): • ◦ ◆ ◇ ▸ ▹ ➤ ➜ ➥ ➢ → ➝ ⇢ ⟶ ⤷ — each such line is its own paragraph.
 - Only these HTML tags (NO Markdown): <b>, <i>, <u>, <s>, <code>, <pre>, <a href="">, <blockquote>.
@@ -1898,7 +1898,7 @@ FORMATTING RULES (mandatory, not optional — these override any conflicting sty
 - VARY THE SUBJECT: name the main person/thing once at first mention, then use pronouns or natural substitutes — never open every paragraph with the same name.
 - UNKNOWN NAMES: a little-known person, company or term gets a one-clause introduction at first mention.
 - NEUTRAL & SOURCE-ONLY: strictly neutral — no judgment, opinion, praise or personal analysis; never add or invent anything beyond the source; never pad to reach the cap — shorter is fine.
-- "post": an engaging, COMPLETE mini-story — max {s['max_words']} words and at most {max(400, int(s['post_limit']) - 120)} characters; never leave the story half-told: if space is tight, compress the whole story instead of dropping its second half.{', ending with 2–4 relevant hashtags on the last line' if s['hashtags'] else ''}.
+- "post": an engaging, COMPLETE mini-story — max {s['max_words']} words and at most {max(400, int(s['post_limit']))} characters; never leave the story half-told: if space is tight, compress the whole story instead of dropping its second half.{', ending with 2–4 relevant hashtags on the last line' if s['hashtags'] else ''}.
 - "full": {'the EXPANDED bot version: everything the post says PLUS the deeper details, background, numbers and context — it must NOT merely repeat the post; start fresh and go deeper. Same format: <b> sub-headings, bullets, at least two <blockquote> highlights (300–700 words, max 2500 characters).' if want_full else 'null'}
 - If the text is an advertisement / advertorial / product-for-sale / betting promotion: is_ad=true.
 - No preamble, never talk about yourself.
@@ -2141,7 +2141,13 @@ async def _publish_article_locked(bot, aid, count_usage=True, test_user=None):
         if posted_before(ch["chat_id"], a["hash"]):
             article_update(aid, status="rejected", reason="duplicate"); return False, "duplicate"
         media = json.loads(a["media"]) if a["media"] and s["include_media"] else None
-        tail = make_tail(s, ch, a["url"]); post = re.sub(r'\s*🔗 <a href="[^"]+">Source</a>\s*', "\n", a["post_html"] or ""); post = clean_ai_text(strip_source_url(post, a["url"]), s); body = post[:-len(tail)] if tail and post.endswith(tail) else post; text = post; limit = int(s["post_limit"])
+        tail = make_tail(s, ch, a["url"]); post = re.sub(r'\s*🔗 <a href="[^"]+">Source</a>\s*', "\n", a["post_html"] or "")
+        # اگر مدل یا پرامپت همان امضا را در متن گذاشته، همه‌ی تکرارهای آن را حذف کن تا دوبار دیده نشود
+        sig = signature_of(s, ch)
+        if sig:
+            sig_html = sanitize_html(sig)
+            post = re.sub(rf"\s*{re.escape(sig_html)}\s*", "\n", post)
+        post = clean_ai_text(strip_source_url(post, a["url"]), s); body = post[:-len(tail)] if tail and post.endswith(tail) else post; text = post; limit = int(s["post_limit"])
         # فاز ۳: دیپ‌لینک «بیشتر» اجباری وقتی متن کامل قابل توجه بزرگ‌تر از پست است — حتی اگر post_limit پاس شود
         full_longer = bool(a["full_html"]) and len(a["full_html"].strip()) > len((a["post_html"] or "").strip()) * 1.5
         if len(post) > limit or full_longer:
@@ -2149,8 +2155,13 @@ async def _publish_article_locked(bot, aid, count_usage=True, test_user=None):
             htitle = f"<b>{html.escape(a['title'] or '')}</b>"
             cfull = clean_ai_text(strip_source_url(a["full_html"], a["url"]), s) if source_bot_ok(a["source_id"]) and a["full_html"] else ""
             ftxt = cfull if cfull.strip() else ((htitle + "\n\n" + rest) if rest else htitle)
-            if len(ftxt) > BOT_FULL_MAX: ftxt = fit_html(ftxt, BOT_FULL_MAX)[0]
-            ftxt = finish_ok(ftxt)
+            # اگر محتوای کامل از سقف تک‌پیام بزرگ‌تر شد، رها نکن — چندبخشی کن تا کامل باشد
+            parts = []
+            while ftxt:
+                chunk, ftxt = fit_html(ftxt, BOT_FULL_MAX)
+                parts.append(chunk)
+            # ذخیرهٔ بخش‌ها: آرایهٔ متون؛ front-end ایجکس/دیپ‌لینک می‌تواند refetch کرد و نمایش دهد
+            ftxt = "\n".join(parts)  # برای سازگاری، ابتدا همهٔ بخش‌ها به‌صورت پیوسته ذخیره می‌شوند — divide_textaf می‌تواند نقشه‌برداری شود
             key = await store_deeplink(admin_id, {"short": cut, "full": ftxt, "title": a["title"], "url": a["url"], "show_source": bool(s.get("include_link", True)), "media": {k: v for k, v in media.items() if not k.startswith("_")} if media else None, "ts": now_iso()})
             more = f'\n\n<a href="https://t.me/{BOT_USERNAME}?start=r_{key}">📖 {"بیشتر" if lang == "fa" else "more..."}</a>'
             text = cut + more + tail
@@ -2322,8 +2333,8 @@ async def _cycle(bot, uid, cid, test_mode, progress):
     for src, name, items, changed, method, err in results:
         if err in ("cooldown", "paused"): D.add("src_cooldown", name=name); continue
         if err: res["errors"] += 1; D.add("src_fail", name=name, err=err); log_event("WARN", f"منبع {src['url']}: {err}", uid); continue
-        if not changed: D.add("src_notmod", name=name); continue
-        if not items: D.add("src_empty", name=name); continue
+        if not changed: D.add("src_notmod", name=name); step_add(_current_operation.get(), "src_notmod", key=name, status="run"); continue
+        if not items: D.add("src_empty", name=name); step_add(_current_operation.get(), "src_empty", key=name, status="fail"); continue
         new = 0
         for it in items:
             h = url_hash(it["url"]); all_items.append((it, h))
@@ -2333,6 +2344,7 @@ async def _cycle(bot, uid, cid, test_mode, progress):
             aid = article_insert(uid, cid, h, it["url"], it["title"], src["id"], it.get("published"))
             if aid: candidates.append({"aid": aid, "url": it["url"], "title": it["title"], "published": it.get("published"), "html": it.get("html") or "", "media": it.get("media")}); new += 1
         D.add("src_ok", name=name, m=method, n=len(items), new=new)
+        step_add(_current_operation.get(), "src_found", key=name, status="ok") if new else step_add(_current_operation.get(), "src_empty", key=name, status="fail")
         if new: q("UPDATE sources SET found_total=found_total+? WHERE id=?", (new, src["id"]), commit=True)
     candidates.sort(key=lambda c: c["published"] or "", reverse=True)
     lo = [{"aid": r["id"], "url": r["url"], "title": r["title"], "published": r["published_at"], "html": "", "media": None} for r in leftovers if r["id"] not in {c["aid"] for c in candidates}]
@@ -2379,7 +2391,8 @@ async def _cycle(bot, uid, cid, test_mode, progress):
         for c, art in zip(chunk, arts):
             if res["accepted"] >= target: stop = True; break
             aid = c["aid"]; res["processed"] += 1
-            if not art or isinstance(art, Exception): article_update(aid, status="rejected", reason="extract_failed"); res["rejected"] += 1; cnt["extract"] += 1; continue
+            src_name = article_src_name(aid) or hostname(c["url"])
+            if not art or isinstance(art, Exception): article_update(aid, status="rejected", reason="extract_failed"); res["rejected"] += 1; cnt["extract"] += 1; step_add(_current_operation.get(), "src_extract_fail", key=src_name, status="fail"); continue
             if not art["title"]: art["title"] = c["title"] or hostname(c["url"])
             if not art["media"] and c["media"]: art["media"] = c["media"]
             D.stage = "filter"
@@ -2388,13 +2401,17 @@ async def _cycle(bot, uid, cid, test_mode, progress):
             if not _within_lookback(pub_when, s):
                 article_update(aid, status="skipped", reason="old" if pub_when else "undated", **({"published_at": pub_when} if pub_when else {}))
                 if not pub_when: cnt["undated"] += 1
+                step_add(_current_operation.get(), "src_skip_old", key=src_name, status="fail")
                 continue
             bad, why, _ = heuristic_ad_check(art, s["strict_ads"])
-            if bad: article_update(aid, status="rejected", reason=f"ad_filter: {why}"); res["rejected"] += 1; cnt["ad"] += 1; details.append((art["title"], "ad: " + why)); continue
+            if bad: article_update(aid, status="rejected", reason=f"ad_filter: {why}"); res["rejected"] += 1; cnt["ad"] += 1; details.append((art["title"], "ad: " + why)); step_add(_current_operation.get(), "src_ad", key=src_name, status="fail"); continue
             D.stage = "ai"; pct = min(94, 40 + int(50 * i / len(candidates))); await p(pct, P["ai"].format(t=art["title"][:40]))
             async def _on_queue(_pct=pct): await p(_pct, P["queue"])
             gen, model, err = await generate(s, art, on_queue=_on_queue, owner_id=uid)
-            if not gen: article_update(aid, status="failed", reason=f"ai: {err}"); res["errors"] += 1; ai_err = err; continue
+            if not gen:
+                article_update(aid, status="failed", reason=f"ai: {err}"); res["errors"] += 1; ai_err = err
+                step_add(_current_operation.get(), "src_ai_fail", key=src_name, status="fail", model=model)
+                continue
             D.stage = "score"
             if gen.get("is_ad"): article_update(aid, status="rejected", reason=f"ai_ad: {gen.get('ad_reason', '')}", score=gen["score"]); res["rejected"] += 1; cnt["ai_ad"] += 1; details.append((art["title"], f"AI ad: {str(gen.get('ad_reason', ''))[:40]}")); continue
             best = max(best, gen["score"])
@@ -2722,7 +2739,7 @@ INT_FIELDS = {"max_words": (30, 600), "min_score": (0, 100), "post_limit": (300,
 FIELD_LABEL = {"prompt": ("پرامپت نگارش", "Writing prompt"), "topic": ("موضوع کانال", "Channel topic"), "language": ("زبان خروجی (نام زبان را بنویس: Italian، Chinese، فارسی، …)", "Output language (type the language name: Italian, Chinese, English, …)"), "signature": ("امضای پایان پست (@channel = یوزرنیم کانال)", "Post signature (@channel = channel username)"),
                "daily_posts_cap": ("📊 سقف روزانه پست (خالی = نامحدود)", "📊 Daily post cap (blank = unlimited)"), "max_words": ("حداکثر کلمات پست", "Max post words"), "min_score": ("حداقل امتیاز (۰–۱۰۰)", "Min score (0–100)"), "post_limit": ("سقف کاراکتر پست کانال (پیش‌فرض ۳۰۰۰)؛ محتوای کامل‌تر → «ادامه در ربات» (۳۰۰–۴۰۰۰)", "Channel post char limit (default 700); longer content → “continue in bot” (300–4000)"),
                "interval_minutes": (f"فاصله‌ی چرخه (دقیقه، ≥{MIN_INTERVAL})", f"Cycle interval (min, ≥{MIN_INTERVAL})"), "posts_per_cycle": (f"پست در هر چرخه (≤{MAX_PPC})", f"Posts per cycle (≤{MAX_PPC})"), "lookback_hours": (f"مقالات چند ساعت اخیر (≤{MAX_LOOKBACK})", f"Articles from last N hours (≤{MAX_LOOKBACK})")}
-SCHED_FIELDS = ("interval_minutes", "posts_per_cycle", "lookback_hours")
+SCHED_FIELDS = ("interval_minutes", "posts_per_cycle", "lookback_hours", "daily_posts_cap")
 TZ_NAMES = {"tehran": ("🇮🇷 تهران", "🇮🇷 Tehran"), "istanbul": ("🇹🇷 استانبول", "🇹🇷 Istanbul"), "dubai": ("🇦🇪 دبی", "🇦🇪 Dubai"), "kabul": ("🇦🇫 کابل", "🇦🇫 Kabul"), "karachi": ("🇵🇰 کراچی", "🇵🇰 Karachi"), "delhi": ("🇮🇳 دهلی", "🇮🇳 Delhi"),
             "moscow": ("🇷🇺 مسکو", "🇷🇺 Moscow"), "berlin": ("🇩🇪 برلین", "🇩🇪 Berlin"), "london": ("🇬🇧 لندن", "🇬🇧 London"), "beijing": ("🇨🇳 پکن", "🇨🇳 Beijing"), "tokyo": ("🇯🇵 توکیو", "🇯🇵 Tokyo"), "sydney": ("🇦🇺 سیدنی", "🇦🇺 Sydney"),
             "newyork": ("🇺🇸 نیویورک", "🇺🇸 New York"), "losangeles": ("🇺🇸 لس‌آنجلس", "🇺🇸 Los Angeles"), "saopaulo": ("🇧🇷 سائوپائولو", "🇧🇷 São Paulo"), "utc": ("🌐 گرینویچ", "🌐 UTC")}
@@ -2887,6 +2904,10 @@ SPHARSE.update({
   ("ad","run",0): "🚫 بررسی تبلیغات…", ("ad","run",1): "🛡 تشخیص تبلیغاتی بودن…", ("ad","run",2): "⚠️ بررسی محتوای تبلیغاتی…",
   ("ai","run",0): "⏳ در حال تولید با مدل…", ("ai","run",1): "⏳ مدل در حال فکر کردن…", ("ai","run",2): "✍️ در حال نگارش…",
   ("queue","run",0): "⏳ در صف انتشار…", ("queue","run",1): "📥 آماده‌ی انتشار شد", ("queue","run",2): "🕐 در انتظار انتشار…",
+  ("src_extract_fail","fail",0): "📭 متن این منبع استخراج نشد", ("src_extract_fail","fail",1): "❌ منبع قابل‌خواندن نبود", ("src_extract_fail","fail",2): "⚠️ بدنه‌ی خبر خالی آمد",
+  ("src_skip_old","fail",0): "🕰 خارج از بازه‌ی زمانی بود", ("src_skip_old","fail",1): "⏳ خبر قدیمی است", ("src_skip_old","fail",2): "📅 تاریخش قدیمی است",
+  ("src_ad","fail",0): "🚫 به نظر تبلیغات می‌رسد", ("src_ad","fail",1): "⚠️ محتوا تبلیغاتی تشخیص داده شد", ("src_ad","fail",2): "🛑 فیلتر تبلیغ رد کرد",
+  ("src_ai_fail","fail",0): "🧠 مدل نتوانست تولید کند", ("src_ai_fail","fail",1): "❌ خروجی مدل معتبر نبود", ("src_ai_fail","fail",2): "⚠️ مدل پاسخ قابل‌استفاده نداد",
   ("published","ok",0): "✅ منتشر شد", ("published","ok",1): "📣 ارسال به کانال انجام شد", ("published","ok",2): "🎉 در کانال قرار گرفت",
   ("queued","ok",0): "📌 در صف قرار گرفت", ("queued","ok",1): "📥 برای انتشار بعدی ذخیره شد", ("queued","ok",2): "✅ آماده قرار گرفت",
 })
@@ -2895,7 +2916,7 @@ def _step_text(st, lang):
     f = st.get("fmt", {})
     key_tpl = SPHARSE.get((cat, status, var)) or SPHARSE.get((cat, status, 0))
     if not key_tpl: return cat
-    model = st.get("model") or ""
+    model = st.get("model") or st.get("key") or ""
     try: return key_tpl.format(model, **f)
     except Exception: return key_tpl
 def make_status(lang, text, step=None):
@@ -3650,13 +3671,22 @@ async def view_super_home(update, context):
     await render(update, context, text, kb)
 async def view_s_plans(update, context):
     lang = L(update); plans = list_plans(active_only=False)
-    text = tr(lang, "s_plans_title") + "\n" + "".join(f"\n{'🟢' if p['active'] else '🔴'}{'🎁' if p['is_free'] else ''} <b>{esc(plan_txt(p, 'name', lang))}</b> · {p['days']}d · {p['daily_posts']}p · {p['max_sources']}s · {p['max_channels']}c · {esc(plan_txt(p, 'price', lang))}" for p in plans)
+    lines_p = []
+    for p in plans:
+        try:
+            lines_p.append(f"\n{'🟢' if p['active'] else '🔴'}{'🎁' if p['is_free'] else ''} <b>{esc(plan_txt(p, 'name', lang))}</b> · {p['days']}d · {p['daily_posts']}p · {p['max_sources']}s · {p['max_channels']}c · {esc(plan_txt(p, 'price', lang))}")
+        except Exception:
+            lines_p.append("\n" + esc(str(dict(p))))
+    text = tr(lang, "s_plans_title") + "\n" + "".join(lines_p)
     kb = pairs([B(f"{'🟢' if p['active'] else '🔴'} {plan_txt(p, 'name', lang)[:20]}", f"s:plan:{p['id']}") for p in plans]) + [[B(tr(lang, "s_plan_new"), "s:plan_new")], [B(tr(lang, "back"), "s:home")]]; await render(update, context, text, kb)
 async def view_s_plan(update, context, pid):
     lang = L(update); p = get_plan(pid)
     if not p: return await view_s_plans(update, context)
     n = q("SELECT COUNT(*) c FROM users WHERE plan_id=?", (pid,), one=True)["c"]
-    text = tr(lang, "s_plan_view", name=esc(p["name"]), name_en=esc(p["name_en"] or "—"), free="🎁" if p["is_free"] else "", st="🟢" if p["active"] else "🔴", desc=esc(p["description"]), desc_en=esc(p["description_en"] or ""), days=p["days"], posts=p["daily_posts"], tests=p["daily_tests"], src=p["max_sources"], ch=p["max_channels"], price=esc(p["price"]), price_en=esc(p["price_en"] or "—"), price_num=f"${p['price_num']}" if p.get("price_num") else "—", n=n)
+    try:
+        text = tr(lang, "s_plan_view", name=esc(p["name"]), name_en=esc(p["name_en"] or "—"), free="🎁" if p["is_free"] else "", st="🟢" if p["active"] else "🔴", desc=esc(p["description"]), desc_en=esc(p["description_en"] or ""), days=p["days"], posts=p["daily_posts"], tests=p["daily_tests"], src=p["max_sources"], ch=p["max_channels"], price=esc(p["price"]), price_en=esc(p["price_en"] or "—"), price_num=f"${p['price_num']}" if p["price_num"] else "—", n=n)
+    except Exception:
+        text = tr(lang, "s_plans_title") + "\n" + esc(str(dict(p)))
     kb = pairs([B(f"✏️ {f[2] if lang == 'en' else f[1]}", f"s:plan_e:{pid}:{f[0]}") for f in PLAN_FIELDS]) + [[B(tr(lang, "toggle"), f"s:plan_t:{pid}"), B(tr(lang, "s_plan_free_set"), f"s:plan_free:{pid}")], [B(tr(lang, "s_plan_del"), f"s:plan_d:{pid}")], [B(tr(lang, "back"), "s:plans")]]
     await render(update, context, text, kb)
 def _disc_st(d, lang):
