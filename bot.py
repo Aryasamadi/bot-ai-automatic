@@ -2142,12 +2142,17 @@ async def _publish_article_locked(bot, aid, count_usage=True, test_user=None):
             article_update(aid, status="rejected", reason="duplicate"); return False, "duplicate"
         media = json.loads(a["media"]) if a["media"] and s["include_media"] else None
         tail = make_tail(s, ch, a["url"]); post = re.sub(r'\s*🔗 <a href="[^"]+">Source</a>\s*', "\n", a["post_html"] or "")
-        # اگر مدل یا پرامپت همان امضا را در متن گذاشته، همه‌ی تکرارهای آن را حذف کن تا دوبار دیده نشود
+        post = clean_ai_text(strip_source_url(post, a["url"]), s)
         sig = signature_of(s, ch)
         if sig:
-            sig_html = sanitize_html(sig)
-            post = re.sub(rf"\s*{re.escape(sig_html)}\s*", "\n", post)
-        post = clean_ai_text(strip_source_url(post, a["url"]), s); body = post[:-len(tail)] if tail and post.endswith(tail) else post; text = post; limit = int(s["post_limit"])
+            sig_txt = esc(sig).strip()
+            # فقط اگر امضا در متن باشد و جای آخرش نباشد، یک نسخه‌اش را حذف کن؛ اگر اصلاً نباشد، append نکن (tail خودش اضافه می‌کند)
+            if sig_txt in post and not post.rstrip().endswith(sig_txt):
+                post = post.replace(sig_txt, "", 1).rstrip()
+            body = post[:-len(tail)] if tail and post.endswith(tail) else post
+        else:
+            body = post
+        text = post; limit = int(s["post_limit"])
         # فاز ۳: دیپ‌لینک «بیشتر» اجباری وقتی متن کامل قابل توجه بزرگ‌تر از پست است — حتی اگر post_limit پاس شود
         full_longer = bool(a["full_html"]) and len(a["full_html"].strip()) > len((a["post_html"] or "").strip()) * 1.5
         if len(post) > limit or full_longer:
@@ -4113,8 +4118,16 @@ def _input_value(field, raw, lang, name_limit=100):
         t = text.strip()
         if t == "": return None
         try: value = to_int(t)
-        except (ValueError, TypeError): invalid("عدد صحیح بین ۱ و ۵۰۰ وارد کنید.", "Enter an integer between 1 and 500.")
-        if not 1 <= value <= 500: invalid("بین ۱ و ۵۰۰ انتخاب کنید.", "Choose between 1 and 500.")
+        except (ValueError, TypeError): invalid("عدد صحیح وارد کنید.", "Enter an integer.")
+        plan_cap = None
+        try:
+            cid = st.get("data", {}).get("cid") or st.get("cid")
+            if cid:
+                plan = admin_limits(uid)
+                plan_cap = plan.get("daily_posts")
+        except Exception: pass
+        hi = plan_cap if plan_cap else 500
+        if not 1 <= value <= hi: invalid(f"بین ۱ و {hi} انتخاب کنید.", f"Choose between 1 and {hi}.")
         return value
     if field in INT_FIELDS or field in ("days", "daily_posts", "max_sources", "max_channels", "daily_tests", "max_tokens", "max_uses", "priority", "weight", "percent", "price_num"):
         try: value = to_int(text) if field != "price_num" else float(text.translate(_FA_DIGITS).replace(",", ""))
