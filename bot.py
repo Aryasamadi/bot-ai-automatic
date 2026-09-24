@@ -43,7 +43,7 @@ MODEL_PROBE_MIN = 10
 MIN_INTERVAL = 30            # حداقل فاصله‌ی چرخه (دقیقه)
 MAX_LOOKBACK = 48            # حداکثر بازه‌ی مقالات (ساعت)
 MAX_PPC = 5                  # حداکثر پست در هر چرخه
-POST_LIMIT_DEFAULT = 2500    # سقف کاراکتر پست کانال (پیش‌فرض) — تنظیم طبق دستور مدیر فاز ۳ (قبلی 700)
+POST_LIMIT_DEFAULT = 900     # سقف کاراکتر کپشن کانال (محتوا/امضا/بیشتر در دیپ‌لینک می‌آید) طبق درخواست ادمین (پیش‌فرض) — تنظیم طبق دستور مدیر فاز ۳ (قبلی 700)
 BOT_FULL_MAX = 2500          # سقف کاراکتر محتوای کامل داخل ربات («ادامه در ربات»)
 LANGS = ("fa", "en")
 # ---- محافظت در برابر فشار (قابل تنظیم با متغیر محیطی)
@@ -498,7 +498,7 @@ def default_settings(lang="fa", channel_username=""):
             "categories": [dict(c) for c in DEFAULT_CATEGORIES[lang]], "criteria": [dict(c) for c in DEFAULT_CRITERIA[lang]], "min_score": 60,
             "lookback_hours": 24, "allow_undated": True, "quiet_start": None, "quiet_end": None, "utc_offset": DEFAULT_UTC_OFFSET,
             "include_media": True, "include_link": True, "signature": f"@{channel_username}" if channel_username else "@channel", "max_words": 500, "post_limit": POST_LIMIT_DEFAULT,  # پیش‌فرض کلمات طبق دستور فاز ۳ (قبلی ۱۵۰)
-            "strict_ads": False, "interval_minutes": 60, "posts_per_cycle": 2, "hashtags": True, "daily_posts_cap": None,
+            "strict_ads": False, "interval_minutes": 60, "posts_per_cycle": 1, "hashtags": True, "daily_posts_cap": None,
             "last_run": None, "last_end": None, "last_result": "", "last_diag": None, "last_notified_diag": ""}
 def get_settings(cid):
     ch = q("SELECT settings, username, admin_id FROM channels WHERE id=?", (cid,), one=True)
@@ -1898,7 +1898,7 @@ FORMATTING RULES (mandatory, not optional — these override any conflicting sty
 - VARY THE SUBJECT: name the main person/thing once at first mention, then use pronouns or natural substitutes — never open every paragraph with the same name.
 - UNKNOWN NAMES: a little-known person, company or term gets a one-clause introduction at first mention.
 - NEUTRAL & SOURCE-ONLY: strictly neutral — no judgment, opinion, praise or personal analysis; never add or invent anything beyond the source; never pad to reach the cap — shorter is fine.
-- "post": an engaging, COMPLETE mini-story — max {s['max_words']} words and at most {max(400, int(s['post_limit']))} characters; never leave the story half-told: if space is tight, compress the whole story instead of dropping its second half.{', ending with 2–4 relevant hashtags on the last line' if s['hashtags'] else ''}.
+- "post": an engaging, COMPLETE mini-story — max {s['max_words']} words and at most {s["post_limit"]} characters total; never leave the story half-told: if space is tight, compress the whole story instead of dropping its second half.{', ending with 2–4 relevant hashtags on the last line' if s['hashtags'] else ''}.
 - "full": {'the EXPANDED bot version: everything the post says PLUS the deeper details, background, numbers and context — it must NOT merely repeat the post; start fresh and go deeper. Same format: <b> sub-headings, bullets, at least two <blockquote> highlights (300–700 words, max 2500 characters).' if want_full else 'null'}
 - If the text is an advertisement / advertorial / product-for-sale / betting promotion: is_ad=true.
 - No preamble, never talk about yourself.
@@ -2144,19 +2144,24 @@ async def _publish_article_locked(bot, aid, count_usage=True, test_user=None):
         tail = make_tail(s, ch, a["url"]); post = re.sub(r'\s*🔗 <a href="[^"]+">Source</a>\s*', "\n", a["post_html"] or "")
         post = clean_ai_text(strip_source_url(post, a["url"]), s)
         sig = signature_of(s, ch)
+        tail = make_tail(s, ch, a["url"])
+        body = post
         if sig:
             sig_txt = esc(sig).strip()
-            # فقط اگر امضا در متن باشد و جای آخرش نباشد، یک نسخه‌اش را حذف کن؛ اگر اصلاً نباشد، append نکن (tail خودش اضافه می‌کند)
-            if sig_txt in post and not post.rstrip().endswith(sig_txt):
-                post = post.replace(sig_txt, "", 1).rstrip()
-            body = post[:-len(tail)] if tail and post.endswith(tail) else post
-        else:
-            body = post
-        text = post; limit = int(s["post_limit"])
-        # فاز ۳: دیپ‌لینک «بیشتر» اجباری وقتی متن کامل قابل توجه بزرگ‌تر از پست است — حتی اگر post_limit پاس شود
-        full_longer = bool(a["full_html"]) and len(a["full_html"].strip()) > len((a["post_html"] or "").strip()) * 1.5
-        if len(post) > limit or full_longer:
-            cut, rest = split_post_html(body, max(200, limit - len(tail) - 100 - len(BOT_USERNAME)))
+            # فقط یک نسخه از امضا را می‌خواهیم: اگر مدل داخل متن گذاشته و آخر نباشد، اولین را حذف کن
+            if sig_txt in body and not body.rstrip().endswith(sig_txt):
+                body = body.replace(sig_txt, "", 1).rstrip()
+            # اگر body آخرش امضا ندارد، یک بار append کن
+            if not body.rstrip().endswith(sig_txt):
+                body = body.rstrip() + tail
+            else:
+                body = body.rstrip()
+        more_placeholder = f'\n\n<a href="https://t.me/{BOT_USERNAME}?start=r_">📖 more...</a>'
+        limit = int(s["post_limit"])
+        limit_eff = max(200, limit - len(tail) - len(more_placeholder))
+        text = body
+        if len(text) > limit_eff:
+            cut, rest = split_post_html(body, limit_eff)
             htitle = f"<b>{html.escape(a['title'] or '')}</b>"
             cfull = clean_ai_text(strip_source_url(a["full_html"], a["url"]), s) if source_bot_ok(a["source_id"]) and a["full_html"] else ""
             ftxt = cfull if cfull.strip() else ((htitle + "\n\n" + rest) if rest else htitle)
@@ -2740,7 +2745,7 @@ def reason_text(reason, lang):
         if r.startswith(pre): return tr(lang, key)
     if r.startswith("ai_"): return ai_err_text(r, lang)
     return tr(lang, "rj_other")
-INT_FIELDS = {"max_words": (30, 600), "min_score": (0, 100), "post_limit": (300, 4000), "interval_minutes": (MIN_INTERVAL, 1440), "posts_per_cycle": (1, MAX_PPC), "lookback_hours": (1, MAX_LOOKBACK)}
+INT_FIELDS = {"max_words": (30, 600), "min_score": (0, 100), "post_limit": (300, 900), "interval_minutes": (MIN_INTERVAL, 1440), "posts_per_cycle": (1, MAX_PPC), "lookback_hours": (1, MAX_LOOKBACK)}
 FIELD_LABEL = {"prompt": ("پرامپت نگارش", "Writing prompt"), "topic": ("موضوع کانال", "Channel topic"), "language": ("زبان خروجی (نام زبان را بنویس: Italian، Chinese، فارسی، …)", "Output language (type the language name: Italian, Chinese, English, …)"), "signature": ("امضای پایان پست (@channel = یوزرنیم کانال)", "Post signature (@channel = channel username)"),
                "daily_posts_cap": ("📊 سقف روزانه پست (خالی = نامحدود)", "📊 Daily post cap (blank = unlimited)"), "max_words": ("حداکثر کلمات پست", "Max post words"), "min_score": ("حداقل امتیاز (۰–۱۰۰)", "Min score (0–100)"), "post_limit": ("سقف کاراکتر پست کانال (پیش‌فرض ۳۰۰۰)؛ محتوای کامل‌تر → «ادامه در ربات» (۳۰۰–۴۰۰۰)", "Channel post char limit (default 700); longer content → “continue in bot” (300–4000)"),
                "interval_minutes": (f"فاصله‌ی چرخه (دقیقه، ≥{MIN_INTERVAL})", f"Cycle interval (min, ≥{MIN_INTERVAL})"), "posts_per_cycle": (f"پست در هر چرخه (≤{MAX_PPC})", f"Posts per cycle (≤{MAX_PPC})"), "lookback_hours": (f"مقالات چند ساعت اخیر (≤{MAX_LOOKBACK})", f"Articles from last N hours (≤{MAX_LOOKBACK})")}
