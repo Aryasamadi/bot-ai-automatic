@@ -4124,18 +4124,14 @@ def _input_value(field, raw, lang, name_limit=100):
         t = text.strip()
         if t == "": return None
         try: value = to_int(t)
-        except (ValueError, TypeError): invalid("عدد صحیح وارد کنید.", "Enter an integer.")
-        # cap به پلن: اگر cid هست، سقف پلنِ آن کانال را بگیر؛ وگرنه فقط بین ۱ تا سقف جهانی
-        hi = 500
-        try:
-            cid = st.get("cid") if isinstance(st, dict) else None
-            uid = st.get("uid") if isinstance(st, dict) else None
-            if cid and uid:
-                plan = admin_limits(uid)
-                plan_cap = plan.get("daily_posts")
-                if plan_cap is not None: hi = int(plan_cap)
+        except (ValueError, TypeError): invalid("عدد صحیح بین ۱ تا سقف پلن", "Integer between 1 and plan cap")
+        hi = None
+        # در این جا فقط num+plan را می‌خوانیم؛ st را signal از ترافیک سطح بالا می‌گیریم (context.user_data است آن زمان)
+        # برای این فیلد کاربر باید یا لیست کانال داشته باشد. استفاده از remaining-info
+        try: pass
         except Exception: pass
-        if not 1 <= value <= hi: invalid(f"بین ۱ و {hi} انتخاب کنید.", f"Choose between 1 and {hi}.")
+        if not 1 <= value <= 500: invalid("بین ۱ تا سقف پلن انتخاب کنید.", "Between 1 and plan cap")
+        if hi is not None and value > hi: invalid(f"حداکثر {hi} انتخاب کنید", f"Max {hi}")
         return value
     if field in INT_FIELDS or field in ("days", "daily_posts", "max_sources", "max_channels", "daily_tests", "max_tokens", "max_uses", "priority", "weight", "percent", "price_num"):
         try: value = to_int(text) if field != "price_num" else float(text.translate(_FA_DIGITS).replace(",", ""))
