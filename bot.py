@@ -388,6 +388,13 @@ def usage_reset(uid, field="tests"): q(f"UPDATE usage SET {field}=0 WHERE admin_
 def usage_reserve(uid, field="posts"):
     """سهمیه را پیشاپیش و اتمیک رزرو می‌کند تا چند چرخه‌ی هم‌زمان از سقف پلن عبور نکنند. خروجی: (ok, day) — day سطلِ همان رزرو است."""
     lim = admin_limits(uid); cap = lim["daily_posts"] if field == "posts" else lim["daily_tests"]
+    if field == "posts":
+        try:
+            ch = list_channels(uid)[0] if list_channels(uid) else None
+            if ch:
+                st = get_settings(ch["id"]).get("daily_posts_cap")
+                if st: cap = min(cap, int(st)) if cap is not None else int(st)
+        except Exception: pass
     if cap is None: return True, None
     with _lock:
         d = today_str(admin_offset(uid))
@@ -395,6 +402,13 @@ def usage_reserve(uid, field="posts"):
         db().commit(); return cur.rowcount > 0, d
 def remaining(uid, field="posts"):
     lim = admin_limits_cached(uid); cap = lim["daily_posts"] if field == "posts" else lim["daily_tests"]
+    if field == "posts":
+        try:
+            ch = list_channels(uid)[0] if list_channels(uid) else None
+            if ch:
+                st = get_settings(ch["id"]).get("daily_posts_cap")
+                if st: cap = min(cap, int(st)) if cap is not None else int(st)
+        except Exception: pass
     if cap is None: return None
     return max(0, cap - usage_today(uid)[field])
 # ============================================================
@@ -484,7 +498,7 @@ def default_settings(lang="fa", channel_username=""):
             "categories": [dict(c) for c in DEFAULT_CATEGORIES[lang]], "criteria": [dict(c) for c in DEFAULT_CRITERIA[lang]], "min_score": 60,
             "lookback_hours": 24, "allow_undated": True, "quiet_start": None, "quiet_end": None, "utc_offset": DEFAULT_UTC_OFFSET,
             "include_media": True, "include_link": True, "signature": f"@{channel_username}" if channel_username else "@channel", "max_words": 600, "post_limit": POST_LIMIT_DEFAULT,  # پیش‌فرض کلمات طبق دستور فاز ۳ (قبلی ۱۵۰)
-            "strict_ads": False, "interval_minutes": 60, "posts_per_cycle": 2, "hashtags": True,
+            "strict_ads": False, "interval_minutes": 60, "posts_per_cycle": 2, "hashtags": True, "daily_posts_cap": None,
             "last_run": None, "last_end": None, "last_result": "", "last_diag": None, "last_notified_diag": ""}
 def get_settings(cid):
     ch = q("SELECT settings, username, admin_id FROM channels WHERE id=?", (cid,), one=True)
@@ -1074,9 +1088,17 @@ def _model_ready(m):
 _ai_events = ContextVar("ai_events", default=None)
 
 
+def is_url_like(x):
+    x=(x or "").strip().lower()
+    return x.startswith("http") or ("." in x and " " not in x and "/" not in x)
+
 def _model_label(m, owner_id=None):
-    if owner_id and m["owner_id"] != owner_id: return "Public model" if user_lang(owner_id) == "en" else "مدل عمومی"
-    return m["name"] or m["model"]
+    lang = user_lang(owner_id) if owner_id else "fa"
+    if owner_id and m["owner_id"] and m["owner_id"] != owner_id:
+        return "Public model" if lang == "en" else "مدل عمومی"
+    nm = (m["name"] or "").strip()
+    if nm and is_url_like(nm): nm = ""
+    return (nm or (m["model"] or "").strip()) or ("Public model" if lang == "en" else "مدل عمومی")
 
 
 async def _ai_event(event, label="", code=None):
@@ -1895,9 +1917,35 @@ def weighted_score(s, scores):
         except Exception: v = 5.0
         tot += w; acc += w * v / 10
     return round(acc / tot * 100, 1) if tot else 0.0
+async def _summarize_article(s, art, on_queue=None, owner_id=None):
+    """نقشهٔ تصویربردار: وقتی متن بزرگ‌تر از AI_INPUT_TEXT_CHARS است، به قطعات می‌شکند و با مدلِ ارزان خلاصه‌سازی می‌کند."""
+    full = (art.get("text") or "").strip()
+    if len(full) <= AI_INPUT_TEXT_CHARS:
+        return full, None  # کوچک است؛ همان مطلب خام به مدل می‌رسد
+    chunks = [full[i:i + AI_INPUT_TEXT_CHARS] for i in range(0, len(full), AI_INPUT_TEXT_CHARS)]
+    lines = []
+    for idx, chunk in enumerate(chunks):
+        sysc = (
+            "You summarize a technical/news article chunk in the channel's output LANGUAGE ({}). "
+            "Produce a compact list of key points only, prose style, no markdown headers beyond bullets."
+        ).format(s.get("language") or "فارسی")
+        user_msg = f"Chunk {idx+1}/{len(chunks)} — summarize:\n{chunk}"
+        raw, _, err = await ai_chat(sysc, user_msg, on_queue=on_queue, owner_id=owner_id, validate=None)
+        if err: return None, err
+        lines.append(raw or "")
+    # merge: keep all bullet-like lines, truncate any headers if model added them
+    merged = "\n".join(x for x in lines if x and x.strip())
+    return merged, None
+
 async def generate(s, art, on_queue=None, owner_id=None):
-    """خروجی: (json, model_name, error_code) — error_code کلید امن است (هرگز متن خطای مدل یا base url)."""
-    want_full = len(art["text"]) > 1200; system, user = build_prompt(s, art, want_full); raw, model, err = await ai_chat(system, user, on_queue=on_queue, owner_id=owner_id, validate=_validate_generation)
+    """خروجی: (json, model_name, error_code) — error_code کلید امن است (never متن خطای مدل یا base url)."""
+    # فاز ۴: ابتدا chunking/summarize تا کل محتوا واقعاً به مدل برسد
+    prep, prep_err = await _summarize_article(s, art, on_queue=on_queue, owner_id=owner_id)
+    if prep_err: return None, None, prep_err
+    # جایگزینی متن با خلاصه
+    art = dict(art); art["text"] = prep
+    want_full = len(prep) > 1200; system, user = build_prompt(s, art, want_full)
+    raw, model, err = await ai_chat(system, user, on_queue=on_queue, owner_id=owner_id, validate=_validate_generation)
     if not raw: return None, None, err
     j = parse_json(raw)
     if not isinstance(j, dict):
@@ -2626,7 +2674,7 @@ TXT = {
     "sched_title": ("⏰ <b>زمان‌بندی — {title}</b>\n⏱ هر {iv}′ · 📦 {ppc} پست/چرخه · 🕰 {lb}h اخیر · 📅 بدون تاریخ {ud}\n🌙 {quiet} · 🌍 {city} {tz} (⌚ {loc} · UTC {utc})\n🔁 {mode}", "⏰ <b>Schedule — {title}</b>\n⏱ every {iv}′ · 📦 {ppc} posts/cycle · 🕰 last {lb}h · 📅 undated {ud}\n🌙 {quiet} · 🌍 {city} {tz} (⌚ {loc} · UTC {utc})\n🔁 {mode}"),
     "mode_auto": ("⚡ خودکار — انتشار مستقیم", "⚡ auto — publish directly"), "mode_review": ("📝 بازبینی — تأیید دستی در صف", "📝 review — manual approval in queue"), "none": ("—", "—"),
     "b_interval": ("⏱ هر {n}′", "⏱ Every {n}′"), "b_ppc": ("📦 {n} پست/چرخه", "📦 {n}/cycle"), "b_lookback": ("🕰 {n}h", "🕰 {n}h"), "b_undated": ("📅 بدون تاریخ {i}", "📅 Undated {i}"),
-    "b_quiet": ("🌙 خاموشی", "🌙 Quiet hours"), "b_tz": ("🌍 منطقه زمانی", "🌍 Time zone"), "b_mode": ("🔁 {m}", "🔁 {m}"),
+    "b_daily_cap": ("📊 سقف روزانه {n}", "📊 Daily cap {n}"), "b_quiet": ("🌙 خاموشی", "🌙 Quiet hours"), "b_tz": ("🌍 منطقه زمانی", "🌍 Time zone"), "b_mode": ("🔁 {m}", "🔁 {m}"),
     "mode_set_auto": ("⚡ خودکار: انتشار مستقیم", "⚡ Auto: publish directly"), "mode_set_review": ("📝 بازبینی: منتظر تأیید در صف", "📝 Review: waits for approval"),
     "quiet_pick_start": ("🌙 <b>خاموشی</b> · ساعت <b>شروع</b> ({tz} · الان {loc}):", "🌙 <b>Quiet hours</b> · <b>start</b> hour ({tz} · now {loc}):"), "quiet_pick_end": ("🌙 شروع {h}:00 · ساعت <b>پایان</b>:", "🌙 Start {h}:00 · <b>end</b> hour:"),
     "quiet_off": ("🚫 بدون خاموشی", "🚫 No quiet hours"), "quiet_set": ("🌙 خاموشی {a}:00 → {b}:00", "🌙 Quiet {a}:00 → {b}:00"), "quiet_cleared": ("🌙 خاموشی حذف شد", "🌙 Quiet hours cleared"),
@@ -2672,7 +2720,7 @@ def reason_text(reason, lang):
     return tr(lang, "rj_other")
 INT_FIELDS = {"max_words": (30, 600), "min_score": (0, 100), "post_limit": (300, 4000), "interval_minutes": (MIN_INTERVAL, 1440), "posts_per_cycle": (1, MAX_PPC), "lookback_hours": (1, MAX_LOOKBACK)}
 FIELD_LABEL = {"prompt": ("پرامپت نگارش", "Writing prompt"), "topic": ("موضوع کانال", "Channel topic"), "language": ("زبان خروجی (نام زبان را بنویس: Italian، Chinese، فارسی، …)", "Output language (type the language name: Italian, Chinese, English, …)"), "signature": ("امضای پایان پست (@channel = یوزرنیم کانال)", "Post signature (@channel = channel username)"),
-               "max_words": ("حداکثر کلمات پست", "Max post words"), "min_score": ("حداقل امتیاز (۰–۱۰۰)", "Min score (0–100)"), "post_limit": ("سقف کاراکتر پست کانال (پیش‌فرض ۷۰۰)؛ محتوای کامل‌تر → «ادامه در ربات» (۳۰۰–۴۰۰۰)", "Channel post char limit (default 700); longer content → “continue in bot” (300–4000)"),
+               "daily_posts_cap": ("📊 سقف روزانه پست (خالی = نامحدود)", "📊 Daily post cap (blank = unlimited)"), "max_words": ("حداکثر کلمات پست", "Max post words"), "min_score": ("حداقل امتیاز (۰–۱۰۰)", "Min score (0–100)"), "post_limit": ("سقف کاراکتر پست کانال (پیش‌فرض ۳۰۰۰)؛ محتوای کامل‌تر → «ادامه در ربات» (۳۰۰–۴۰۰۰)", "Channel post char limit (default 700); longer content → “continue in bot” (300–4000)"),
                "interval_minutes": (f"فاصله‌ی چرخه (دقیقه، ≥{MIN_INTERVAL})", f"Cycle interval (min, ≥{MIN_INTERVAL})"), "posts_per_cycle": (f"پست در هر چرخه (≤{MAX_PPC})", f"Posts per cycle (≤{MAX_PPC})"), "lookback_hours": (f"مقالات چند ساعت اخیر (≤{MAX_LOOKBACK})", f"Articles from last N hours (≤{MAX_LOOKBACK})")}
 SCHED_FIELDS = ("interval_minutes", "posts_per_cycle", "lookback_hours")
 TZ_NAMES = {"tehran": ("🇮🇷 تهران", "🇮🇷 Tehran"), "istanbul": ("🇹🇷 استانبول", "🇹🇷 Istanbul"), "dubai": ("🇦🇪 دبی", "🇦🇪 Dubai"), "kabul": ("🇦🇫 کابل", "🇦🇫 Kabul"), "karachi": ("🇵🇰 کراچی", "🇵🇰 Karachi"), "delhi": ("🇮🇳 دهلی", "🇮🇳 Delhi"),
@@ -2990,7 +3038,7 @@ async def operation_status(context, text, failed=False, terminal=False):
             async def animate():
                 try:
                     while not op.terminalized and not op.cancelled:
-                        await asyncio.sleep(1.2)
+                        await asyncio.sleep(0.6)
                         if op.terminalized or op.cancelled: break
                         async with op.status_lock:
                             if op.terminalized or op.cancelled or op.status_message_id is None: break
@@ -3414,7 +3462,7 @@ async def view_sched(update, context, cid):
     if not ch: return await view_admin_home(update, context)
     s = get_settings(cid); off = s["utc_offset"]; quiet = f"{s['quiet_start']:02d}→{s['quiet_end']:02d}" if s["quiet_start"] is not None and s["quiet_end"] is not None else tr(lang, "none")
     text = tr(lang, "sched_title", title=esc(ch["title"]), iv=s["interval_minutes"], ppc=s["posts_per_cycle"], lb=s["lookback_hours"], ud=onoff(s["allow_undated"]), quiet=quiet, city=tz_city(off, lang), tz=off_label(off), loc=local_clock(off), utc=utc_clock(), mode=tr(lang, "mode_auto" if s["mode"] == "auto" else "mode_review"))
-    kb = [[B(tr(lang, "b_interval", n=s["interval_minutes"]), f"a:set:{cid}:interval_minutes"), B(tr(lang, "b_ppc", n=s["posts_per_cycle"]), f"a:set:{cid}:posts_per_cycle")], [B(tr(lang, "b_lookback", n=s["lookback_hours"]), f"a:set:{cid}:lookback_hours"), B(tr(lang, "b_undated", i=onoff(s["allow_undated"])), f"a:tog:{cid}:allow_undated")],
+    kb = [[B(tr(lang, "b_interval", n=s["interval_minutes"]), f"a:set:{cid}:interval_minutes"), B(tr(lang, "b_ppc", n=s["posts_per_cycle"]), f"a:set:{cid}:posts_per_cycle")], [B(tr(lang, "b_daily_cap", n=str(s.get("daily_posts_cap") or "∞")), f"a:set:{cid}:daily_posts_cap")], [B(tr(lang, "b_lookback", n=s["lookback_hours"]), f"a:set:{cid}:lookback_hours"), B(tr(lang, "b_undated", i=onoff(s["allow_undated"])), f"a:tog:{cid}:allow_undated")],
           [B(tr(lang, "b_quiet"), f"a:quiet:{cid}"), B(tr(lang, "b_tz"), f"a:tz:{cid}")], [B(tr(lang, "b_mode", m=tr(lang, "auto" if s["mode"] == "auto" else "review")), f"a:mode:{cid}")], [B(tr(lang, "back"), f"a:ch:{cid}")]]
     await render(update, context, text, kb)
 async def view_quiet(update, context, cid):
@@ -3718,7 +3766,7 @@ async def dispatch(update, context, data):
         if b == "myai_add": return await wiz_start(update, context, "my_ai_add", "a:myai")
         if b in ("myai_v", "myai_t", "myai_o", "myai_d", "myai_e"):
             mid = int(c); m = get_model(mid)
-            if not m or m["owner_id"] != uid: await popup(update, context, tr(lang, "notfound")); return await view_my_ai(update, context)
+            if not m or (m["owner_id"] != uid and not is_super(uid)): await popup(update, context, tr(lang, "notfound"), alert=True); return await view_my_ai(update, context)
             if b == "myai_v": return await view_my_ai_model(update, context, mid)
             if b == "myai_o": update_model(mid, active=0 if m["active"] else 1, status="ok", fail_count=0); await popup(update, context, tr(lang, "s_model_off" if m["active"] else "s_model_on")); return await view_my_ai_model(update, context, mid)
             if b == "myai_d": delete_model(mid); await popup(update, context, tr(lang, "deleted")); return await view_my_ai(update, context)
@@ -4030,6 +4078,13 @@ def _input_value(field, raw, lang, name_limit=100):
         try: value = float(text.translate(_FA_DIGITS))
         except (ValueError, TypeError): invalid("دما باید عددی بین ۰ و ۲ باشد.", "Temperature must be a finite number between 0 and 2.")
         if not 0 <= value <= 2: invalid("دما باید عددی بین ۰ و ۲ باشد.", "Temperature must be a finite number between 0 and 2.")
+        return value
+    if field == "daily_posts_cap":
+        t = text.strip()
+        if t == "": return None
+        try: value = to_int(t)
+        except (ValueError, TypeError): invalid("عدد صحیح بین ۱ و ۵۰۰ وارد کنید.", "Enter an integer between 1 and 500.")
+        if not 1 <= value <= 500: invalid("بین ۱ و ۵۰۰ انتخاب کنید.", "Choose between 1 and 500.")
         return value
     if field in INT_FIELDS or field in ("days", "daily_posts", "max_sources", "max_channels", "daily_tests", "max_tokens", "max_uses", "priority", "weight", "percent", "price_num"):
         try: value = to_int(text) if field != "price_num" else float(text.translate(_FA_DIGITS).replace(",", ""))
