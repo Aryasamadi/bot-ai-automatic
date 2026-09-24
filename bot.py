@@ -43,7 +43,7 @@ MODEL_PROBE_MIN = 10
 MIN_INTERVAL = 30            # حداقل فاصله‌ی چرخه (دقیقه)
 MAX_LOOKBACK = 48            # حداکثر بازه‌ی مقالات (ساعت)
 MAX_PPC = 5                  # حداکثر پست در هر چرخه
-POST_LIMIT_DEFAULT = 700     # سقف کاراکتر پست کانال (پیش‌فرض)؛ بیشتر از آن → «ادامه در ربات»
+POST_LIMIT_DEFAULT = 3000    # سقف کاراکتر پست کانال (پیش‌فرض) — تنظیم طبق دستور مدیر فاز ۳ (قبلی 700)
 BOT_FULL_MAX = 2500          # سقف کاراکتر محتوای کامل داخل ربات («ادامه در ربات»)
 LANGS = ("fa", "en")
 # ---- محافظت در برابر فشار (قابل تنظیم با متغیر محیطی)
@@ -483,7 +483,7 @@ def default_settings(lang="fa", channel_username=""):
     return {"ui_lang": lang, "enabled": True, "mode": "auto", "prompt": DEFAULT_PROMPT[lang], "topic": "", "language": "فارسی" if lang == "fa" else "English",
             "categories": [dict(c) for c in DEFAULT_CATEGORIES[lang]], "criteria": [dict(c) for c in DEFAULT_CRITERIA[lang]], "min_score": 60,
             "lookback_hours": 24, "allow_undated": True, "quiet_start": None, "quiet_end": None, "utc_offset": DEFAULT_UTC_OFFSET,
-            "include_media": True, "include_link": True, "signature": f"@{channel_username}" if channel_username else "@channel", "max_words": 150, "post_limit": POST_LIMIT_DEFAULT,
+            "include_media": True, "include_link": True, "signature": f"@{channel_username}" if channel_username else "@channel", "max_words": 600, "post_limit": POST_LIMIT_DEFAULT,  # پیش‌فرض کلمات طبق دستور فاز ۳ (قبلی ۱۵۰)
             "strict_ads": False, "interval_minutes": 60, "posts_per_cycle": 2, "hashtags": True,
             "last_run": None, "last_end": None, "last_result": "", "last_diag": None, "last_notified_diag": ""}
 def get_settings(cid):
@@ -2094,7 +2094,9 @@ async def _publish_article_locked(bot, aid, count_usage=True, test_user=None):
             article_update(aid, status="rejected", reason="duplicate"); return False, "duplicate"
         media = json.loads(a["media"]) if a["media"] and s["include_media"] else None
         tail = make_tail(s, ch, a["url"]); post = re.sub(r'\s*🔗 <a href="[^"]+">Source</a>\s*', "\n", a["post_html"] or ""); post = clean_ai_text(strip_source_url(post, a["url"]), s); body = post[:-len(tail)] if tail and post.endswith(tail) else post; text = post; limit = int(s["post_limit"])
-        if len(post) > limit:
+        # فاز ۳: دیپ‌لینک «بیشتر» اجباری وقتی متن کامل قابل توجه بزرگ‌تر از پست است — حتی اگر post_limit پاس شود
+        full_longer = bool(a["full_html"]) and len(a["full_html"].strip()) > len((a["post_html"] or "").strip()) * 1.5
+        if len(post) > limit or full_longer:
             cut, rest = split_post_html(body, max(200, limit - len(tail) - 100 - len(BOT_USERNAME)))
             htitle = f"<b>{html.escape(a['title'] or '')}</b>"
             cfull = clean_ai_text(strip_source_url(a["full_html"], a["url"]), s) if source_bot_ok(a["source_id"]) and a["full_html"] else ""
@@ -2463,23 +2465,41 @@ async def scheduler_tick(bot):
         except Exception as e: log_event("ERROR", f"plan notifications: {e}")
         if not gget("automation_enabled", True): return
         due = []
+        skipped = []
         for u in list_admins():
             uid = u["id"]
-            if not admin_limits(uid)["active"]: continue
+            if not admin_limits(uid)["active"]:
+                skipped.append((uid, "plan_expired")); continue
             rem = remaining(uid, "posts")
             for ch in list_channels(uid):
                 s = get_settings(ch["id"])
-                if not s["enabled"]: continue
+                if not s["enabled"]:
+                    skipped.append((uid, ch["id"], "disabled")); continue
                 try: await flush_ready(bot, uid, ch["id"])
                 except Exception as e: log_event("ERROR", f"flush {ch['title']}: {e}", uid)
                 rem = remaining(uid, "posts")
-                if rem is not None and rem <= 0: continue
-                if in_quiet(s) and s["mode"] == "auto": continue
+                if rem is not None and rem <= 0:
+                    skipped.append((uid, ch["id"], "quota")); continue
+                if in_quiet(s) and s["mode"] == "auto":
+                    skipped.append((uid, ch["id"], "quiet")); continue
                 lr = parse_dt(s["last_run"])
-                if not lr or (now_utc() - lr) >= timedelta(minutes=int(s["interval_minutes"])): due.append((lr.isoformat() if lr else "", uid, ch, s))
+                if not lr or (now_utc() - lr) >= timedelta(minutes=int(s["interval_minutes"])):
+                    due.append((lr.isoformat() if lr else "", uid, ch, s))
+                else:
+                    skipped.append((uid, ch["id"], f"not_due (next in {int(s['interval_minutes']) - int((now_utc() - lr).total_seconds())//60}′)"))
         gset("load_due", len(due))
-        if not due: return
-        if not any(any_model_available(uid) for _, uid, _, _ in due): log_event("WARN", f"{len(due)} کانال در انتظار؛ هیچ مدل AI در دسترس نیست"); return
+        if skipped:
+            log_event("INFO", f"scheduler skip-summary: {'; '.join(f'{u}/{c}/{r}' for u, c, r in skipped[:10])}")
+        if not due:
+            log_event("INFO", "scheduler: nothing due this tick")
+            return
+        # مدل در دسترس: فقط کانال‌هایی که مدل آماده دارند انجام شوند؛ بقیه در حافظه لاگ می‌شوند
+        ready_uids = set(uid for _, uid, _, _ in due if any_model_available(uid))
+        if not ready_uids:
+            log_event("WARN", f"{len(due)} کانال در انتظار؛ هیچ مدل AI در دسترس نیست (ساختار مدار شکننده فعّال)")
+            return
+        due = [d for d in due if d[1] in ready_uids]
+        log_event("INFO", f"scheduler dispatching {len(due)} cycles")
         due.sort(key=lambda x: x[0]); batch = due[:MAX_CYCLES_PER_TICK]
         gset("last_cycle_start", now_iso()); await asyncio.gather(*[_scheduled(bot, uid, ch, s) for _, uid, ch, s in batch]); gset("last_cycle_end", now_iso())
 # ============================================================
@@ -2939,7 +2959,9 @@ async def operation_status(context, text, failed=False, terminal=False):
                 context.user_data["status_message_id"] = op.status_message_id
             if op.status_message_id is not None:
                 context.user_data["status_message_id"] = op.status_message_id
-                # پیام نتیجه‌ی پایانی ماندگار است تا عملکرد/نتیجه قابل مرور بماند (فاز ۱).
+                # فاز ۳: پیام نتیجه‌ی نهایی پس از نمایش ۵ ثانیه‌ای پاک می‌شود تا صفحه تمیز بماند
+                _temp_messages.add((op.chat_id, op.status_message_id))
+                expire_temp(context.bot, op.chat_id, op.status_message_id, 5)
         return True
 
     async with op.status_lock:
@@ -3507,7 +3529,15 @@ async def run_test(update, context, cid):
     elif res.get("queued"): text = f"{tr(lang, 'test_queued')}{src_line}\n\n{tr(lang, 'test_log', d=diag)}"; kb.append([B(tr(lang, "queue", n=ready_count(cid)), f"a:que:{cid}")])
     else: text = f"{tr(lang, 'test_fail')}{src_line}\n\n{tr(lang, 'test_log', d=diag)}\n\n{tr(lang, 'test_retry_note')}"; kb.append([B(tr(lang, "rejected"), f"a:rej:{cid}"), B(tr(lang, "sched"), f"a:sch:{cid}")])
     op = _current_operation.get()
-    model_line = ("Model used: " if lang == "en" else "مدل استفاده‌شده: ") + esc(", ".join(model_labels)) if model_labels else ""
+    def _final_label(lbl):
+        if lbl in ("مدل عمومی", "Public model", "مدل عمومی/پیش‌فرض", "Public/default model"):
+            try:
+                mm = get_model(gget("test_model_id")) if gget("test_model_id") else None
+                if mm and mm.get("model"): return f"{'مدل عمومی' if lang=='fa' else 'Public model'} ({mm['model']})"
+            except Exception: pass
+            return "مدل عمومی" if lang == "fa" else "Public model"
+        return lbl
+    model_line = ("مدل: " if lang == "fa" else "Model: ") + esc(", ".join(_final_label(l) for l in model_labels)) if model_labels else ""
     links_count = len(res.get('links', []))
     # Terminal status: clean final message (Thinking prefix will be stripped by operation_status)
     if ok:
