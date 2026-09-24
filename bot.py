@@ -2182,7 +2182,23 @@ DIAG = {
 STAGES = {"start": ("شروع", "start"), "checks": ("بررسی پلن/کانال/منبع", "checks"), "discover": ("کشف مقالات", "discovery"), "extract": ("استخراج متن", "extraction"), "filter": ("فیلتر", "filtering"), "ai": ("تولید با AI", "AI generation"), "score": ("امتیازدهی", "scoring"), "publish": ("انتشار", "publishing"), "done": ("پایان", "done")}
 class Diag:
     def __init__(self): self.items, self.hints, self.stage = [], [], "start"
-    def add(self, key, **kw): self.items.append((key, kw))
+    def add(self, key, **kw):
+        self.items.append((key, kw))
+        op = _current_operation.get()
+        if op is None: return
+        mapping = {
+            "busy": ("run", "⏳ در حال بررسیِ قبلی…"), "checks": ("run", "🔎 بررسی راه‌اندازی…"),
+            "no_channel": ("fail", "❌ کانال یافت نشد"), "plan_inactive": ("fail", "⛔ پلن فعال نیست"),
+            "quota_posts": ("fail", "📉 سهمیه‌ی امروز تمام شد"), "quota_tests": ("fail", "🧪 سهمیه‌ی تست تمام شد"),
+            "no_sources": ("fail", "📭 هیچ منبعی فعال نیست"), "src_cooldown": ("run", "⏳ منبع در حال بازیابی…"),
+            "src_fail": ("fail", "❌ خطای منبع"), "src_notmod": ("run", "⏳ منبع تغییر نکرده است"),
+            "src_empty": ("fail", "📭 خروجی منبع خالی"), "found": ("ok", "📥 مورد یافت شد"),
+            "extract": ("run", "🧾 استخراج محتوا…"), "low": ("run", "📏 بررسی امتیاز…"), "ad": ("run", "🚫 بررسی تبلیغ…"),
+            "ai": ("run", "⏳ در حال تولید با AI…"), "queue": ("run", "⏳ در صف انتشار…"),
+            "published": ("ok", "✅ منتشر شد"), "queued": ("ok", "📌 در انتظار")
+        }
+        st = mapping.get(key)
+        if st: step_add(op, key, status=st[0])
     def hint(self, key, **kw):
         if key not in [h[0] for h in self.hints]: self.hints.append((key, kw))
     def keys(self): return sorted({k for k, _ in self.items if k not in ("src_ok", "src_notmod", "found", "detail", "leftover", "retry")})
@@ -2718,10 +2734,12 @@ class Operation:
     ai_popup: bool = False
     status_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     debug_tag: str = ""
-    thinking_step: int = 0  # for Thinking... animation during operation
+    thinking_step: int = 0  # اسپینر Thinking/Working
     thinking_task: asyncio.Task | None = None
     terminalized: bool = False
     status_display: str = ""
+    steps: list = field(default_factory=list)            # هر قدم: {emoji,text,status,model?,ts}
+    header_kind: str = "thinking"                       # thinking | working | none
 
 
 def operation_checkpoint():
@@ -2742,8 +2760,28 @@ def user_control(uid):
     return _user_controls[uid]
 
 
+STEP_VARIANTS = {
+    "thinking": [("🧠 Thinking…", "🧠 Thinking…"), ("🤔 Thinking…", "🤔 Thinking…"), ("🔎 Thinking…", "🔎 Thinking…")],
+    "working": [("⚙️ Working…", "⚙️ Working…"), ("⏳ Working…", "⏳ Working…"), ("🛠 Working…", "🛠 Working…")],
+}
+STEP_ICON = {"ok": "✅", "fail": "❌", "run": "⏳", "warn": "⚠️"}
+def step_add(op, category, key=None, status="run", model=None, **fmt):
+    """سابقه‌ی مرحله‌ای با سه وارینت از هر دسته؛ در هر نمایش، وارینت جدید به‌صورت رندوم انتخاب می‌شود."""
+    if op is None: return
+    steps = getattr(op, "steps", None)
+    if steps is None: return
+    # upsert per (category,key) — آخرین وضعیت به‌روز می‌شود
+    rec = None
+    for st in reversed(steps):
+        if st.get("category") == category and st.get("key") == key: rec = st; break
+    if rec is None:
+        rec = {"category": category, "key": key, "variant": random.randrange(3), "entered": time.time()}
+        steps.append(rec)
+    rec.update(status=status, model=model, fmt=fmt or {})
+    if op.header_kind == "thinking" and category.startswith(("ai_", "model_")):
+        op.header_kind = "working"
+
 def thinking_animation(step):
-    """Generate the three-step Thinking animation."""
     return "Thinking" + "." * (1 + (step % 3))
 
 
@@ -2753,10 +2791,61 @@ def strip_thinking_prefix(text):
     return re.sub(r"^\s*(?:<b>)?Thinking(?:\.{1,3}|…)(?:</b>)?\s*\n", "", str(text), count=1)
 
 
+SPHARSE = {
+  ("model_start","run",0): "⏳ در حال اتصال به {}…", ("model_start","run",1): "🔌 {} در راه است…", ("model_start","run",2): "⏳ صبر می‌کنم تا {} جواب بده…",
+  ("model_start","ok",0): "✅ {} جواب داد", ("model_start","ok",1): "✅ به {} رسیدم", ("model_start","ok",2): "✅ {} تایید شد",
+  ("model_start","fail",0): "❌ {} جواب نداد", ("model_start","fail",1): "⚠️ خطا از {} — عیب یاب", ("model_start","fail",2): "❌ {} از دسترس رفت",
+  ("model_ok","ok",0): "✅ مدل {} قبول شد", ("model_ok","ok",1): "🎯 {} سالم بود", ("model_ok","ok",2): "✅ خروجی {} سالم است",
+  ("model_fail","fail",0): "❌ خطا در {}", ("model_fail","fail",1): "⚠️ {} گیر کرد", ("model_fail","fail",2): "🛑 {} متوقف شد",
+  ("src_check","run",0): "⏳ در حال بررسی منبع…", ("src_check","run",1): "⏳ به منبع وصل می‌شوم…", ("src_check","run",2): "⏳ چک کردن منبع…",
+  ("src_found","ok",0): "✅ چیزی پیدا کردم", ("src_found","ok",1): "📝 یک مورد بالقوه یافتم", ("src_found","ok",2): "✅ موضوع خوب تشخیص دادم",
+  ("src_empty","fail",0): "📭 چیزی پیدا نشد", ("src_empty","fail",1): "⚠️ خروجی خالی بود", ("src_empty","fail",2): "❌ مورد مناسب نبود",
+  ("post_gen","run",0): "⏳ در حال نگارش…", ("post_gen","run",1): "🧠 دارم فکر می‌کنم روی سبک…", ("post_gen","run",2): "⌛ در حال تولید…",
+  ("post_ready","ok",0): "✅ خروجی آماده شد", ("post_ready","ok",1): "🎉 پست تولید شد", ("post_ready","ok",2): "📨 دا�م ارسال می‌کنم…",
+}
+SPHARSE.update({
+  ("busy","run",0): "⏳ عملیات قبلی هنوز تمام نشده", ("busy","run",1): "⏳ در حال تکمیل چرخه‌ی قبلی…", ("busy","run",2): "⏳ منتظر باز شدن کانال…",
+  ("plan_inactive","fail",0): "⛔ پلن فعال نیست", ("plan_inactive","fail",1): "🛑 پلن نیاز به تمدید دارد", ("plan_inactive","fail",2): "⚠️ مجوز انتشار فعلی منقضی است",
+  ("quota_posts","fail",0): "📉 سهمیه‌ی امروز به اتمام رسید", ("quota_posts","fail",1): "⛔ سقف روزانه پر شده", ("quota_posts","fail",2): "⚠️ امروز دیگر ظرفیت انتشار نیست",
+  ("quota_tests","fail",0): "🧪 سهمیه‌ی تست امروز پر شده", ("quota_tests","fail",1): "⛔ ظرفیت تست تمام شده", ("quota_tests","fail",2): "🧪 محدودیت تست اعمال شد",
+  ("no_sources","fail",0): "📭 هیچ منبعی فعال نیست", ("no_sources","fail",1): "🚫 هیچ منبع فعالی یافت نشد", ("no_sources","fail",2): "📭 منبعی برای بررسی نیست",
+  ("src_cooldown","run",0): "⏳ منبع در حال خنک شدن است", ("src_cooldown","run",1): "🔄 منبع در بازه‌ی بازیابی است", ("src_cooldown","run",2): "⏳ بعداً دوباره منبع بازدید می‌شود",
+  ("src_fail","fail",0): "❌ خطای دسترسی به منبع", ("src_fail","fail",1): "⚠️ منبع پاسخ نداد", ("src_fail","fail",2): "❌ منبع قطع است",
+  ("src_notmod","run",0): "ℹ️ منبع تغییری نکرده است", ("src_notmod","run",1): "⏳ خبر تازه‌ای موجود نیست", ("src_notmod","run",2): "ℹ️ محتوا همان است",
+  ("src_empty","fail",0): "📭 چیزی مطابق معیار یافت نشد", ("src_empty","fail",1): "⚠️ محتوایی مطابق برند نیست", ("src_empty","fail",2): "❌ قابل استفاده نیست",
+  ("found","ok",0): "📥 موردی مطابق یافت شد", ("found","ok",1): "✅ یک گزینه‌ی خوب پیدا شد", ("found","ok",2): "🎯 آیتم مناسب تشخیص داده شد",
+  ("extract","run",0): "🧾 در حال استخراج متن…", ("extract","run",1): "🔍 متن را بیرون می‌کشم…", ("extract","run",2): "📄 بدنه‌ی خبر را می‌خوانم…",
+  ("low","run",0): "⏳ در حال امتیازدهی…", ("low","run",1): "📏 بررسی معیارها…", ("low","run",2): "🧪 امتیازدهی در جریان…", 
+  ("ad","run",0): "🚫 بررسی تبلیغات…", ("ad","run",1): "🛡 تشخیص تبلیغاتی بودن…", ("ad","run",2): "⚠️ بررسی محتوای تبلیغاتی…",
+  ("ai","run",0): "⏳ در حال تولید با مدل…", ("ai","run",1): "⏳ مدل در حال فکر کردن…", ("ai","run",2): "✍️ در حال نگارش…",
+  ("queue","run",0): "⏳ در صف انتشار…", ("queue","run",1): "📥 آماده‌ی انتشار شد", ("queue","run",2): "🕐 در انتظار انتشار…",
+  ("published","ok",0): "✅ منتشر شد", ("published","ok",1): "📣 ارسال به کانال انجام شد", ("published","ok",2): "🎉 در کانال قرار گرفت",
+  ("queued","ok",0): "📌 در صف قرار گرفت", ("queued","ok",1): "📥 برای انتشار بعدی ذخیره شد", ("queued","ok",2): "✅ آماده قرار گرفت",
+})
+def _step_text(st, lang):
+    cat = st.get("category"); status = st.get("status", "run"); var = int(st.get("variant", 0))
+    f = st.get("fmt", {})
+    key_tpl = SPHARSE.get((cat, status, var)) or SPHARSE.get((cat, status, 0))
+    if not key_tpl: return cat
+    model = st.get("model") or ""
+    try: return key_tpl.format(model, **f)
+    except Exception: return key_tpl
 def make_status(lang, text, step=None):
-    """Format a running status with the animated Thinking header."""
+    """هدر Thinking/Working + لیست مراحل جاری (حداکثر ۶ خط). متن بیرونی فقط به‌عنوان خط جاری/نهایی.
+    """
     if step is None: return str(text or "")
-    return f"<b>{thinking_animation(step)}</b>\n{strip_thinking_prefix(text)}"
+    op = _current_operation.get()
+    kind = getattr(op, "header_kind", "thinking")
+    dots = "." * (1 + (step % 3))
+    header = f"Working{dots}" if kind == "working" else f"Thinking{dots}"
+    steps = (op.steps[-6:] if (op and op.steps) else [])
+    lines = []
+    for st in steps:
+        t = _step_text(st, lang) or st.get("category")
+        lines.append(t)
+    body = strip_thinking_prefix(text)
+    if body: lines.append(body)
+    return f"<b>{header}</b>\n" + "\n".join(lines[-7:])
 
 
 def operation_text(lang, key):
@@ -2833,9 +2922,11 @@ async def operation_status(context, text, failed=False, terminal=False):
             task = op.thinking_task
             op.thinking_task = None
             if task and not task.done(): task.cancel()
-            display = body or strip_thinking_prefix(op.status_text)
-            op.status_text = display
-            op.status_display = display
+            steps = getattr(op, "steps", [])
+            syms = {"run": "⏳", "ok": "✅", "fail": "❌"}
+            step_lines = [f"{syms.get(st.get('status'), '⏳')} {_step_text(st, lang)}" for st in steps[-6:]]
+            base = body or strip_thinking_prefix(op.status_text)
+            display = (("\n".join(step_lines) + "\n") if step_lines else "") + (base or "")
             candidate_id = op.status_message_id or context.user_data.get("status_message_id")
             if candidate_id is not None:
                 try:
@@ -3017,6 +3108,18 @@ def _ai_status_reporter(context, lang):
                 "success": f"پاسخ از {name} رسید؛ دارم نتیجه رو بررسی می‌کنم…",
                 "failed": "مدل‌های در دسترس پاسخ قابل‌استفاده‌ای ندادند.",
             }
+        op = _current_operation.get()
+        if op is not None:
+            if event == "start":
+                step_add(op, "model_start", key=name, status="run", model=name); op.header_kind = "working"
+            elif event == "busy":
+                step_add(op, "model_start", key=name, status="run", model=name)
+            elif event == "success":
+                step_add(op, "model_start", key=name, status="ok", model=name); step_add(op, "model_ok", key=name, status="ok")
+            elif event == "failure":
+                step_add(op, "model_start", key=name, status="fail", model=name); step_add(op, "model_fail", key=name, status="fail", **{"reason": reason})
+            elif event == "unavailable":
+                step_add(op, "model_start", key=name, status="fail", model=name)
         await operation_status(context, texts.get(event, reason or "در حال ادامه پردازش…"))
     return report
 
