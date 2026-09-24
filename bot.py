@@ -36,6 +36,8 @@ UTC = timezone.utc
 CAPTION_LIMIT, MSG_LIMIT = 1024, 4096
 SOURCE_COOLDOWN_MIN = 10     # حداقل فاصله‌ی دو بررسی یک منبع در حالت خودکار
 SOURCE_FAIL_LIMIT = 3         # فقط پس از چند شکست متوالی، منبع خاموش می‌شود
+SOURCE_PAUSE_MIN = int(os.getenv("SOURCE_PAUSE_MIN", "30"))   # توقف موقت منبع شکست‌خورده تا backoff باز شود
+MODEL_BACKOFF_MAX_MIN = int(os.getenv("MODEL_BACKOFF_MAX_MIN", "120"))  # سقف backoff نمایی مدل سالم‌نشده
 PERSIST_INTERVAL_SECONDS = max(60, int(os.getenv("PERSIST_INTERVAL_SECONDS", "300")))
 MODEL_PROBE_MIN = 10
 MIN_INTERVAL = 30            # حداقل فاصله‌ی چرخه (دقیقه)
@@ -90,7 +92,7 @@ def ago_text(iso, lang="fa"):
     if lang == "en": return f"{s}s" if s < 60 else f"{s//60}m" if s < 3600 else f"{s//3600}h" if s < 86400 else f"{s//86400}d"
     return f"{s} ثانیه" if s < 60 else f"{s//60} دقیقه" if s < 3600 else f"{s//3600} ساعت" if s < 86400 else f"{s//86400} روز"
 def url_hash(u): return hashlib.sha1(u.strip().encode()).hexdigest()[:20]
-def parse_expiry(text):
+def _parse_expiry_unused(text):
     """«30» → ۳۰ روز بعد · «2025-12-31» → پایان همان روز (UTC). خروجی: iso یا None"""
     t = str(text).strip().translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789"))
     if t.isdigit(): return (now_utc() + timedelta(days=int(t))).isoformat()
@@ -148,6 +150,11 @@ CREATE INDEX IF NOT EXISTS idx_art_created ON articles(created_at);
 CREATE INDEX IF NOT EXISTS idx_src_ch ON sources(channel_id);
 CREATE INDEX IF NOT EXISTS idx_logs_admin ON logs(admin_id, id);
 """
+DB_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_pay_status ON pay_requests(status, id);
+CREATE INDEX IF NOT EXISTS idx_usage_day ON usage(day);
+CREATE INDEX IF NOT EXISTS idx_art_disco ON articles(channel_id, status, created_at);
+"""
 MIGRATIONS = [("users", "next_plan_id", "INTEGER"), ("users", "next_plan_days", "INTEGER"), ("users", "lang", "TEXT"), ("users", "remind_key", "TEXT"), ("users", "premium", "INTEGER DEFAULT 0"),
               ("plans", "name_en", "TEXT"), ("plans", "price_en", "TEXT DEFAULT ''"), ("plans", "description_en", "TEXT DEFAULT ''"),
               ("channels", "lock_code", "TEXT"), ("channels", "verified_by", "INTEGER"), ("channels", "created_at", "TEXT"), ("channels", "settings", "TEXT"),
@@ -155,32 +162,38 @@ MIGRATIONS = [("users", "next_plan_id", "INTEGER"), ("users", "next_plan_days", 
               ("sources", "bot_active", "INTEGER DEFAULT 1"), ("sources", "api_url", "TEXT"), ("sources", "api_key", "TEXT"), ("sources", "api_note", "TEXT DEFAULT ''"),
               ("pay_requests", "discount", "TEXT"), ("pay_requests", "final_price", "TEXT"),
               ("ai_models", "temperature", "REAL DEFAULT 0.5"), ("ai_models", "max_tokens", "INTEGER DEFAULT 2500"), ("ai_models", "owner_id", "INTEGER"),
-              ("plans", "daily_tests", "INTEGER DEFAULT 2"), ("plans", "price_num", "REAL DEFAULT 0"), ("sources", "found_total", "INTEGER DEFAULT 0"), ("sources", "title", "TEXT DEFAULT ''")]
+              ("ai_models", "fail_count", "INTEGER DEFAULT 0"), ("ai_models", "next_try_after", "TEXT DEFAULT ''"),
+              ("plans", "daily_tests", "INTEGER DEFAULT 2"), ("plans", "price_num", "REAL DEFAULT 0"), ("sources", "found_total", "INTEGER DEFAULT 0"), ("sources", "title", "TEXT DEFAULT ''")
+              , ("sources", "fail_count", "INTEGER DEFAULT 0"), ("sources", "next_try_after", "TEXT DEFAULT \'\'")]
 def db():
     global _conn
     if _conn is None:
         _conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
         _conn.row_factory = sqlite3.Row
         for pr in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL", "PRAGMA busy_timeout=8000", "PRAGMA cache_size=-16000", "PRAGMA temp_store=MEMORY"): _conn.execute(pr)
-        _conn.executescript(SCHEMA)
+        _conn.executescript(SCHEMA + "\n" + DB_INDEXES)
         for tbl, col, decl in MIGRATIONS:
             try: _conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {decl}")
             except sqlite3.OperationalError: pass
         _conn.commit()
     return _conn
+class _NullLock:
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+_NUL = _NullLock()
 def q(sql, params=(), one=False, commit=False):
-    """قفل موقت SQLite زیر بار (چند چرخه‌ی هم‌زمان) خطا نمی‌دهد؛ چند بار کوتاه دوباره تلاش می‌شود."""
+    """خواندن آزاد با WAL (بدون قفل)؛ نوشتن/commit زیر قفل؛ retry فقط روی locked/busy."""
     for attempt in range(4):
         try:
-            with _lock:
+            with (_lock if commit else _NUL):
                 cur = db().execute(sql, params)
                 if commit: db().commit(); return cur.lastrowid
                 return cur.fetchone() if one else cur.fetchall()
         except sqlite3.OperationalError as e:
             msg = str(e).lower()
-            try: db().rollback()   # تراکنش ناتمام باز نماند؛ وگرنه تلاش دوباره روی تغییر نیمه‌کاره سوار می‌شود
+            try: db().rollback()
             except Exception: pass
-            if attempt == 3 or ("locked" not in msg and "busy" not in msg): raise   # انتظار قفل با PRAGMA busy_timeout انجام می‌شود؛ حلقه‌ی رویداد مسدود نمی‌شود
+            if attempt == 3 or ("locked" not in msg and "busy" not in msg): raise
 _COLS = {}
 def _safe_fields(table, f):
     """در SQL پویا فقط ستون‌های واقعیِ همان جدول پذیرفته می‌شوند (نام ستون از ورودی کاربر می‌آید)."""
@@ -305,7 +318,9 @@ def upgrade_amount(cur_price_num, new_price_num, cur_days, uid):
 def upgrade_carryover_days(uid):
     """روزهای باقی‌ماندهٔ واقعیِ پلن فعلی به‌صورت کسری (float) برای transfer به پلن جدید."""
     return proration_remaining_days(uid)
-def revoke_plan(uid): q("UPDATE users SET plan_id=NULL, plan_expires=NULL, next_plan_id=NULL, next_plan_days=NULL, remind_key=NULL WHERE id=?", (uid,), commit=True)
+def revoke_plan(uid):
+    q("UPDATE users SET plan_id=NULL, plan_expires=NULL, next_plan_id=NULL, next_plan_days=NULL, remind_key=NULL WHERE id=?", (uid,), commit=True)
+    admin_limits_invalidate(uid)
 def activate_next_plans():
     out = []
     for u in q("SELECT * FROM users WHERE next_plan_id IS NOT NULL AND (plan_expires IS NULL OR plan_expires<=?)", (now_iso(),)):
@@ -344,6 +359,17 @@ def expiring_users():
         if cur.rowcount:
             out.append((u, key, left))
     return out
+_LIMITS_TTL = 60.0
+_limits_cache = {}
+def admin_limits_cached(uid, max_age=_LIMITS_TTL):
+    """کش کوتاه‌مدت سهمیه‌ها (یک تیک/تعامل) تا کاهش ترافیک read در حلقه‌های scheduler/publish."""
+    ent = _limits_cache.get(uid)
+    if ent and (time.monotonic() - ent[0]) < max_age: return ent[1]
+    val = admin_limits(uid); _limits_cache[uid] = (time.monotonic(), val)
+    return val
+def admin_limits_invalidate(uid=None):
+    if uid is None: _limits_cache.clear(); return
+    _limits_cache.pop(uid, None)
 def admin_limits(uid):
     if is_super(uid): return dict(daily_posts=None, max_sources=None, max_channels=None, daily_tests=None, plan=None, plan_id=None, expires=None, active=True, next_plan=None)
     u = get_user(uid); p = get_plan(u["plan_id"]) if u and u["plan_id"] else None
@@ -357,24 +383,18 @@ def usage_today(uid):
     r = q("SELECT posts,tests FROM usage WHERE admin_id=? AND day=?", (uid, today_str(admin_offset(uid))), one=True)
     return {"posts": r["posts"], "tests": r["tests"]} if r else {"posts": 0, "tests": 0}
 def usage_inc(uid, field):
-    d = today_str(admin_offset(uid))
-    q("INSERT INTO usage(admin_id,day,posts,tests) VALUES(?,?,0,0) ON CONFLICT(admin_id,day) DO NOTHING", (uid, d), commit=True)
-    q(f"UPDATE usage SET {field}={field}+1 WHERE admin_id=? AND day=?", (uid, d), commit=True)
+    q(f"INSERT INTO usage(admin_id,day,posts,tests) VALUES(?,?,{'1' if field=='posts' else '0'},{'1' if field=='tests' else '0'}) ON CONFLICT(admin_id,day) DO UPDATE SET {field}={field}+1", (uid, today_str(admin_offset(uid))), commit=True)
 def usage_reset(uid, field="tests"): q(f"UPDATE usage SET {field}=0 WHERE admin_id=? AND day=?", (uid, today_str(admin_offset(uid))), commit=True)
 def usage_reserve(uid, field="posts"):
     """سهمیه را پیشاپیش و اتمیک رزرو می‌کند تا چند چرخه‌ی هم‌زمان از سقف پلن عبور نکنند. خروجی: (ok, day) — day سطلِ همان رزرو است."""
     lim = admin_limits(uid); cap = lim["daily_posts"] if field == "posts" else lim["daily_tests"]
     if cap is None: return True, None
-    d = today_str(admin_offset(uid))
-    q("INSERT INTO usage(admin_id,day,posts,tests) VALUES(?,?,0,0) ON CONFLICT(admin_id,day) DO NOTHING", (uid, d), commit=True)
     with _lock:
-        cur = db().execute(f"UPDATE usage SET {field}={field}+1 WHERE admin_id=? AND day=? AND {field}<?", (uid, d, cap))
+        d = today_str(admin_offset(uid))
+        cur = db().execute(f"INSERT INTO usage(admin_id,day,posts,tests) VALUES(?,?,{'1' if field=='posts' else '0'},{'1' if field=='tests' else '0'}) ON CONFLICT(admin_id,day) DO UPDATE SET {field}={field}+1 WHERE {field}<?", (uid, d, cap))
         db().commit(); return cur.rowcount > 0, d
-def usage_release(uid, field, day):
-    if day is None: return
-    q(f"UPDATE usage SET {field}=MAX(0,{field}-1) WHERE admin_id=? AND day=?", (uid, day), commit=True)
 def remaining(uid, field="posts"):
-    lim = admin_limits(uid); cap = lim["daily_posts"] if field == "posts" else lim["daily_tests"]
+    lim = admin_limits_cached(uid); cap = lim["daily_posts"] if field == "posts" else lim["daily_tests"]
     if cap is None: return None
     return max(0, cap - usage_today(uid)[field])
 # ============================================================
@@ -474,7 +494,9 @@ def get_settings(cid):
         except Exception: stored = {}
     base = stored.get("ui_lang") or (user_lang(ch["admin_id"]) if ch else None) or "fa"
     s = default_settings(base if base in LANGS else "fa", ch["username"] if ch else ""); s.update(stored); s["ui_lang"] = base if base in LANGS else "fa"
-    if s.get("prompt") in _LEGACY_PROMPTS: s["prompt"] = DEFAULT_PROMPT[s["ui_lang"]]  # پرامپتِ پیش‌فرضِ قدیمی → خودکار به نسخه‌ی جدید (خنثی از زبان)
+    if s.get("prompt") in _LEGACY_PROMPTS: s["prompt"] = DEFAULT_PROMPT[s["ui_lang"]]  # مهاجرت پرامپت قدیمی
+    for k in list(s):
+        if k.startswith("_"): s.pop(k)
     s["interval_minutes"] = max(MIN_INTERVAL, int(s.get("interval_minutes") or MIN_INTERVAL)); s["lookback_hours"] = min(MAX_LOOKBACK, max(1, int(s.get("lookback_hours") or 24)))
     s["posts_per_cycle"] = min(MAX_PPC, max(1, int(s.get("posts_per_cycle") or 1))); s["post_limit"] = min(4000, max(300, int(s.get("post_limit") or POST_LIMIT_DEFAULT)))
     return s
@@ -578,7 +600,14 @@ def set_source_api(sid, api_url="", api_key="", api_note=""):
     return get_source(sid)
 def source_ok(sid, feed_url=None, etag=None, last_modified=None):
     q("UPDATE sources SET last_fetch=?, fail_count=0, last_error=NULL, etag=?, last_modified=?, feed_url=COALESCE(?, feed_url) WHERE id=?", (now_iso(), etag, last_modified, feed_url, sid), commit=True)
-def source_fail(sid, err): q("UPDATE sources SET last_fetch=?, fail_count=fail_count+1, last_error=? WHERE id=?", (now_iso(), str(err)[:200], sid), commit=True)
+def source_fail(sid, err):
+    """شمارش شکست + backoff نمایی: next_try_after = now + min(2^(fc-1)*SOURCE_PAUSE_MIN, 12h)."""
+    wait = min(SOURCE_PAUSE_MIN * (2 ** max(0, _source_fail_count(sid))), 720)
+    until = (now_utc() + timedelta(minutes=wait)).isoformat()
+    q("UPDATE sources SET last_fetch=?, fail_count=fail_count+1, last_error=?, next_try_after=? WHERE id=?",
+      (now_iso(), str(err)[:200], until, sid), commit=True)
+def _source_fail_count(sid):
+    r = q("SELECT fail_count c FROM sources WHERE id=?", (sid,), one=True); return int(r["c"]) if r else 0
 # ============================================================
 # مقالات (مستقل برای هر کانال)
 def article_exists(cid, h): return bool(q("SELECT 1 FROM articles WHERE channel_id=? AND hash=?", (cid, h), one=True))
@@ -593,26 +622,33 @@ def article_update(aid, **f):
     _safe_fields("articles", f)
     q("UPDATE articles SET " + ", ".join(f"{k}=?" for k in f) + " WHERE id=?", (*f.values(), aid), commit=True)
 def get_article(aid): return q("SELECT * FROM articles WHERE id=?", (aid,), one=True)
+class PublicationQuotaExceeded(Exception): pass
 def get_pub_journal(aid): return gget(f"pubj:{aid}") or None
 def set_pub_journal(aid, entry): gset(f"pubj:{aid}", entry)
-def release_publication(aid, journal, reason):
+def _trx(fn):
+    """تراکنش اتمیک مشترک (BEGIN IMMEDIATE + commit/rollback) برای حلقه‌ی ژورنال انتشار. خروجی fn بازگردانده می‌شود."""
     with _lock:
         conn = db()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            day = journal.get("reserved_day")
-            if day is not None and journal.get("phase") != "in_flight":
-                conn.execute("UPDATE usage SET posts=MAX(0,posts-1) WHERE admin_id=? AND day=?", (journal["admin_id"], day))
-            journal = dict(journal, reserved_day=day if journal.get("phase") == "in_flight" else None)
-            conn.execute("UPDATE articles SET reason=? WHERE id=?", (reason, aid))
-            if journal.get("phase") == "prepared":
-                conn.execute("DELETE FROM settings WHERE key=?", (f"pubj:{aid}",))
-            else:
-                conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (f"pubj:{aid}", json.dumps(journal)))
+            result = fn(conn)
             conn.commit()
+            return result
         except BaseException:
             conn.rollback(); raise
-    return journal
+def release_publication(aid, journal, reason):
+    def _go(conn):
+        day = journal.get("reserved_day")
+        if day is not None and journal.get("phase") != "in_flight":
+            conn.execute("UPDATE usage SET posts=MAX(0,posts-1) WHERE admin_id=? AND day=?", (journal["admin_id"], day))
+        jr = dict(journal, reserved_day=day if journal.get("phase") == "in_flight" else None)
+        conn.execute("UPDATE articles SET reason=? WHERE id=?", (reason, aid))
+        if jr.get("phase") == "prepared":
+            conn.execute("DELETE FROM settings WHERE key=?", (f"pubj:{aid}",))
+        else:
+            conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (f"pubj:{aid}", json.dumps(jr)))
+        return jr
+    return _trx(_go)
 
 class PublicationTransport:
     def __init__(self, bot, aid, journal, parent):
@@ -649,39 +685,28 @@ def reserve_publication(aid, admin_id, count_usage, test_user, previous):
     cap = admin_limits(admin_id)["daily_posts"] if count_usage else None
     journal = dict(previous or {}, phase="partial" if previous and previous.get("media_id") else "prepared",
                    admin_id=admin_id, test_user=test_user, day=day, reserved_day=day if count_usage and cap is not None else None)
-    with _lock:
-        conn = db()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            if journal["reserved_day"] is not None:
-                conn.execute("INSERT OR IGNORE INTO usage(admin_id,day,posts,tests) VALUES(?,?,0,0)", (admin_id, day))
-                cur = conn.execute("UPDATE usage SET posts=posts+1 WHERE admin_id=? AND day=? AND posts<?", (admin_id, day, cap))
-                if not cur.rowcount: conn.rollback(); return None
-            conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (f"pubj:{aid}", json.dumps(journal)))
-            conn.commit()
-        except BaseException:
-            conn.rollback(); raise
-    return journal
+    def _go(conn):
+        if journal["reserved_day"] is not None:
+            cur = conn.execute("INSERT INTO usage(admin_id,day,posts,tests) VALUES(?,?,1,0) ON CONFLICT(admin_id,day) DO UPDATE SET posts=posts+1 WHERE posts<?", (admin_id, day, cap))
+            if not cur.rowcount: raise PublicationQuotaExceeded
+        conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (f"pubj:{aid}", json.dumps(journal)))
+        return journal
+    try: return _trx(_go)
+    except PublicationQuotaExceeded: return None
 
 def settle_publication(aid, ch, journal):
     link = journal.get("link") or msg_link(ch, SimpleNamespace(message_id=journal["message_id"]))
-    with _lock:
-        conn = db()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            a = conn.execute("SELECT * FROM articles WHERE id=?", (aid,)).fetchone()
-            if not a: raise RuntimeError("article_missing")
-            if a["status"] != "published":
-                conn.execute("INSERT OR IGNORE INTO posted VALUES(?,?,?)", (ch["chat_id"], a["hash"], now_iso()))
-                conn.execute("UPDATE articles SET status='published',links=?,reason='' WHERE id=?", (json.dumps([link]), aid))
-                uid = journal.get("test_user")
-                if uid is not None:
-                    day = journal["day"]
-                    conn.execute("INSERT INTO usage(admin_id,day,posts,tests) VALUES(?,?,0,1) ON CONFLICT(admin_id,day) DO UPDATE SET tests=tests+1", (uid, day))
-            conn.execute("DELETE FROM settings WHERE key=?", (f"pubj:{aid}",))
-            conn.commit()
-        except BaseException:
-            conn.rollback(); raise
+    def _go(conn):
+        a = conn.execute("SELECT * FROM articles WHERE id=?", (aid,)).fetchone()
+        if not a: raise RuntimeError("article_missing")
+        if a["status"] != "published":
+            conn.execute("INSERT OR IGNORE INTO posted VALUES(?,?,?)", (ch["chat_id"], a["hash"], now_iso()))
+            conn.execute("UPDATE articles SET status='published',links=?,reason='' WHERE id=?", (json.dumps([link]), aid))
+            uid = journal.get("test_user")
+            if uid is not None:
+                conn.execute("INSERT INTO usage(admin_id,day,posts,tests) VALUES(?,?,0,1) ON CONFLICT(admin_id,day) DO UPDATE SET tests=tests+1", (uid, journal["day"]))
+        conn.execute("DELETE FROM settings WHERE key=?", (f"pubj:{aid}",))
+    _trx(_go)
     if journal.get("test_user") is not None: rate_mark(f"test:{ch['id']}")
 def recover_publications():
     for row in q("SELECT a.id,a.channel_id,a.reason FROM articles a JOIN settings s ON s.key='pubj:'||a.id WHERE s.value!='null'"):
@@ -707,7 +732,6 @@ def delete_article(aid, uid):
     if a and publication_pending(a["channel_id"]): raise RuntimeError("channel_busy")
     q("DELETE FROM articles WHERE id=? AND admin_id=?", (aid, uid), commit=True)
 def posted_before(chat_id, h): return bool(q("SELECT 1 FROM posted WHERE channel_id=? AND hash=?", (chat_id, h), one=True))
-def mark_posted(chat_id, h): q("INSERT OR IGNORE INTO posted VALUES(?,?,?)", (chat_id, h, now_iso()), commit=True)
 def count_articles(uid=None, hours=24, status=None, cid=None):
     since = (now_utc() - timedelta(hours=hours)).isoformat(); sql, p = "SELECT COUNT(*) c FROM articles WHERE created_at>=?", [since]
     if cid is not None: sql += " AND channel_id=?"; p.append(cid)
@@ -1005,15 +1029,23 @@ async def _call_model(m, system, user):
     r = await _post(url, headers=headers, json=body)
     if r.status_code == 404 and not re.search(r"/v\d", base): r = await _post(base + "/v1/chat/completions", headers=headers, json=body)
     return _openai_content(_provider_json(r))
+def _model_fail_count(mid):
+    r = q("SELECT fail_count c FROM ai_models WHERE id=?", (mid,), one=True); return int(r["c"]) if r else 0
+def _model_next_try(mid):
+    wait = min(5 * (2 ** _model_fail_count(mid)), MODEL_BACKOFF_MAX_MIN)
+    return (now_utc() + timedelta(minutes=wait)).isoformat()
 async def _mark_fail(m, err):
     cur = get_model(m["id"]) or m   # اسنپ‌شاتِ ورودی ممکن است کهنه باشد؛ شمارنده از سطر فعلی خوانده می‌شود
-    fc = (cur["fail_count"] or 0) + 1; update_model(m["id"], fail_count=fc, last_error=str(err)[:300], last_fail=now_iso())
+    fc = (cur["fail_count"] or 0) + 1
+    ntry = (now_utc() + timedelta(minutes=min(5 * (2 ** min(fc, 6)), MODEL_BACKOFF_MAX_MIN))).isoformat()
+    update_model(m["id"], fail_count=fc, last_error=str(err)[:300], last_fail=now_iso(), next_try_after=ntry,
+                 status="down" if fc >= 2 else cur["status"])
     if fc >= 2 and cur["status"] != "down":
-        update_model(m["id"], status="down"); log_event("ERROR", f"مدل «{m['name']}» از کار افتاد: {err}")
+        log_event("ERROR", f"مدل «{m['name']}» از کار افتاد: {err}")
         await notify_super(f"🔴 مدل <b>{html.escape(m['name'])}</b> (<code>{html.escape(m['model'])}</code>) از کار افتاد.\n<code>{html.escape(str(err)[:200])}</code>")
 async def _mark_ok(m):
     cur = get_model(m["id"]) or m   # ok_count/fail_count از سطر فعلی، نه از اسنپ‌شات احتمالاً کهنه
-    update_model(m["id"], fail_count=0, status="ok", last_ok=now_iso(), ok_count=(cur["ok_count"] or 0) + 1)
+    update_model(m["id"], fail_count=0, status="ok", last_ok=now_iso(), ok_count=(cur["ok_count"] or 0) + 1, next_try_after="")
     if cur["status"] == "down": log_event("INFO", f"مدل «{m['name']}» دوباره فعال شد."); await notify_super(f"🟢 مدل <b>{html.escape(m['name'])}</b> دوباره فعال شد.")
 # --- حریم خصوصی مدل‌ها: هیچ نام مدل/آدرس/کلیدی به مدیر میانی نمی‌رسد؛ فقط یک کد کوتاه و بی‌خطر
 AI_ERR = {"ai_busy": ("سرویس هوش مصنوعی موقتاً شلوغ است", "AI service is busy right now"), "ai_auth": ("دسترسی سرویس هوش مصنوعی برقرار نشد", "AI service access failed"),
@@ -1034,8 +1066,10 @@ def model_lock(mid):
     return _model_locks[mid]
 def model_busy(mid): return model_lock(mid).locked()
 def _model_ready(m):
-    """مدلِ سالم، یا مدلِ افتاده‌ای که وقت آزمایش دوباره‌اش رسیده است."""
+    """مدل قابل انتخاب: سالم (status=ok)، یا افتاده ولی backoff تمام‌شده (next_try_after <= now)."""
     if m["status"] != "down": return True
+    nta = parse_dt(m["next_try_after"]) if "next_try_after" in m.keys() else None
+    if nta: return now_utc() >= nta
     lf = parse_dt(m["last_fail"]); return bool(not lf or (now_utc() - lf) >= timedelta(minutes=MODEL_PROBE_MIN))
 _ai_events = ContextVar("ai_events", default=None)
 
@@ -1075,13 +1109,20 @@ def _validate_generation(text):
 
 
 async def _try_models(groups, system, user, owner_id=None, on_queue=None, validate=None, explicit_id=None):
+    def _sort_key(m):
+        fc = m["fail_count"] or 0; okc = m["ok_count"] or 0
+        ratio = (okc + 1.0) / (okc + fc + 2.0)
+        return (ratio, -fc, -(okc), m["priority"] or 99, m["id"])
     tried = set(); last = "ai_none"
     for stage, models in groups:
         if stage == "test" and not models: await _ai_event("no_test")
-        rest = list(models)
+        rest = sorted(models, key=_sort_key)
         while rest:
             free = [m for m in rest if not model_busy(m["id"])]
-            m = (rest if explicit_id == rest[0]["id"] else (free or rest))[0]
+            if explicit_id is not None and any(m["id"] == explicit_id for m in rest):
+                m = next(m for m in rest if m["id"] == explicit_id)
+            else:
+                m = (free or rest)[0]
             rest.remove(m)
             if m["id"] in tried: continue
             tried.add(m["id"])
@@ -1135,7 +1176,6 @@ async def probe_down_models():
         lf = parse_dt(m["last_fail"])
         if not lf or (now_utc() - lf) >= timedelta(minutes=MODEL_PROBE_MIN): await test_model(m["id"])
 def any_model_available(owner_id=None): return any(_model_ready(m) for m in list_models(active_only=True, owner_id=owner_id)) or (bool(owner_id) and any(_model_ready(m) for m in list_models(active_only=True)))
-def models_free_count(): return sum(1 for m in list_models(active_only=True) if _model_ready(m) and not model_busy(m["id"]))
 def parse_json(text):
     if not text: return None
     t = re.sub(r"```(?:json|JSON)?", "", text).strip(); s, e = t.find("{"), t.rfind("}")
@@ -2007,12 +2047,19 @@ async def send_post(bot, chat_id, text, media=None):
             raise
     raise RuntimeError("format")
 def msg_link(ch, msg): return f"https://t.me/{ch['username']}/{msg.message_id}" if ch["username"] else f"https://t.me/c/{str(ch['chat_id'])[4:]}/{msg.message_id}"
+_tg_status: dict = {}   # chat_id -> (ts, reason) — حافظه‌ی کوتاه خطای تلگرام (Phase R)
 async def bot_can_post(bot, chat_id):
+    st = _tg_status.get(chat_id)
+    if st and time.monotonic() - st[0] < 180: return False
     try:
         me = await bot.get_chat_member(chat_id, bot.id)
-        if me.status == "creator": return True
-        return me.status == "administrator" and getattr(me, "can_post_messages", True) is not False
-    except Exception: return False
+        ok = me.status == "creator" or (me.status == "administrator" and getattr(me, "can_post_messages", True) is not False)
+        if ok: _tg_status.pop(chat_id, None)
+        else: _tg_status[chat_id] = (time.monotonic(), "mem")
+        return ok
+    except Exception:
+        _tg_status[chat_id] = (time.monotonic(), st[1] if st else "err"); return False
+
 async def publish_article(bot, aid, count_usage=True, test_user=None):
     a = get_article(aid)
     if not a: return False, "not_ready"
@@ -2188,6 +2235,7 @@ async def _cycle(bot, uid, cid, test_mode, progress):
     if not lim["active"]: D.add("plan_inactive"); D.hint("hint_quota"); return fin()
     sources = list_sources(cid, active_only=True)
     if not sources: D.add("no_sources"); D.hint("hint_sources"); return fin()
+    admin_limits_cached(uid, max_age=_LIMITS_TTL)
     field = "tests" if test_mode else "posts"; rem = remaining(uid, field)
     if rem is not None and rem <= 0: D.add("quota_tests" if test_mode else "quota_posts", used=usage_today(uid)[field], cap=lim["daily_tests" if test_mode else "daily_posts"]); D.hint("hint_quota"); return fin()
     if not await bot_can_post(bot, ch["chat_id"]): D.add("bot_not_admin"); D.hint("hint_admin"); return fin()
@@ -2196,6 +2244,9 @@ async def _cycle(bot, uid, cid, test_mode, progress):
     D.stage = "discover"; await p(10, P["src"].format(n=len(sources)))
     async def one(src):
         name = hostname(src["url"]); lf = parse_dt(src["last_fetch"])
+        fc = int(src["fail_count"] or 0) if "fail_count" in src.keys() else 0
+        nta = parse_dt(src["next_try_after"]) if "next_try_after" in src.keys() else None
+        if fc >= SOURCE_FAIL_LIMIT and nta and now_utc() < nta: return src, name, None, False, "", "paused"
         if not test_mode and lf and (now_utc() - lf) < timedelta(minutes=SOURCE_COOLDOWN_MIN): return src, name, None, False, "", "cooldown"
         try: items, changed, method = await discover_source(src, use_cache=not test_mode); return src, name, items, changed, method, None
         except Exception as e: return src, name, None, False, "", str(e)[:80]
@@ -2203,7 +2254,7 @@ async def _cycle(bot, uid, cid, test_mode, progress):
     leftovers = q("SELECT id,url,title,published_at FROM articles WHERE channel_id=? AND status='discovered' AND source_id IN (SELECT id FROM sources WHERE active=1 AND channel_id=articles.channel_id) ORDER BY id DESC LIMIT 10", (cid,))
     candidates, all_items, n_old, seen = [], [], 0, set()
     for src, name, items, changed, method, err in results:
-        if err == "cooldown": D.add("src_cooldown", name=name); continue
+        if err in ("cooldown", "paused"): D.add("src_cooldown", name=name); continue
         if err: res["errors"] += 1; D.add("src_fail", name=name, err=err); log_event("WARN", f"منبع {src['url']}: {err}", uid); continue
         if not changed: D.add("src_notmod", name=name); continue
         if not items: D.add("src_empty", name=name); continue
@@ -2319,26 +2370,27 @@ async def _cycle(bot, uid, cid, test_mode, progress):
         elif top and cnt["low"] == top: D.hint("hint_score")
         elif top and cnt["extract"] == top: D.hint("hint_extract")
     await p(100, P["done"]); return fin()
-async def run_admin_cycle(bot, uid, test_mode=False, progress=None):
-    out = {}
-    for ch in list_channels(uid):
-        try: out[ch["id"]] = await run_channel_cycle(bot, uid, ch["id"], test_mode, progress)
-        except Exception as e: log_event("ERROR", f"چرخه کانال {ch['title']}: {e}", uid)
-    return out
 async def flush_ready(bot, uid, cid, max_n=2):
     lk = ch_lock(cid)
     if lk.locked(): return 0
     async with lk:
         s = get_settings(cid); ch = get_channel(cid)
-        if not ch or ch["admin_id"] != uid or not admin_limits(uid)["active"]: return 0
+        if not ch or ch["admin_id"] != uid or not admin_limits_cached(uid)["active"]: return 0
         if s["mode"] != "auto" or in_quiet(s) or not s["enabled"]: return 0
+        ru = parse_dt(s.get("_retry_until") or "")
+        if ru and now_utc() < ru: return 0
         rem = remaining(uid, "posts"); sent = 0
         for a in articles_by_status(cid, "ready", max_n, automatic=True):
             if rem is not None and rem <= 0: break
             operation_checkpoint()
             ok, out = await _publish_article_locked(bot, a["id"])
             if ok: sent += 1; rem = None if rem is None else rem - 1
-            elif out != "duplicate": break
+            elif out == "duplicate": continue
+            elif isinstance(out, RetryAfter):
+                # توقف موقت drain با ذخیره‌ی زمان بازگشتی (۵ دقیقه سقف) تا چرخه‌ی بعدی دوباره تلاش کند
+                update_settings(cid, _retry_until=(now_utc() + timedelta(seconds=min(int(getattr(out, "retry_after", 30)), 300))).isoformat()); break
+            else:
+                update_settings(cid, _retry_until=(now_utc() + timedelta(seconds=90)).isoformat()); break
         return sent
 # ============================================================
 # زمان‌بند هوشمند: عادلانه (قدیمی‌ترین اجرا اول)، سقف چرخه در هر تیک، توقف وقتی هیچ مدلی در دسترس نیست
@@ -2796,8 +2848,7 @@ async def operation_status(context, text, failed=False, terminal=False):
                 context.user_data["status_message_id"] = op.status_message_id
             if op.status_message_id is not None:
                 context.user_data["status_message_id"] = op.status_message_id
-                _temp_messages.add((op.chat_id, op.status_message_id))
-                expire_temp(context.bot, op.chat_id, op.status_message_id, 5)
+                # پیام نتیجه‌ی پایانی ماندگار است تا عملکرد/نتیجه قابل مرور بماند (فاز ۱).
         return True
 
     async with op.status_lock:
@@ -3001,15 +3052,23 @@ async def run_model_test(update, context, mid, personal=False):
 
 async def popup(update, context, text, alert=False):
     op = _current_operation.get()
-    if op and op.status_message_id is not None and not op.ai_popup and not alert:
-        op.final_status = True
-        await operation_status(context, text)
-        return
+    plain = strip_tags(text); temp = None
+    # Policy یکتا (فاز ۱): کوتاه → پاپ‌آپ / بلند → پیامِ ۵ ثانیه‌ای / وضعیت جاری → در همان پیام بازنویسی می‌شود
+    if op and op.status_message_id is not None and getattr(op, "steps", None) is None:
+        alert = False if not alert else True
+        if not alert:
+            op.final_status = True
+            await operation_status(context, text)
+            return
+    elif not alert and len(plain) > 200:
+        alert = False; temp = 5
     qy = update.callback_query
-    if qy:
-        try: await qy.answer(strip_tags(text)[:200], show_alert=alert); context._callback_answered = True; return
+    if qy and temp is None:
+        try:
+            await qy.answer(plain[:200], show_alert=alert); context._callback_answered = True
+            return
         except Exception: pass
-    await send_temp(context, update.effective_chat.id, text)
+    await send_temp(context, update.effective_chat.id, text, seconds=temp)
 async def render(update, context, text, kb=None, force_new=False):
     op = _current_operation.get()
     tag = getattr(op, 'debug_tag', '?')
@@ -4154,7 +4213,9 @@ async def _ack(msg, fallback_text, kb=None):
     except Exception:
         try: await msg.reply_text(fallback_text, reply_markup=kb)
         except Exception: pass
-async def send_temp(context, chat_id, text, seconds=10):
+async def send_temp(context, chat_id, text, seconds=None):
+    """پیام موقت: seconds=None → همیشه ۵ ثانیه (قانون فاز ۱)؛ مقدار صریح فقط برای جایی که واقعاً لازم است."""
+    seconds = 5 if seconds is None else max(1, int(seconds))
     try: mid = await create_temp(context.bot, chat_id, text)
     except Exception:
         log.debug("temporary message send failed", exc_info=True)
@@ -4284,4 +4345,3 @@ def main():
     log.info("در حال اجرا…"); APP.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
 if __name__ == "__main__": main()
 # ---------- پایان فایل newsbot.py ----------
-
