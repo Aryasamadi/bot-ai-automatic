@@ -2873,7 +2873,8 @@ def step_add(op, category, key=None, status="run", model=None, **fmt):
         rec = {"category": category, "key": key, "variant": random.randrange(3), "entered": time.time()}
         steps.append(rec)
     rec.update(status=status, model=model, fmt=fmt or {})
-    if op.header_kind == "thinking" and category.startswith(("ai_", "model_")):
+    # Thinking طولانی‌تر: تا وقتی همهٔ مراحل غیرمدلی هست، Thinking می‌ماند؛ سوییچ به Working فقط وقتی AI/مدل start شد
+    if category.startswith(("ai_", "model_")):
         op.header_kind = "working"
 
 def thinking_animation(step):
@@ -2887,7 +2888,7 @@ def strip_thinking_prefix(text):
 
 
 SPHARSE = {
-  ("model_start","run",0): "⏳ در حال اتصال به {}…", ("model_start","run",1): "🔌 {} در راه است…", ("model_start","run",2): "⏳ صبر می‌کنم تا {} جواب بده…",
+  ("model_start","run",0): "⏳ در حال اتصال به مدل {}…", ("model_start","run",1): "🔌 مدل {} در حال اجراست…", ("model_start","run",2): "⏳ صبر می‌کنم تا مدل {} جواب بده…",
   ("model_start","ok",0): "✅ {} جواب داد", ("model_start","ok",1): "✅ به {} رسیدم", ("model_start","ok",2): "✅ {} تایید شد",
   ("model_start","fail",0): "❌ {} جواب نداد", ("model_start","fail",1): "⚠️ خطا از {} — عیب یاب", ("model_start","fail",2): "❌ {} از دسترس رفت",
   ("model_ok","ok",0): "✅ مدل {} قبول شد", ("model_ok","ok",1): "🎯 {} سالم بود", ("model_ok","ok",2): "✅ خروجی {} سالم است",
@@ -4124,14 +4125,16 @@ def _input_value(field, raw, lang, name_limit=100):
         if t == "": return None
         try: value = to_int(t)
         except (ValueError, TypeError): invalid("عدد صحیح وارد کنید.", "Enter an integer.")
-        plan_cap = None
+        # cap به پلن: اگر cid هست، سقف پلنِ آن کانال را بگیر؛ وگرنه فقط بین ۱ تا سقف جهانی
+        hi = 500
         try:
-            cid = st.get("data", {}).get("cid") or st.get("cid")
-            if cid:
+            cid = st.get("cid") if isinstance(st, dict) else None
+            uid = st.get("uid") if isinstance(st, dict) else None
+            if cid and uid:
                 plan = admin_limits(uid)
                 plan_cap = plan.get("daily_posts")
+                if plan_cap is not None: hi = int(plan_cap)
         except Exception: pass
-        hi = plan_cap if plan_cap else 500
         if not 1 <= value <= hi: invalid(f"بین ۱ و {hi} انتخاب کنید.", f"Choose between 1 and {hi}.")
         return value
     if field in INT_FIELDS or field in ("days", "daily_posts", "max_sources", "max_channels", "daily_tests", "max_tokens", "max_uses", "priority", "weight", "percent", "price_num"):
