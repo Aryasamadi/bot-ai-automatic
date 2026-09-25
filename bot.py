@@ -1354,11 +1354,9 @@ def clean_ai_text(t, s=None):
     t = re.sub(r"\[([^\]\n]{1,160})\]\((https?://[^)\s\"']{4,})\)", lambda m: m.group(2) if m.group(1).strip() in m.group(2) else f'<a href="{m.group(2)}">{m.group(1).replace(chr(34), "")}</a>', t)   # لینک مارک‌داونی → لینک واقعی
     t = re.sub(r"\[([^\]\n]{0,160})\]\(\s*\)", r"\1", t)
     t = re.sub(r"(?<![\w])['‘’]([\w؀-ۿ][\w؀-ۿ \-]{0,38}[\w؀-ۿ]|[\w؀-ۿ])['‘’](?![\w])", r"\1", t)   # کوتیشن دور واژه‌ها حذف می‌شود
-    em = re.compile(r"[\U0001F000-\U0001FAFF]")
-    hits = em.findall(t)
-    if hits:
-        t = em.sub("", t).replace("️", ""); t = re.sub(r'<a href="[^"]*">\s*</a>', " ", t)
-        t = t.rstrip() + " " + hits[-1]   # فقط یک ایموجی، در همان انتها
+    EM = r"[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF]\ufe0f?"
+    t = re.sub(rf"({EM})\1{{3,}}", r"\1\1", t)                    # فقط ایموجی‌های پشت‌سرهمِ افراطی جمع می‌شوند
+    t = re.sub(rf"(?m)^[ \t]*{EM}(?:[ \t]|{EM})*$", "", t)          # خطی که تنها ایموجی است حذف می‌شود
     t = re.sub(r"(?m)^[ \t]+|[ \t]+$", "", t); t = re.sub(r"[ \t]{2,}", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     parts = re.split(r"(<pre>.*?</pre>|<code>.*?</code>)", t, flags=re.S)
@@ -1888,7 +1886,7 @@ EVALUATION CRITERIA (score each 0–10, honestly and strictly):
 {crit}
 FORMATTING RULES (mandatory, not optional — these override any conflicting style guidance above):
 - HUMAN VOICE: write like a skilled human editor, never like a bot or an AI. Vary sentence length, no meta commentary, no clichéd openings like "In today's world", and NEVER use divider lines like "---" or "***" or "⸻".
-- EMOJI: keep emojis moderate; if the channel style asks for no emoji or a specific style (e.g. per-paragraph), follow the channel style.
+- EMOJI: the channel style has the final say — if it asks for emojis (e.g. one per paragraph, or 8–12 per post), use exactly that many; never reduce or drop them. Only when the style is silent, stay moderate.
 - Line 1: headline inside <b>. Then a blank line, then a one-sentence lead.
 - SYMBOLS: wherever a list, step, comparison or highlight helps, start the line with a symbol from this palette (pick 1–2 kinds per post and stay consistent): • ◦ ◆ ◇ ▸ ▹ ➤ ➜ ➥ ➢ → ➝ ⇢ ⟶ ⤷ — each such line is its own paragraph.
 - Only these HTML tags (NO Markdown): <b>, <i>, <u>, <s>, <code>, <pre>, <a href="">, <blockquote>.
@@ -2114,7 +2112,7 @@ def channel_caption(s, ch, post_html, full_html, title, url):
     """متنِ کپشن کانال + نسخهٔ کاملِ «بیشتر».
     قواعد: فقط یک امضا و همیشه در انتهای همان پیام · طول کل ≤ سقف کپشن (POST_LIMIT_MAX) تا تلگرام پست را به دو پیام نشکند ·
     لینک «بیشتر» هر وقت نسخهٔ ربات محتوای بیشتری از کپشن داشته باشد.
-    خروجی: (caption, full_or_None)
+    خروجی: (cut, tail, full_or_None) — کلید لینک «بیشتر» را فراخوان می‌سازد و خودش به متن می‌چسباند.
     """
     lang = s.get("ui_lang") or "fa"
     sig = signature_of(s, ch)
@@ -2127,18 +2125,18 @@ def channel_caption(s, ch, post_html, full_html, title, url):
         post = re.sub(r"\n{3,}", "\n\n", post).strip()
     full = clean_ai_text(strip_source_url(full_html or "", url), s) if full_html else ""
     limit = min(int(s.get("post_limit") or POST_LIMIT_DEFAULT), POST_LIMIT_MAX)
-    more_tpl = f'\n\n<a href="https://t.me/{BOT_USERNAME}?start=r_">📖 {"بیشتر" if lang == "fa" else "more..."}</a>'
-    budget = max(200, limit - len(tail) - len(more_tpl))
+    more_len = len(f'\n\n<a href="https://t.me/{BOT_USERNAME}?start=r_XXXXXXXX">📖 {"بیشتر" if lang == "fa" else "more..."}</a>')
+    budget = max(200, limit - len(tail) - more_len)
     has_more = bool(full.strip()) and (len(post) > budget or len(full.strip()) > len(post) + 150)
     if not has_more:
-        return post + tail, None
+        return post, tail, None
     cut, rest = split_post_html(post, budget)
     body_full = full.strip() or ((f"<b>{html.escape(title or '')}</b>\n\n" + rest) if rest else "")
     parts = []
     while body_full:
         chunk, body_full = fit_html(body_full, BOT_FULL_MAX)
         parts.append(chunk)
-    return cut + more_tpl + tail, "\n".join(parts)
+    return cut, tail, "\n".join(parts)
 
 async def publish_article(bot, aid, count_usage=True, test_user=None):
     a = get_article(aid)
@@ -2173,10 +2171,11 @@ async def _publish_article_locked(bot, aid, count_usage=True, test_user=None):
         if posted_before(ch["chat_id"], a["hash"]):
             article_update(aid, status="rejected", reason="duplicate"); return False, "duplicate"
         media = json.loads(a["media"]) if a["media"] and s["include_media"] else None
-        caption, full_for_bot = channel_caption(s, ch, a["post_html"], a["full_html"], a["title"], a["url"])
-        text = caption
+        cut, tail, full_for_bot = channel_caption(s, ch, a["post_html"], a["full_html"], a["title"], a["url"])
+        text = cut + tail
         if full_for_bot:
-            await store_deeplink(admin_id, {"short": caption, "full": full_for_bot, "title": a["title"], "url": a["url"], "show_source": bool(s.get("include_link", True)), "media": {k: v for k, v in media.items() if not k.startswith("_")} if media else None, "ts": now_iso()})
+            key = await store_deeplink(admin_id, {"short": cut, "full": full_for_bot, "title": a["title"], "url": a["url"], "show_source": bool(s.get("include_link", True)), "media": {k: v for k, v in media.items() if not k.startswith("_")} if media else None, "ts": now_iso()})
+            text = cut + f'\n\n<a href="https://t.me/{BOT_USERNAME}?start=r_{key}">📖 {"بیشتر" if (s.get("ui_lang") or "fa") == "fa" else "more..."}</a>' + tail
 
         if journal.get("media_id"):
             text = journal["text"]
@@ -2234,25 +2233,27 @@ async def _publish_article_locked(bot, aid, count_usage=True, test_user=None):
 # ============================================================
 # تشخیص مرحله‌ای (Diagnostics) — کوتاه، نمادین، دوزبانه
 DIAG = {
-    "busy": ("⏳ چرخه‌ی دیگری روی این کانال در حال اجراست", "⏳ Another cycle is running on this channel"),
-    "no_channel": ("❌ کانال یافت نشد", "❌ Channel not found"), "plan_inactive": ("⛔ پلن فعال نیست", "⛔ Plan inactive"), "no_sources": ("⚠️ منبعی ثبت نشده", "⚠️ No source added"),
-    "quota_posts": ("⛔ سهمیه‌ی پست امروز: {used}/{cap}", "⛔ Today's posts: {used}/{cap}"), "quota_tests": ("⛔ سهمیه‌ی تست امروز: {used}/{cap}", "⛔ Today's tests: {used}/{cap}"),
-    "bot_not_admin": ("❌ ربات ادمین کانال نیست یا مجوز ارسال ندارد", "❌ Bot is not admin / can't post"),
-    "src_ok": ("🌐 {name} [{m}]: {n} آیتم · 🆕 {new}", "🌐 {name} [{m}]: {n} items · 🆕 {new}"), "src_notmod": ("🌐 {name}: بدون تغییر", "🌐 {name}: unchanged"),
-    "src_empty": ("🟡 {name}: فید/مقاله‌ای پیدا نشد", "🟡 {name}: no feed/articles found"), "src_fail": ("🔴 {name}: {err}", "🔴 {name}: {err}"), "src_cooldown": ("⏸ {name}: به‌تازگی بررسی شده", "⏸ {name}: checked recently"),
-    "old": ("🕰 {n} قدیمی‌تر از {h} ساعت", "🕰 {n} older than {h}h"), "leftover": ("♻️ {n} باقی‌مانده از چرخه‌های قبل", "♻️ {n} left over from earlier cycles"), "retry": ("🧪 {n} مورد قبلی دوباره بررسی می‌شود", "🧪 Re-checking {n} earlier items"),
-    "found": ("🔎 {n} مقاله برای بررسی", "🔎 {n} articles to process"), "none_found": ("⚠️ مقاله‌ی جدیدی نیست", "⚠️ No new article"),
-    "extract_fail": ("📄 {n} بدون متن قابل استخراج", "📄 {n} without extractable text"), "undated": ("📅 {n} بدون تاریخ (رد شد)", "📅 {n} undated (skipped)"), "ad": ("🛡 {n} تبلیغ (فیلتر)", "🛡 {n} ads (filter)"),
-    "ai_fail": ("🤖 خطای AI: {err}", "🤖 AI error: {err}"), "ai_ad": ("🤖 {n} تبلیغ (تشخیص AI)", "🤖 {n} ads (AI)"), "low": ("⭐ {n} زیر حداقل {min} · بهترین {best}", "⭐ {n} below {min} · best {best}"),
-    "from_src": ("🌐 تولید از منبع: {name}", "🌐 Generated from source: {name}"),
-    "quiet": ("🌙 ساعت خاموشی؛ در صف ماند", "🌙 Quiet hours; queued"), "review": ("📝 {n} در صفحه‌ی انتشار منتظر تأیید", "📝 {n} awaiting approval in publish page"),
-    "published": ("✅ {n} منتشر شد", "✅ {n} published"), "pub_fail": ("❌ انتشار: {err}", "❌ Publish: {err}"), "detail": ("   ↳ {title} — {why}", "   ↳ {title} — {why}"),
+    "busy": ("⏳ من یک چرخه‌ی دیگر روی همین کانال دارم؛ اول آن را تمام می‌کنم", "⏳ Another cycle is running on this channel"),
+    "checks": ("🔎 دارم تنظیمات، پلن و منابع را بررسی می‌کنم…", "🔎 Checking settings, plan and sources…"),
+    "no_channel": ("❌ کانالی برای بررسی پیدا نکردم", "❌ Channel not found"), "plan_inactive": ("⛔ نمی‌توانم منتشر کنم؛ پلن فعال نیست", "⛔ Plan inactive"), "no_sources": ("⚠️ منبعی ثبت نشده که بررسی کنم", "⚠️ No source added"),
+    "quota_posts": ("⛔ سهمیه‌ی پست امروز پر است ({used}/{cap})؛ دیگر منتشر نمی‌کنم", "⛔ Today's posts: {used}/{cap}"), "quota_tests": ("⛔ سهمیه‌ی تست امروز پر است ({used}/{cap})؛ الان تست نمی‌گیرم", "⛔ Today's tests: {used}/{cap}"),
+    "bot_not_admin": ("❌ نمی‌توانم در کانال بنویسم؛ ربات ادمین نیست یا مجوز ارسال ندارد", "❌ Bot is not admin / can't post"),
+    "src_ok": ("🌐 {name} [{m}]: {n} آیتم دیدم · 🆕 {new} تازه", "🌐 {name} [{m}]: {n} items · 🆕 {new}"), "src_notmod": ("🌐 {name}: از آخرین بار تغییری ندیدم", "🌐 {name}: unchanged"),
+    "src_empty": ("🟡 {name}: فید یا مقاله‌ای پیدا نکردم", "🟡 {name}: no feed/articles found"), "src_fail": ("🔴 {name}: نتوانستم بخوانم — {err}", "🔴 {name}: {err}"), "src_cooldown": ("⏸ {name}: تازه بررسی‌اش کرده‌ام؛ فعلاً ردش می‌کنم", "⏸ {name}: checked recently"),
+    "old": ("🕰 {n} خبر قدیمی‌تر از {h} ساعت بود؛ کنارشان گذاشتم", "🕰 {n} older than {h}h"), "leftover": ("♻️ {n} مورد از چرخه‌های قبلی را دوباره برمی‌دارم", "♻️ {n} left over from earlier cycles"), "retry": ("🧪 {n} مورد قبلی را دوباره بررسی می‌کنم", "🧪 Re-checking {n} earlier items"),
+    "found": ("🔎 {n} مقاله را برای بررسی برداشتم", "🔎 {n} articles to process"), "none_found": ("⚠️ مقاله‌ی تازه‌ای پیدا نکردم", "⚠️ No new article"),
+    "extract_fail": ("📄 {n} مورد متن قابل استخراج نداشت؛ ردشان کردم", "📄 {n} without extractable text"), "undated": ("📅 {n} خبر بدون تاریخ بود؛ ردش کردم", "📅 {n} undated (skipped)"), "ad": ("🛡 {n} مورد را تبلیغ تشخیص دادم؛ حذف کردم", "🛡 {n} ads (filter)"),
+    "ai_fail": ("🤖 خطای مدل: {err}", "🤖 AI error: {err}"), "ai_ad": ("🤖 {n} مورد را خود مدل تبلیغ تشخیص داد", "🤖 {n} ads (AI)"), "low": ("⭐ {n} مورد زیر حداقل امتیاز ({min}) بود؛ بهترین {best}", "⭐ {n} below {min} · best {best}"),
+    "from_src": ("🌐 محتوا را از منبع {name} ساختم", "🌐 Generated from source: {name}"),
+    "quiet": ("🌙 ساعت خاموشی است؛ پس در صف می‌گذارم", "🌙 Quiet hours; queued"), "review": ("📝 {n} مورد را برای تأیید تو در صفحه‌ی انتشار گذاشتم", "📝 {n} awaiting approval in publish page"),
+    "published": ("✅ {n} مطلب را در کانال منتشر کردم", "✅ {n} published"), "pub_fail": ("❌ نتوانستم منتشر کنم — {err}", "❌ Publish: {err}"), "detail": ("   ↳ {title} — {why}", "   ↳ {title} — {why}"),
     "hint_sources": ("→ منبع دیگری اضافه کنید یا بازه را بیشتر کنید (≤۴۸h)", "→ Add another source or widen the window (≤48h)"), "hint_score": ("→ حداقل امتیاز را کمتر کنید", "→ Lower the minimum score"),
     "hint_ads": ("→ فیلتر سخت تبلیغ را خاموش کنید", "→ Turn off strict ad filter"), "hint_ai": ("→ سرویس AI پاسخ نمی‌دهد؛ چند دقیقه بعد یا /man", "→ AI service failing; retry later or /man"),
     "hint_admin": ("→ ربات را با مجوز «ارسال پیام» ادمین کنید", "→ Make the bot admin with “post messages”"), "hint_undated": ("→ «بدون تاریخ» را روشن کنید", "→ Turn on “undated articles”"),
     "hint_extract": ("→ این منبع متن استاندارد ندارد؛ منبع دیگر", "→ Source lacks readable text; try another"), "hint_review": ("→ حالت را روی «خودکار» بگذارید", "→ Switch mode to “auto”"), "hint_quota": ("→ ارتقای پلن", "→ Upgrade plan"),
     "stage": ("📍 مرحله: {stage}", "📍 Stage: {stage}"),
 }
+
 STAGES = {"start": ("شروع", "start"), "checks": ("بررسی پلن/کانال/منبع", "checks"), "discover": ("کشف مقالات", "discovery"), "extract": ("استخراج متن", "extraction"), "filter": ("فیلتر", "filtering"), "ai": ("تولید با AI", "AI generation"), "score": ("امتیازدهی", "scoring"), "publish": ("انتشار", "publishing"), "done": ("پایان", "done")}
 class Diag:
     def __init__(self): self.items, self.hints, self.stage = [], [], "start"
@@ -2272,7 +2273,7 @@ class Diag:
             "published": ("ok", "✅ منتشر شد"), "queued": ("ok", "📌 در انتظار")
         }
         st = mapping.get(key)
-        if st: step_add(op, key, status=st[0])
+        if st: step_add(op, key, status=st[0], **kw)
     def hint(self, key, **kw):
         if key not in [h[0] for h in self.hints]: self.hints.append((key, kw))
     def keys(self): return sorted({k for k, _ in self.items if k not in ("src_ok", "src_notmod", "found", "detail", "leftover", "retry")})
@@ -2701,10 +2702,10 @@ TXT = {
     "my_ai_add": ("➕ افزودن مدل", "➕ Add model"), "my_ai_added": ("✅ مدل «{name}» اضافه شد · {res}", "✅ Model “{name}” added · {res}"),
     "my_ai_view": ("🤖 <b>{name}</b> · {kind}\n<code>{model}</code>\n🔗 <code>{base}</code>\n{st} · ✅ {ok} · ⚠️×{fc}\n🕐 موفق {lo} · خطا {lf}", "🤖 <b>{name}</b> · {kind}\n<code>{model}</code>\n🔗 <code>{base}</code>\n{st} · ✅ {ok} · ⚠️×{fc}\n🕐 ok {lo} · error {lf}"),
     # ---- زمان‌بندی
-    "sched_title": ("⏰ <b>زمان‌بندی — {title}</b>\n⏱ هر {iv}′ · 📦 {ppc} پست/چرخه · 🕰 {lb}h اخیر · 📅 بدون تاریخ {ud}\n🌙 {quiet} · 🌍 {city} {tz} (⌚ {loc} · UTC {utc})\n🔁 {mode}", "⏰ <b>Schedule — {title}</b>\n⏱ every {iv}′ · 📦 {ppc} posts/cycle · 🕰 last {lb}h · 📅 undated {ud}\n🌙 {quiet} · 🌍 {city} {tz} (⌚ {loc} · UTC {utc})\n🔁 {mode}"),
+    "sched_title": ("⏰ <b>زمان‌بندی کانال {title}</b>\n⏱ فاصله‌ی چرخه: هر {iv} دقیقه · 📦 در هر چرخه {ppc} پست\n🗓 بازه‌ی خبری: {lb} ساعت گذشته · 📅 خبر بدون تاریخ: {ud}\n🌙 {quiet} · 🌍 {city} {tz} (⌚ {loc} · UTC {utc})\n🔁 {mode}", "⏰ <b>Schedule — {title}</b>\n⏱ every {iv}′ · 📦 {ppc} posts/cycle · 🕰 last {lb}h · 📅 undated {ud}\n🌙 {quiet} · 🌍 {city} {tz} (⌚ {loc} · UTC {utc})\n🔁 {mode}"),
     "mode_auto": ("⚡ خودکار — انتشار مستقیم", "⚡ auto — publish directly"), "mode_review": ("📝 بازبینی — تأیید دستی در صف", "📝 review — manual approval in queue"), "none": ("—", "—"),
-    "b_interval": ("⏱ هر {n}′", "⏱ Every {n}′"), "b_ppc": ("📦 {n} پست/چرخه", "📦 {n}/cycle"), "b_lookback": ("🕰 {n}h", "🕰 {n}h"), "b_undated": ("📅 بدون تاریخ {i}", "📅 Undated {i}"),
-    "b_daily_cap": ("📊 سقف روزانه {n}", "📊 Daily cap {n}"), "cap_over_plan": ("⚠️ بیشتر از سقف پلن شما ({n} پست در روز) قابل تنظیم نیست.", "⚠️ Cannot exceed your plan limit ({n} posts/day)."), "cap_range": ("حداکثر تا {n} پست در روز (طبق پلن شما)", "Max {n} posts/day (your plan)"), "unlimited": ("نامحدود", "unlimited"), "b_quiet": ("🌙 خاموشی", "🌙 Quiet hours"), "b_tz": ("🌍 منطقه زمانی", "🌍 Time zone"), "b_mode": ("🔁 {m}", "🔁 {m}"),
+    "b_interval": ("⏱ فاصله‌ی چرخه: هر {n} دقیقه", "⏱ Cycle interval: every {n} min"), "b_ppc": ("📦 در هر چرخه {n} پست منتشر شود", "📦 Publish {n} post(s) per cycle"), "b_lookback": ("🗓 فقط خبرهای {n} ساعت گذشته", "🗓 Only news from the last {n} hours"), "b_undated": ("📅 خبرهای بدون تاریخ: {i}", "📅 Undated news: {i}"),
+    "b_daily_cap": ("📊 در روز حداکثر {n} پست منتشر شود", "📊 Publish at most {n} post(s) per day"), "cap_over_plan": ("⚠️ بیشتر از سقف پلن شما ({n} پست در روز) قابل تنظیم نیست.", "⚠️ Cannot exceed your plan limit ({n} posts/day)."), "cap_range": ("حداکثر تا {n} پست در روز (طبق پلن شما)", "Max {n} posts/day (your plan)"), "unlimited": ("نامحدود", "unlimited"), "b_quiet": ("🌙 خاموشی", "🌙 Quiet hours"), "b_tz": ("🌍 منطقه زمانی", "🌍 Time zone"), "b_mode": ("🔁 {m}", "🔁 {m}"),
     "mode_set_auto": ("⚡ خودکار: انتشار مستقیم", "⚡ Auto: publish directly"), "mode_set_review": ("📝 بازبینی: منتظر تأیید در صف", "📝 Review: waits for approval"),
     "quiet_pick_start": ("🌙 <b>خاموشی</b> · ساعت <b>شروع</b> ({tz} · الان {loc}):", "🌙 <b>Quiet hours</b> · <b>start</b> hour ({tz} · now {loc}):"), "quiet_pick_end": ("🌙 شروع {h}:00 · ساعت <b>پایان</b>:", "🌙 Start {h}:00 · <b>end</b> hour:"),
     "quiet_off": ("🚫 بدون خاموشی", "🚫 No quiet hours"), "quiet_set": ("🌙 خاموشی {a}:00 → {b}:00", "🌙 Quiet {a}:00 → {b}:00"), "quiet_cleared": ("🌙 خاموشی حذف شد", "🌙 Quiet hours cleared"),
@@ -2876,12 +2877,15 @@ def step_add(op, category, key=None, status="run", model=None, **fmt):
         rec = {"category": category, "key": key, "variant": random.randrange(3), "entered": time.time()}
         steps.append(rec)
     rec.update(status=status, model=model, fmt=fmt or {})
-    # Thinking طولانی‌تر: تا وقتی همهٔ مراحل غیرمدلی هست، Thinking می‌ماند؛ سوییچ به Working فقط وقتی AI/مدل start شد
-    if category.startswith(("ai_", "model_")):
+    # Thinking غالب می‌ماند: فقط مرحله‌ی تولید و انتشار Working است؛ هر مرحله‌ی بررسی/منبع، هدر را به Thinking برمی‌گرداند
+    if category.startswith(("ai_", "model_")) or category in ("post_gen", "post_ready", "published", "queued", "queue"):
         op.header_kind = "working"
+    elif category.startswith("src_") or category in ("extract", "low", "found", "ad"):
+        op.header_kind = "thinking"
 
+DOTS_SEQ = (3, 2, 1, 0, 1, 2)          # ابتدا سه نقطه یکی‌یکی پاک می‌شود، سپس یکی‌یکی برمی‌گردد
 def thinking_animation(step):
-    return "Thinking" + "." * (1 + (step % 3))
+    return "Thinking" + "." * DOTS_SEQ[step % len(DOTS_SEQ)]
 
 
 def strip_thinking_prefix(text):
@@ -2891,62 +2895,63 @@ def strip_thinking_prefix(text):
 
 
 SPHARSE = {
-  ("model_start","run",0): "⏳ دارم مدل {} را اجرا می‌کنم…", ("model_start","run",1): "🧠 دارم با مدل {} می‌نویسم…", ("model_start","run",2): "▶️ مدل {} شروع به کار کرد…",
-  ("model_start","ok",0): "✅ مدل {} جواب داد؛ نتیجه را بررسی می‌کنم", ("model_start","ok",1): "🎯 خروجی مدل {} سالم بود", ("model_start","ok",2): "✅ مدل {} کارش را درست انجام داد",
+  # --- مدل‌ها (وضعیت Working) — همیشه با ضمیر اول‌شخص
+  ("model_start","run",0): "⏳ دارم مدل {} را اجرا می‌کنم…", ("model_start","run",1): "🧠 دارم با مدل {} می‌نویسم…", ("model_start","run",2): "▶️ مدل {} را روشن می‌کنم…",
+  ("model_start","ok",0): "✅ مدل {} جواب داد؛ دارم خروجی‌اش را بررسی می‌کنم", ("model_start","ok",1): "🎯 خروجی مدل {} سالم بود", ("model_start","ok",2): "✅ مدل {} کارش را درست انجام داد",
   ("model_start","fail",0): "⚠️ مدل {} جواب نداد؛ می‌روم سراغ مدل بعدی", ("model_start","fail",1): "❌ مدل {} از کار افتاده بود؛ مدل بعدی را امتحان می‌کنم", ("model_start","fail",2): "🛑 مدل {} پاسخ نداد؛ سوییچ می‌کنم روی مدل بعدی",
-  ("model_ok","ok",0): "✅ مدل {} جواب داد؛ نتیجه را بررسی می‌کنم", ("model_ok","ok",1): "🎯 خروجی مدل {} سالم بود", ("model_ok","ok",2): "✅ مدل {} کارش را درست انجام داد",
-  ("model_fail","fail",0): "⚠️ مدل {} جواب نداد؛ می‌روم سراغ مدل بعدی", ("model_fail","fail",1): "❌ مدل {} از کار افتاده بود؛ مدل بعدی را امتحان می‌کنم", ("model_fail","fail",2): "🛑 مدل {} پاسخ نداد؛ سوییچ می‌کنم روی مدل بعدی",
-  ("src_check","run",0): "🔎 دارم {} را بررسی می‌کنم…", ("src_check","run",1): "⏳ سراغ {} می‌روم…", ("src_check","run",2): "🔗 دارم {} را می‌خوانم…",
-  ("src_found","ok",0): "✅ در {} یک مورد مناسب پیدا کردم", ("src_found","ok",1): "📝 {} یک خبر به‌درد‌بخور داشت", ("src_found","ok",2): "🎯 محتوای {} مناسب تشخیص داده شد",
-  ("src_empty","fail",0): "📭 در {} چیزی به کار ما نمی‌آمد؛ می‌روم منبع بعدی", ("src_empty","fail",1): "⚠️ {} خروجی قابل‌استفاده نداشت", ("src_empty","fail",2): "📭 {} خبر تازه‌ای نداشت",
-  ("post_gen","run",0): "⏳ دارم محتوا را می‌نویسم…", ("post_gen","run",1): "🧠 دارم مطابق سبک کانال می‌نویسم…", ("post_gen","run",2): "✍️ در حال تولید محتوا…",
+  ("post_gen","run",0): "⏳ دارم محتوا را می‌نویسم…", ("post_gen","run",1): "🧠 دارم مطابق سبک کانال می‌نویسم…", ("post_gen","run",2): "✍️ دارم متن را آماده می‌کنم…",
   ("post_ready","ok",0): "✅ محتوا آماده شد", ("post_ready","ok",1): "🎉 پست تولید شد", ("post_ready","ok",2): "📨 دارم به کانال می‌فرستم…",
-}
-SPHARSE.update({
-  ("busy","run",0): "⏳ عملیات قبلی هنوز تمام نشده", ("busy","run",1): "⏳ در حال تکمیل چرخه‌ی قبلی…", ("busy","run",2): "⏳ منتظر باز شدن کانال…",
-  ("plan_inactive","fail",0): "⛔ پلن فعال نیست", ("plan_inactive","fail",1): "🛑 پلن نیاز به تمدید دارد", ("plan_inactive","fail",2): "⚠️ مجوز انتشار فعلی منقضی است",
-  ("quota_posts","fail",0): "📉 سهمیه‌ی امروز به اتمام رسید", ("quota_posts","fail",1): "⛔ سقف روزانه پر شده", ("quota_posts","fail",2): "⚠️ امروز دیگر ظرفیت انتشار نیست",
-  ("quota_tests","fail",0): "🧪 سهمیه‌ی تست امروز پر شده", ("quota_tests","fail",1): "⛔ ظرفیت تست تمام شده", ("quota_tests","fail",2): "🧪 محدودیت تست اعمال شد",
-  ("no_sources","fail",0): "📭 هیچ منبعی فعال نیست", ("no_sources","fail",1): "🚫 هیچ منبع فعالی یافت نشد", ("no_sources","fail",2): "📭 منبعی برای بررسی نیست",
-  ("src_cooldown","run",0): "⏳ {} در بازه‌ی استراحت است؛ فعلاً ردش می‌کنم", ("src_cooldown","run",1): "🔄 {} تازه بررسی شده؛ بعداً سراغش می‌روم", ("src_cooldown","run",2): "💤 {} در حال بازیابی است",
-  ("src_fail","fail",0): "⚠️ {} جواب نداد؛ منبع را کنار می‌گذارم", ("src_fail","fail",1): "❌ دسترسی به {} ممکن نشد", ("src_fail","fail",2): "🔌 {} قطع بود؛ می‌روم منبع بعدی",
+  ("ai","run",0): "⏳ دارم با مدل تولید می‌کنم…", ("ai","run",1): "🧠 مدل دارد فکر می‌کند…", ("ai","run",2): "✍️ دارم می‌نویسم…",
+  # --- منابع (وضعیت Thinking)
+  ("src_check","run",0): "🔎 دارم {} را بررسی می‌کنم…", ("src_check","run",1): "⏳ خب، می‌روم سراغ {}…", ("src_check","run",2): "📖 دارم {} را می‌خوانم…",
+  ("src_found","ok",0): "✅ در {} یک مورد مناسب پیدا کردم", ("src_found","ok",1): "📝 {} یک خبر به‌درد‌بخور داشت", ("src_found","ok",2): "🎯 در {} یک گزینه‌ی خوب دیدم",
+  ("src_empty","fail",0): "📭 در {} چیزی به کارم نیامد؛ می‌روم منبع بعدی", ("src_empty","fail",1): "⚠️ خروجی {} با معیارهای کانال نمی‌خواند", ("src_empty","fail",2): "📭 {} خبر تازه‌ای نداشت",
+  ("src_cooldown","run",0): "⏳ {} در بازه‌ی استراحت است؛ فعلاً ردش می‌کنم", ("src_cooldown","run",1): "🔄 {} را تازه بررسی کرده‌ام؛ بعداً سراغش می‌روم", ("src_cooldown","run",2): "💤 {} دارد بازیابی می‌شود",
+  ("src_fail","fail",0): "⚠️ {} جواب نداد؛ منبع را کنار می‌گذارم", ("src_fail","fail",1): "❌ نتوانستم به {} وصل شوم", ("src_fail","fail",2): "🔌 {} قطع بود؛ می‌روم منبع بعدی",
   ("src_notmod","run",0): "ℹ️ {} از آخرین بررسی تازه‌تر نشده", ("src_notmod","run",1): "⏳ {} خبر جدیدی نداشت", ("src_notmod","run",2): "📄 محتوای {} همان قبلی است",
-  ("src_empty","fail",0): "📭 {} محتوایی مطابق معیارها نداشت", ("src_empty","fail",1): "⚠️ خروجی {} با معیارهای کانال نمی‌خواند", ("src_empty","fail",2): "📭 {} مورد مناسبی نداشت",
-  ("found","ok",0): "📥 موردی مطابق یافت شد", ("found","ok",1): "✅ یک گزینه‌ی خوب پیدا شد", ("found","ok",2): "🎯 آیتم مناسب تشخیص داده شد",
-  ("extract","run",0): "🧾 دارم متن خبر را استخراج می‌کنم…", ("extract","run",1): "🔍 دارم بدنه‌ی خبر را می‌خوانم…", ("extract","run",2): "📄 دارم کل مقاله را می‌خوانم…",
-  ("low","run",0): "⏳ دارم امتیاز می‌دهم…", ("low","run",1): "📏 دارم معیارها را می‌سنجم…", ("low","run",2): "🧪 امتیازدهی در جریان است…", 
-  ("ad","run",0): "🚫 بررسی تبلیغات…", ("ad","run",1): "🛡 تشخیص تبلیغاتی بودن…", ("ad","run",2): "⚠️ بررسی محتوای تبلیغاتی…",
-  ("ai","run",0): "⏳ در حال تولید با مدل…", ("ai","run",1): "⏳ مدل در حال فکر کردن…", ("ai","run",2): "✍️ در حال نگارش…",
-  ("queue","run",0): "⏳ در صف انتشار…", ("queue","run",1): "📥 آماده‌ی انتشار شد", ("queue","run",2): "🕐 در انتظار انتشار…",
-  ("src_extract_fail","fail",0): "📭 متن این منبع استخراج نشد", ("src_extract_fail","fail",1): "❌ منبع قابل‌خواندن نبود", ("src_extract_fail","fail",2): "⚠️ بدنه‌ی خبر خالی آمد",
-  ("src_skip_old","fail",0): "🕰 خارج از بازه‌ی زمانی بود", ("src_skip_old","fail",1): "⏳ خبر قدیمی است", ("src_skip_old","fail",2): "📅 تاریخش قدیمی است",
-  ("src_ad","fail",0): "🚫 به نظر تبلیغات می‌رسد", ("src_ad","fail",1): "⚠️ محتوا تبلیغاتی تشخیص داده شد", ("src_ad","fail",2): "🛑 فیلتر تبلیغ رد کرد",
-  ("src_ai_fail","fail",0): "🧠 مدل نتوانست تولید کند", ("src_ai_fail","fail",1): "❌ خروجی مدل معتبر نبود", ("src_ai_fail","fail",2): "⚠️ مدل پاسخ قابل‌استفاده نداد",
-  ("published","ok",0): "✅ منتشر شد", ("published","ok",1): "📣 ارسال به کانال انجام شد", ("published","ok",2): "🎉 در کانال قرار گرفت",
-  ("queued","ok",0): "📌 در صف قرار گرفت", ("queued","ok",1): "📥 برای انتشار بعدی ذخیره شد", ("queued","ok",2): "✅ آماده قرار گرفت",
-})
-SPHARSE.update({
-  ("src_extract_fail","fail",0): "📄 متن این خبر خوانده نشد؛ ردش می‌کنم", ("src_extract_fail","fail",1): "❌ محتوای این خبر در دسترس نبود", ("src_extract_fail","fail",2): "⚠️ بدنهٔ خبر خالی آمد؛ ردش کردم",
-  ("src_skip_old","fail",0): "🕰 این خبر قدیمی‌تر از بازهٔ تعیین‌شده بود", ("src_skip_old","fail",1): "⏳ تاریخ خبر گذشته بود؛ کنارش گذاشتم", ("src_skip_old","fail",2): "📅 خبر خارج از بازهٔ زمانی بود",
-  ("src_ad","fail",0): "🚫 این محتوا تبلیغاتی بود؛ پردازش نکردم", ("src_ad","fail",1): "⚠️ تبلیغ تشخیص داده شد؛ کنارش گذاشتم", ("src_ad","fail",2): "🛑 فیلتر تبلیغ این مورد را رد کرد",
+  ("src_extract_fail","fail",0): "📄 متن این خبر خوانده نشد؛ ردش می‌کنم", ("src_extract_fail","fail",1): "❌ نتوانستم محتوای این خبر را بخوانم", ("src_extract_fail","fail",2): "⚠️ بدنهٔ خبر خالی بود؛ ردش کردم",
+  ("src_skip_old","fail",0): "🕰 این خبر قدیمی‌تر از بازهٔ تعیین‌شده بود", ("src_skip_old","fail",1): "⏳ تاریخ خبر گذشته بود؛ کنارش می‌گذارم", ("src_skip_old","fail",2): "📅 این خبر بیرون از بازهٔ زمانی بود",
+  ("src_ad","fail",0): "🚫 این محتوا تبلیغاتی بود؛ پردازش نمی‌کنم", ("src_ad","fail",1): "⚠️ تبلیغ تشخیصش دادم؛ کنارش می‌گذارم", ("src_ad","fail",2): "🛑 فیلتر تبلیغ این مورد را رد کرد",
   ("src_ai_fail","fail",0): "🧠 مدل خروجی قابل‌استفاده نداد؛ می‌روم سراغ بعدی", ("src_ai_fail","fail",1): "❌ تولید محتوا ناموفق بود", ("src_ai_fail","fail",2): "⚠️ خروجی مدل معتبر نبود",
-  ("src_low_score","fail",0): "📏 امتیاز این خبر به حداقل کانال نرسید", ("src_low_score","fail",1): "🧪 امتیاز پایین بود؛ ردش کردم", ("src_low_score","fail",2): "⚠️ با معیارها هم‌خوان نبود",
-})
+  ("src_low_score","fail",0): "📏 امتیاز این خبر به حداقل کانال نرسید", ("src_low_score","fail",1): "🧪 امتیاز پایین بود؛ ردش می‌کنم", ("src_low_score","fail",2): "⚠️ با معیارهای کانال هم‌خوان نبود",
+  # --- مراحل میانی
+  ("found","ok",0): "📥 یک مورد مطابق معیارها پیدا کردم", ("found","ok",1): "✅ یک گزینه‌ی خوب پیدا کردم", ("found","ok",2): "🎯 آیتم مناسب را تشخیص دادم",
+  ("extract","run",0): "🧾 دارم متن خبر را استخراج می‌کنم…", ("extract","run",1): "🔍 دارم بدنه‌ی خبر را می‌خوانم…", ("extract","run",2): "📄 دارم کل مقاله را می‌خوانم…",
+  ("low","run",0): "⏳ دارم امتیاز می‌دهم…", ("low","run",1): "📏 دارم معیارها را می‌سنجم…", ("low","run",2): "🧪 دارم محتوا را ارزیابی می‌کنم…",
+  ("ad","run",0): "🚫 دارم تبلیغاتی بودن را بررسی می‌کنم…", ("ad","run",1): "🛡 دارم نشانه‌های تبلیغ را می‌گردم…", ("ad","run",2): "⚠️ دارم محتوای تبلیغاتی را جدا می‌کنم…",
+  ("queue","run",0): "⏳ دارم در صف انتشار می‌گذارم…", ("queue","run",1): "📥 دارم برای انتشار آماده می‌کنم…", ("queue","run",2): "🕐 دارم برای انتشار نگه می‌دارم…",
+  ("published","ok",0): "✅ منتشر شد", ("published","ok",1): "📣 ارسال به کانال انجام شد", ("published","ok",2): "🎉 در کانال قرار گرفت",
+  ("queued","ok",0): "📌 در صف قرار گرفت", ("queued","ok",1): "📥 برای انتشار بعدی ذخیره شد", ("queued","ok",2): "✅ آماده‌ی انتشار شد",
+  # --- محدودیت‌ها و وضعیت‌های عمومی
+  ("busy","run",0): "⏳ عملیات قبلی هنوز تمام نشده", ("busy","run",1): "⏳ دارم چرخه‌ی قبلی را تمام می‌کنم…", ("busy","run",2): "⏳ منتظر باز شدن کانال هستم…",
+  ("plan_inactive","fail",0): "⛔ پلن فعال نیست", ("plan_inactive","fail",1): "🛑 پلن نیاز به تمدید دارد", ("plan_inactive","fail",2): "⚠️ مجوز انتشار فعلی منقضی شده",
+  ("quota_posts","fail",0): "📉 سهمیه‌ی امروز تمام شد", ("quota_posts","fail",1): "⛔ سقف روزانه پر شده", ("quota_posts","fail",2): "⚠️ امروز دیگر ظرفیت انتشار ندارم",
+  ("quota_tests","fail",0): "🧪 سهمیه‌ی تست امروز پر شده", ("quota_tests","fail",1): "⛔ ظرفیت تست تمام شده", ("quota_tests","fail",2): "🧪 به محدودیت تست رسیدم",
+  ("no_sources","fail",0): "📭 هیچ منبع فعالی ندارم", ("no_sources","fail",1): "🚫 منبع فعالی پیدا نکردم", ("no_sources","fail",2): "📭 منبعی برای بررسی نیست",
+}
 def _step_text(st, lang):
     cat = st.get("category"); status = st.get("status", "run"); var = int(st.get("variant", 0))
-    f = st.get("fmt", {})
+    f = dict(st.get("fmt") or {})
     key_tpl = SPHARSE.get((cat, status, var)) or SPHARSE.get((cat, status, 0))
-    if not key_tpl: return cat
     model = st.get("model") or st.get("key") or ""
-    try: return key_tpl.format(model, **f)
-    except Exception: return key_tpl
+    if not key_tpl:                                  # وضعیت دیگر مهم نیست: هر سه وارینت را امتحان می‌کنم
+        for alt in ("run", "ok", "fail"):
+            key_tpl = SPHARSE.get((cat, alt, var)) or SPHARSE.get((cat, alt, 0))
+            if key_tpl: break
+    if not key_tpl:                                  # هر مرحله‌ای که متن اختصاصی ندارد، از جدول DIAG جمله می‌گیرد
+        d = DIAG.get(cat)
+        if not d: return cat
+        key_tpl = d[1 if lang == "en" else 0]
+    try: out = key_tpl.format(model, **f)
+    except Exception: out = key_tpl
+    return re.sub(r"\{[a-z_]+\}", "", out).strip()   # هیچ جای‌نگهدار بی‌مقداری در متن نمی‌ماند
 def make_status(lang, text, step=None):
     """هدر Thinking/Working + لیست مراحل جاری (حداکثر ۶ خط). متن بیرونی فقط به‌عنوان خط جاری/نهایی.
     """
     if step is None: return str(text or "")
     op = _current_operation.get()
     kind = getattr(op, "header_kind", "thinking")
-    dots = "." * (1 + (step % 3))
+    dots = "." * DOTS_SEQ[step % len(DOTS_SEQ)]
     header = f"Working{dots}" if kind == "working" else f"Thinking{dots}"
     steps = (op.steps[-6:] if (op and op.steps) else [])
     lines = []
@@ -3080,7 +3085,7 @@ async def operation_status(context, text, failed=False, terminal=False):
             async def animate():
                 try:
                     while not op.terminalized and not op.cancelled:
-                        await asyncio.sleep(0.6)
+                        await asyncio.sleep(1.0)      # هر ۱ ثانیه یک قدم انیمیشن
                         if op.terminalized or op.cancelled: break
                         async with op.status_lock:
                             if op.terminalized or op.cancelled or op.status_message_id is None: break
@@ -3678,7 +3683,7 @@ TXT.update({
     "s_umsg_prompt": ("پیام برای این کاربر:", "Message to this user:"), "s_umsg_sent": ("✅ ارسال شد", "✅ Sent"), "s_umsg_head": ("📩 <b>پیام مدیریت:</b>\n\n", "📩 <b>Admin message:</b>\n\n"),
     "sup_open": ("💬 <b>پشتیبانی</b>\nهر پیامی بفرستید مستقیم به مدیر می‌رسد و پاسخ همین‌جا می‌آید.", "💬 <b>Support</b>\nAny message goes straight to the admin; replies arrive here."), "sup_close": ("❌ پایان گفتگو", "❌ End chat"), "sup_closed": ("✅ گفتگو پایان یافت", "✅ Chat ended"),
     "sup_reply_head": ("💬 <b>پاسخ پشتیبانی:</b>\n", "💬 <b>Support reply:</b>\n"), "sup_sent": ("✅ ارسال شد", "✅ Sent"), "sup_fail": ("❌ ارسال نشد: {e}", "❌ Not sent: {e}"), "sup_received": ("✅", "✅"),
-    "dl_notfound": ("⚠️ محتوا یافت نشد یا منقضی شده", "⚠️ Content not found or expired"), "dl_source": ("🔗 Source", "🔗 Source"),
+    "dl_notfound": ("🔎 متأسفم، نسخهٔ کامل این مطلب پیدا نشد — ممکن است پاک شده باشد. لطفاً از خودِ کانال پست را باز کن یا چند دقیقه بعد دوباره امتحان کن.", "🔎 Sorry, this full version could not be found — it may have been removed. Please open the post in the channel or try again later."), "dl_source": ("🔗 Source", "🔗 Source"),
 })
 PLAN_FIELDS = [("name", "نام (فا)", "Name (fa)"), ("name_en", "نام (en)", "Name (en)"), ("days", "مدت (روز)", "Days"), ("daily_posts", "پست/روز", "Posts/day"), ("max_sources", "منابع", "Sources"), ("max_channels", "کانال‌ها", "Channels"), ("daily_tests", "تست/روز", "Tests/day"), ("price", "قیمت (فا)", "Price (fa)"), ("price_en", "قیمت (en)", "Price (en)"), ("price_num", "قیمت عددی (برای proration)", "Numeric price (proration)"), ("description", "توضیح (فا)", "Description (fa)"), ("description_en", "توضیح (en)", "Description (en)")]
 MODEL_FIELDS = [("model", "نام مدل", "Model"), ("base_url", "Base URL", "Base URL"), ("api_key", "کلید API", "API key"), ("name", "نام نمایشی", "Display name"), ("priority", "اولویت", "Priority"), ("temperature", "دما (0–2)", "Temperature (0–2)"), ("max_tokens", "حداکثر توکن", "Max tokens")]
@@ -3796,7 +3801,7 @@ async def dispatch(update, context, data):
     if a == "lang": return await set_language(update, context, b)
     if not user_lang(uid): return await view_lang(update, context)
     if data == "home": return await go_home(update, context)
-    if data == "c:cancel": st = ud.pop("await", None); await popup(update, context, tr(lang, "cancelled")); return await dispatch(update, context, (st or {}).get("back", "home"))
+    if data == "c:cancel": st = ud.pop("await", None); await popup(update, context, operation_text(lang, "cancelled"), alert=True); return await dispatch(update, context, (st or {}).get("back", "home"))
     # ---------------- کاربر
     if a == "u":
         if b == "plans": return await view_plans(update, context)
@@ -4057,7 +4062,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "noop": return
         if data == "c:cancel":
             if not _current_operation.get().replaced_status:
-                await send_temp(context, update.effective_chat.id, operation_text(L(update), "cancelled"))
+                await popup(update, context, operation_text(L(update), "cancelled"), alert=True)
             return await dispatch(update, context, back)
         clear_interaction(context, keep=keep)
         return await dispatch(update, context, data)
@@ -4556,7 +4561,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = await _prep(update, context)
     op = _current_operation.get()
     if not op or not op.replaced_status:
-        await send_temp(context, update.effective_chat.id, operation_text(lang or "fa", "cancelled"))
+        await popup(update, context, operation_text(lang or "fa", "cancelled"), alert=True)
     if not lang: return await view_lang(update, context)
     await go_home(update, context)
 async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
