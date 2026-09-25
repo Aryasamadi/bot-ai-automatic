@@ -43,8 +43,9 @@ MODEL_PROBE_MIN = 10
 MIN_INTERVAL = 30            # حداقل فاصله‌ی چرخه (دقیقه)
 MAX_LOOKBACK = 48            # حداکثر بازه‌ی مقالات (ساعت)
 MAX_PPC = 5                  # حداکثر پست در هر چرخه
-POST_LIMIT_DEFAULT = 900     # سقف کاراکتر کپشن کانال (محتوا/امضا/بیشتر در دیپ‌لینک می‌آید) طبق درخواست ادمین (پیش‌فرض) — تنظیم طبق دستور مدیر فاز ۳ (قبلی 700)
-BOT_FULL_MAX = 2500          # سقف کاراکتر محتوای کامل داخل ربات («ادامه در ربات»)
+POST_LIMIT_DEFAULT = 900     # پیش‌فرض سقف کاراکتر کپشن کانال
+POST_LIMIT_MAX = 900         # سقف سخت کپشن کانال: همیشه زیر محدودیت ۱۰۲۴ تلگرام می‌ماند تا پست هرگز دو پیام نشود     # سقف کاراکتر کپشن کانال (محتوا/امضا/بیشتر در دیپ‌لینک می‌آید) طبق درخواست ادمین (پیش‌فرض) — تنظیم طبق دستور مدیر فاز ۳ (قبلی 700)
+BOT_FULL_MAX = 12000         # سقف کاراکتر محتوای کامل داخل ربات («بیشتر») — تلگرام خودش چندبخشی می‌کند
 LANGS = ("fa", "en")
 # ---- محافظت در برابر فشار (قابل تنظیم با متغیر محیطی)
 AI_CONCURRENCY = int(os.getenv("AI_CONCURRENCY", "3"))          # درخواست هم‌زمان به مدل‌ها
@@ -512,6 +513,8 @@ def get_settings(cid):
     for k in list(s):
         if k.startswith("_"): s.pop(k)
     s["interval_minutes"] = max(MIN_INTERVAL, int(s.get("interval_minutes") or MIN_INTERVAL)); s["lookback_hours"] = min(MAX_LOOKBACK, max(1, int(s.get("lookback_hours") or 24)))
+    # کپشن کانال هرگز از سقف سخت بالاتر نمی‌رود (وگرنه تلگرام پست را دو پیام می‌کند)
+    s["post_limit"] = min(POST_LIMIT_MAX, max(300, int(s.get("post_limit") or POST_LIMIT_DEFAULT)))
     s["posts_per_cycle"] = min(MAX_PPC, max(1, int(s.get("posts_per_cycle") or 1))); s["post_limit"] = min(4000, max(300, int(s.get("post_limit") or POST_LIMIT_DEFAULT)))
     return s
 LOCALIZED_KEYS = ("prompt", "language", "categories", "criteria")
@@ -2073,20 +2076,19 @@ async def _send_media(bot, chat_id, caption, pm, media):
     except Exception:
         raise
 async def send_post(bot, chat_id, text, media=None):
-    """کپشن ≤۱۰۲۴ → رسانه+کپشن · متن بلندتر → رسانه با تیتر و سپس متن · خطای پارس → تنزل تدریجی فرمت (معمولی → ساده)."""
+    """رسانه + کپشنِ یک‌تکه (کپشن همیشه زیر محدودیت ۱۰۲۴ تلگرام می‌ماند) · خطای پارس → تنزل تدریجی فرمت (معمولی → ساده).
+    هیچ‌وقت پست را به دو پیام نمی‌شکند: ادامهٔ محتوا فقط از راه «بیشتر» داخل ربات دیده می‌شود."""
     variants = [(text, "HTML"), (downgrade_html(text), "HTML"), (strip_tags(text), None)]
     sent_media = SimpleNamespace(message_id=media["_sent_id"]) if media and media.get("_sent_id") else None
     for i, (t, pm) in enumerate(variants):
         try:
             if media:
-                cap_ok = len(t) <= CAPTION_LIMIT; cap = t if cap_ok else (headline_of(t) if pm else strip_tags(headline_of(t)))
-                if isinstance(bot, PublicationTransport): bot.caption_complete = cap_ok
+                # کپشن هرگز از محدودیت تلگرام نمی‌گذرد؛ اگر گذشت همان‌جا بریده می‌شود نه با پیام دوم (تک‌پیام می‌ماند)
+                cap_ok = len(t) <= CAPTION_LIMIT
+                cap = t if cap_ok else fit_html(t, max(200, CAPTION_LIMIT - 60))[0]
+                if isinstance(bot, PublicationTransport): bot.caption_complete = True
                 m = sent_media or await _send_media(bot, chat_id, cap, pm, media)
-                if m:
-                    if not sent_media:
-                        sent_media = m
-                        if cap_ok: return m
-                    return await bot.send_message(chat_id, t, parse_mode=pm, disable_web_page_preview=True, reply_to_message_id=m.message_id)
+                if m: return m
             return await bot.send_message(chat_id, t, parse_mode=pm, disable_web_page_preview=True)
         except RetryAfter as e:
             await asyncio.sleep(min(30, float(e.retry_after) + 1)); return await bot.send_message(chat_id, t, parse_mode=pm, disable_web_page_preview=True, **({"reply_to_message_id": sent_media.message_id} if sent_media else {}))
@@ -2107,6 +2109,36 @@ async def bot_can_post(bot, chat_id):
         return ok
     except Exception:
         _tg_status[chat_id] = (time.monotonic(), st[1] if st else "err"); return False
+
+def channel_caption(s, ch, post_html, full_html, title, url):
+    """متنِ کپشن کانال + نسخهٔ کاملِ «بیشتر».
+    قواعد: فقط یک امضا و همیشه در انتهای همان پیام · طول کل ≤ سقف کپشن (POST_LIMIT_MAX) تا تلگرام پست را به دو پیام نشکند ·
+    لینک «بیشتر» هر وقت نسخهٔ ربات محتوای بیشتری از کپشن داشته باشد.
+    خروجی: (caption, full_or_None)
+    """
+    lang = s.get("ui_lang") or "fa"
+    sig = signature_of(s, ch)
+    tail = ("\n" + sig) if sig else ""
+    post = clean_ai_text(strip_source_url(post_html or "", url), s)
+    if sig:                                     # امضای نوشتهٔ مدل → یک نسخه، همیشه از سمت tail
+        sig_txt = esc(sig).strip()
+        while sig_txt and sig_txt in post:
+            post = post.replace(sig_txt, "", 1)
+        post = re.sub(r"\n{3,}", "\n\n", post).strip()
+    full = clean_ai_text(strip_source_url(full_html or "", url), s) if full_html else ""
+    limit = min(int(s.get("post_limit") or POST_LIMIT_DEFAULT), POST_LIMIT_MAX)
+    more_tpl = f'\n\n<a href="https://t.me/{BOT_USERNAME}?start=r_">📖 {"بیشتر" if lang == "fa" else "more..."}</a>'
+    budget = max(200, limit - len(tail) - len(more_tpl))
+    has_more = bool(full.strip()) and (len(post) > budget or len(full.strip()) > len(post) + 150)
+    if not has_more:
+        return post + tail, None
+    cut, rest = split_post_html(post, budget)
+    body_full = full.strip() or ((f"<b>{html.escape(title or '')}</b>\n\n" + rest) if rest else "")
+    parts = []
+    while body_full:
+        chunk, body_full = fit_html(body_full, BOT_FULL_MAX)
+        parts.append(chunk)
+    return cut + more_tpl + tail, "\n".join(parts)
 
 async def publish_article(bot, aid, count_usage=True, test_user=None):
     a = get_article(aid)
@@ -2141,40 +2173,11 @@ async def _publish_article_locked(bot, aid, count_usage=True, test_user=None):
         if posted_before(ch["chat_id"], a["hash"]):
             article_update(aid, status="rejected", reason="duplicate"); return False, "duplicate"
         media = json.loads(a["media"]) if a["media"] and s["include_media"] else None
-        tail = make_tail(s, ch, a["url"]); post = re.sub(r'\s*🔗 <a href="[^"]+">Source</a>\s*', "\n", a["post_html"] or "")
-        post = clean_ai_text(strip_source_url(post, a["url"]), s)
-        sig = signature_of(s, ch)
-        tail = make_tail(s, ch, a["url"])
-        body = post
-        if sig:
-            sig_txt = esc(sig).strip()
-            # فقط یک نسخه از امضا را می‌خواهیم: اگر مدل داخل متن گذاشته و آخر نباشد، اولین را حذف کن
-            if sig_txt in body and not body.rstrip().endswith(sig_txt):
-                body = body.replace(sig_txt, "", 1).rstrip()
-            # اگر body آخرش امضا ندارد، یک بار append کن
-            if not body.rstrip().endswith(sig_txt):
-                body = body.rstrip() + tail
-            else:
-                body = body.rstrip()
-        more_placeholder = f'\n\n<a href="https://t.me/{BOT_USERNAME}?start=r_">📖 more...</a>'
-        limit = int(s["post_limit"])
-        limit_eff = max(200, limit - len(tail) - len(more_placeholder))
-        text = body
-        if len(text) > limit_eff:
-            cut, rest = split_post_html(body, limit_eff)
-            htitle = f"<b>{html.escape(a['title'] or '')}</b>"
-            cfull = clean_ai_text(strip_source_url(a["full_html"], a["url"]), s) if source_bot_ok(a["source_id"]) and a["full_html"] else ""
-            ftxt = cfull if cfull.strip() else ((htitle + "\n\n" + rest) if rest else htitle)
-            # اگر محتوای کامل از سقف تک‌پیام بزرگ‌تر شد، رها نکن — چندبخشی کن تا کامل باشد
-            parts = []
-            while ftxt:
-                chunk, ftxt = fit_html(ftxt, BOT_FULL_MAX)
-                parts.append(chunk)
-            # ذخیرهٔ بخش‌ها: آرایهٔ متون؛ front-end ایجکس/دیپ‌لینک می‌تواند refetch کرد و نمایش دهد
-            ftxt = "\n".join(parts)  # برای سازگاری، ابتدا همهٔ بخش‌ها به‌صورت پیوسته ذخیره می‌شوند — divide_textaf می‌تواند نقشه‌برداری شود
-            key = await store_deeplink(admin_id, {"short": cut, "full": ftxt, "title": a["title"], "url": a["url"], "show_source": bool(s.get("include_link", True)), "media": {k: v for k, v in media.items() if not k.startswith("_")} if media else None, "ts": now_iso()})
-            more = f'\n\n<a href="https://t.me/{BOT_USERNAME}?start=r_{key}">📖 {"بیشتر" if lang == "fa" else "more..."}</a>'
-            text = cut + more + tail
+        caption, full_for_bot = channel_caption(s, ch, a["post_html"], a["full_html"], a["title"], a["url"])
+        text = caption
+        if full_for_bot:
+            await store_deeplink(admin_id, {"short": caption, "full": full_for_bot, "title": a["title"], "url": a["url"], "show_source": bool(s.get("include_link", True)), "media": {k: v for k, v in media.items() if not k.startswith("_")} if media else None, "ts": now_iso()})
+
         if journal.get("media_id"):
             text = journal["text"]
             media = {"_sent_id": journal["media_id"]}
@@ -2423,9 +2426,9 @@ async def _cycle(bot, uid, cid, test_mode, progress):
                 step_add(_current_operation.get(), "src_ai_fail", key=src_name, status="fail", model=model)
                 continue
             D.stage = "score"
-            if gen.get("is_ad"): article_update(aid, status="rejected", reason=f"ai_ad: {gen.get('ad_reason', '')}", score=gen["score"]); res["rejected"] += 1; cnt["ai_ad"] += 1; details.append((art["title"], f"AI ad: {str(gen.get('ad_reason', ''))[:40]}")); continue
+            if gen.get("is_ad"): article_update(aid, status="rejected", reason=f"ai_ad: {gen.get('ad_reason', '')}", score=gen["score"]); res["rejected"] += 1; cnt["ai_ad"] += 1; details.append((art["title"], f"AI ad: {str(gen.get('ad_reason', ''))[:40]}")); step_add(_current_operation.get(), "src_ad", key=src_name, status="fail"); continue
             best = max(best, gen["score"])
-            if gen["score"] < float(s["min_score"]): article_update(aid, status="rejected", reason=f"score {gen['score']} < {s['min_score']}", score=gen["score"]); res["rejected"] += 1; cnt["low"] += 1; details.append((art["title"], f"score {gen['score']}")); continue
+            if gen["score"] < float(s["min_score"]): article_update(aid, status="rejected", reason=f"score {gen['score']} < {s['min_score']}", score=gen["score"]); res["rejected"] += 1; cnt["low"] += 1; details.append((art["title"], f"score {gen['score']}")); step_add(_current_operation.get(), "src_low_score", key=src_name, status="fail", score=gen["score"]); continue
             post, full = compose(s, ch, art, gen)
             article_update(aid, title=gen.get("title") or art["title"], post_html=post, full_html=full, score=gen["score"], category=gen.get("category"), model=model, media=json.dumps(art["media"]) if art["media"] else None, published_at=art["published"], status="ready", reason=""); res["accepted"] += 1
             sname = article_src_name(aid)
@@ -2701,7 +2704,7 @@ TXT = {
     "sched_title": ("⏰ <b>زمان‌بندی — {title}</b>\n⏱ هر {iv}′ · 📦 {ppc} پست/چرخه · 🕰 {lb}h اخیر · 📅 بدون تاریخ {ud}\n🌙 {quiet} · 🌍 {city} {tz} (⌚ {loc} · UTC {utc})\n🔁 {mode}", "⏰ <b>Schedule — {title}</b>\n⏱ every {iv}′ · 📦 {ppc} posts/cycle · 🕰 last {lb}h · 📅 undated {ud}\n🌙 {quiet} · 🌍 {city} {tz} (⌚ {loc} · UTC {utc})\n🔁 {mode}"),
     "mode_auto": ("⚡ خودکار — انتشار مستقیم", "⚡ auto — publish directly"), "mode_review": ("📝 بازبینی — تأیید دستی در صف", "📝 review — manual approval in queue"), "none": ("—", "—"),
     "b_interval": ("⏱ هر {n}′", "⏱ Every {n}′"), "b_ppc": ("📦 {n} پست/چرخه", "📦 {n}/cycle"), "b_lookback": ("🕰 {n}h", "🕰 {n}h"), "b_undated": ("📅 بدون تاریخ {i}", "📅 Undated {i}"),
-    "b_daily_cap": ("📊 سقف روزانه {n}", "📊 Daily cap {n}"), "b_quiet": ("🌙 خاموشی", "🌙 Quiet hours"), "b_tz": ("🌍 منطقه زمانی", "🌍 Time zone"), "b_mode": ("🔁 {m}", "🔁 {m}"),
+    "b_daily_cap": ("📊 سقف روزانه {n}", "📊 Daily cap {n}"), "cap_over_plan": ("⚠️ بیشتر از سقف پلن شما ({n} پست در روز) قابل تنظیم نیست.", "⚠️ Cannot exceed your plan limit ({n} posts/day)."), "cap_range": ("حداکثر تا {n} پست در روز (طبق پلن شما)", "Max {n} posts/day (your plan)"), "unlimited": ("نامحدود", "unlimited"), "b_quiet": ("🌙 خاموشی", "🌙 Quiet hours"), "b_tz": ("🌍 منطقه زمانی", "🌍 Time zone"), "b_mode": ("🔁 {m}", "🔁 {m}"),
     "mode_set_auto": ("⚡ خودکار: انتشار مستقیم", "⚡ Auto: publish directly"), "mode_set_review": ("📝 بازبینی: منتظر تأیید در صف", "📝 Review: waits for approval"),
     "quiet_pick_start": ("🌙 <b>خاموشی</b> · ساعت <b>شروع</b> ({tz} · الان {loc}):", "🌙 <b>Quiet hours</b> · <b>start</b> hour ({tz} · now {loc}):"), "quiet_pick_end": ("🌙 شروع {h}:00 · ساعت <b>پایان</b>:", "🌙 Start {h}:00 · <b>end</b> hour:"),
     "quiet_off": ("🚫 بدون خاموشی", "🚫 No quiet hours"), "quiet_set": ("🌙 خاموشی {a}:00 → {b}:00", "🌙 Quiet {a}:00 → {b}:00"), "quiet_cleared": ("🌙 خاموشی حذف شد", "🌙 Quiet hours cleared"),
@@ -2747,7 +2750,7 @@ def reason_text(reason, lang):
     return tr(lang, "rj_other")
 INT_FIELDS = {"max_words": (30, 600), "min_score": (0, 100), "post_limit": (300, 900), "interval_minutes": (MIN_INTERVAL, 1440), "posts_per_cycle": (1, MAX_PPC), "lookback_hours": (1, MAX_LOOKBACK)}
 FIELD_LABEL = {"prompt": ("پرامپت نگارش", "Writing prompt"), "topic": ("موضوع کانال", "Channel topic"), "language": ("زبان خروجی (نام زبان را بنویس: Italian، Chinese، فارسی، …)", "Output language (type the language name: Italian, Chinese, English, …)"), "signature": ("امضای پایان پست (@channel = یوزرنیم کانال)", "Post signature (@channel = channel username)"),
-               "daily_posts_cap": ("📊 سقف روزانه پست (خالی = نامحدود)", "📊 Daily post cap (blank = unlimited)"), "max_words": ("حداکثر کلمات پست", "Max post words"), "min_score": ("حداقل امتیاز (۰–۱۰۰)", "Min score (0–100)"), "post_limit": ("سقف کاراکتر پست کانال (پیش‌فرض ۳۰۰۰)؛ محتوای کامل‌تر → «ادامه در ربات» (۳۰۰–۴۰۰۰)", "Channel post char limit (default 700); longer content → “continue in bot” (300–4000)"),
+               "daily_posts_cap": ("📊 سقف روزانهٔ پست — عددی تا سقف پلنت بنویس (خالی = نامحدود)", "📊 Daily post cap — a number up to your plan max (blank = unlimited)"), "max_words": ("حداکثر کلمات پست", "Max post words"), "min_score": ("حداقل امتیاز (۰–۱۰۰)", "Min score (0–100)"), "post_limit": ("سقف کاراکتر پست کانال (پیش‌فرض ۳۰۰۰)؛ محتوای کامل‌تر → «ادامه در ربات» (۳۰۰–۴۰۰۰)", "Channel post char limit (default 700); longer content → “continue in bot” (300–4000)"),
                "interval_minutes": (f"فاصله‌ی چرخه (دقیقه، ≥{MIN_INTERVAL})", f"Cycle interval (min, ≥{MIN_INTERVAL})"), "posts_per_cycle": (f"پست در هر چرخه (≤{MAX_PPC})", f"Posts per cycle (≤{MAX_PPC})"), "lookback_hours": (f"مقالات چند ساعت اخیر (≤{MAX_LOOKBACK})", f"Articles from last N hours (≤{MAX_LOOKBACK})")}
 SCHED_FIELDS = ("interval_minutes", "posts_per_cycle", "lookback_hours", "daily_posts_cap")
 TZ_NAMES = {"tehran": ("🇮🇷 تهران", "🇮🇷 Tehran"), "istanbul": ("🇹🇷 استانبول", "🇹🇷 Istanbul"), "dubai": ("🇦🇪 دبی", "🇦🇪 Dubai"), "kabul": ("🇦🇫 کابل", "🇦🇫 Kabul"), "karachi": ("🇵🇰 کراچی", "🇵🇰 Karachi"), "delhi": ("🇮🇳 دهلی", "🇮🇳 Delhi"),
@@ -2888,16 +2891,16 @@ def strip_thinking_prefix(text):
 
 
 SPHARSE = {
-  ("model_start","run",0): "⏳ در حال اتصال به مدل {}…", ("model_start","run",1): "🔌 مدل {} در حال اجراست…", ("model_start","run",2): "⏳ صبر می‌کنم تا مدل {} جواب بده…",
-  ("model_start","ok",0): "✅ {} جواب داد", ("model_start","ok",1): "✅ به {} رسیدم", ("model_start","ok",2): "✅ {} تایید شد",
-  ("model_start","fail",0): "❌ {} جواب نداد", ("model_start","fail",1): "⚠️ خطا از {} — عیب یاب", ("model_start","fail",2): "❌ {} از دسترس رفت",
-  ("model_ok","ok",0): "✅ مدل {} قبول شد", ("model_ok","ok",1): "🎯 {} سالم بود", ("model_ok","ok",2): "✅ خروجی {} سالم است",
-  ("model_fail","fail",0): "❌ خطا در {}", ("model_fail","fail",1): "⚠️ {} گیر کرد", ("model_fail","fail",2): "🛑 {} متوقف شد",
-  ("src_check","run",0): "⏳ در حال بررسی منبع…", ("src_check","run",1): "⏳ به منبع وصل می‌شوم…", ("src_check","run",2): "⏳ چک کردن منبع…",
-  ("src_found","ok",0): "✅ چیزی پیدا کردم", ("src_found","ok",1): "📝 یک مورد بالقوه یافتم", ("src_found","ok",2): "✅ موضوع خوب تشخیص دادم",
-  ("src_empty","fail",0): "📭 چیزی پیدا نشد", ("src_empty","fail",1): "⚠️ خروجی خالی بود", ("src_empty","fail",2): "❌ مورد مناسب نبود",
-  ("post_gen","run",0): "⏳ در حال نگارش…", ("post_gen","run",1): "🧠 دارم فکر می‌کنم روی سبک…", ("post_gen","run",2): "⌛ در حال تولید…",
-  ("post_ready","ok",0): "✅ خروجی آماده شد", ("post_ready","ok",1): "🎉 پست تولید شد", ("post_ready","ok",2): "📨 دا�م ارسال می‌کنم…",
+  ("model_start","run",0): "⏳ دارم مدل {} را اجرا می‌کنم…", ("model_start","run",1): "🧠 دارم با مدل {} می‌نویسم…", ("model_start","run",2): "▶️ مدل {} شروع به کار کرد…",
+  ("model_start","ok",0): "✅ مدل {} جواب داد؛ نتیجه را بررسی می‌کنم", ("model_start","ok",1): "🎯 خروجی مدل {} سالم بود", ("model_start","ok",2): "✅ مدل {} کارش را درست انجام داد",
+  ("model_start","fail",0): "⚠️ مدل {} جواب نداد؛ می‌روم سراغ مدل بعدی", ("model_start","fail",1): "❌ مدل {} از کار افتاده بود؛ مدل بعدی را امتحان می‌کنم", ("model_start","fail",2): "🛑 مدل {} پاسخ نداد؛ سوییچ می‌کنم روی مدل بعدی",
+  ("model_ok","ok",0): "✅ مدل {} جواب داد؛ نتیجه را بررسی می‌کنم", ("model_ok","ok",1): "🎯 خروجی مدل {} سالم بود", ("model_ok","ok",2): "✅ مدل {} کارش را درست انجام داد",
+  ("model_fail","fail",0): "⚠️ مدل {} جواب نداد؛ می‌روم سراغ مدل بعدی", ("model_fail","fail",1): "❌ مدل {} از کار افتاده بود؛ مدل بعدی را امتحان می‌کنم", ("model_fail","fail",2): "🛑 مدل {} پاسخ نداد؛ سوییچ می‌کنم روی مدل بعدی",
+  ("src_check","run",0): "🔎 دارم {} را بررسی می‌کنم…", ("src_check","run",1): "⏳ سراغ {} می‌روم…", ("src_check","run",2): "🔗 دارم {} را می‌خوانم…",
+  ("src_found","ok",0): "✅ در {} یک مورد مناسب پیدا کردم", ("src_found","ok",1): "📝 {} یک خبر به‌درد‌بخور داشت", ("src_found","ok",2): "🎯 محتوای {} مناسب تشخیص داده شد",
+  ("src_empty","fail",0): "📭 در {} چیزی به کار ما نمی‌آمد؛ می‌روم منبع بعدی", ("src_empty","fail",1): "⚠️ {} خروجی قابل‌استفاده نداشت", ("src_empty","fail",2): "📭 {} خبر تازه‌ای نداشت",
+  ("post_gen","run",0): "⏳ دارم محتوا را می‌نویسم…", ("post_gen","run",1): "🧠 دارم مطابق سبک کانال می‌نویسم…", ("post_gen","run",2): "✍️ در حال تولید محتوا…",
+  ("post_ready","ok",0): "✅ محتوا آماده شد", ("post_ready","ok",1): "🎉 پست تولید شد", ("post_ready","ok",2): "📨 دارم به کانال می‌فرستم…",
 }
 SPHARSE.update({
   ("busy","run",0): "⏳ عملیات قبلی هنوز تمام نشده", ("busy","run",1): "⏳ در حال تکمیل چرخه‌ی قبلی…", ("busy","run",2): "⏳ منتظر باز شدن کانال…",
@@ -2905,13 +2908,13 @@ SPHARSE.update({
   ("quota_posts","fail",0): "📉 سهمیه‌ی امروز به اتمام رسید", ("quota_posts","fail",1): "⛔ سقف روزانه پر شده", ("quota_posts","fail",2): "⚠️ امروز دیگر ظرفیت انتشار نیست",
   ("quota_tests","fail",0): "🧪 سهمیه‌ی تست امروز پر شده", ("quota_tests","fail",1): "⛔ ظرفیت تست تمام شده", ("quota_tests","fail",2): "🧪 محدودیت تست اعمال شد",
   ("no_sources","fail",0): "📭 هیچ منبعی فعال نیست", ("no_sources","fail",1): "🚫 هیچ منبع فعالی یافت نشد", ("no_sources","fail",2): "📭 منبعی برای بررسی نیست",
-  ("src_cooldown","run",0): "⏳ منبع در حال خنک شدن است", ("src_cooldown","run",1): "🔄 منبع در بازه‌ی بازیابی است", ("src_cooldown","run",2): "⏳ بعداً دوباره منبع بازدید می‌شود",
-  ("src_fail","fail",0): "❌ خطای دسترسی به منبع", ("src_fail","fail",1): "⚠️ منبع پاسخ نداد", ("src_fail","fail",2): "❌ منبع قطع است",
-  ("src_notmod","run",0): "ℹ️ منبع تغییری نکرده است", ("src_notmod","run",1): "⏳ خبر تازه‌ای موجود نیست", ("src_notmod","run",2): "ℹ️ محتوا همان است",
-  ("src_empty","fail",0): "📭 چیزی مطابق معیار یافت نشد", ("src_empty","fail",1): "⚠️ محتوایی مطابق برند نیست", ("src_empty","fail",2): "❌ قابل استفاده نیست",
+  ("src_cooldown","run",0): "⏳ {} در بازه‌ی استراحت است؛ فعلاً ردش می‌کنم", ("src_cooldown","run",1): "🔄 {} تازه بررسی شده؛ بعداً سراغش می‌روم", ("src_cooldown","run",2): "💤 {} در حال بازیابی است",
+  ("src_fail","fail",0): "⚠️ {} جواب نداد؛ منبع را کنار می‌گذارم", ("src_fail","fail",1): "❌ دسترسی به {} ممکن نشد", ("src_fail","fail",2): "🔌 {} قطع بود؛ می‌روم منبع بعدی",
+  ("src_notmod","run",0): "ℹ️ {} از آخرین بررسی تازه‌تر نشده", ("src_notmod","run",1): "⏳ {} خبر جدیدی نداشت", ("src_notmod","run",2): "📄 محتوای {} همان قبلی است",
+  ("src_empty","fail",0): "📭 {} محتوایی مطابق معیارها نداشت", ("src_empty","fail",1): "⚠️ خروجی {} با معیارهای کانال نمی‌خواند", ("src_empty","fail",2): "📭 {} مورد مناسبی نداشت",
   ("found","ok",0): "📥 موردی مطابق یافت شد", ("found","ok",1): "✅ یک گزینه‌ی خوب پیدا شد", ("found","ok",2): "🎯 آیتم مناسب تشخیص داده شد",
-  ("extract","run",0): "🧾 در حال استخراج متن…", ("extract","run",1): "🔍 متن را بیرون می‌کشم…", ("extract","run",2): "📄 بدنه‌ی خبر را می‌خوانم…",
-  ("low","run",0): "⏳ در حال امتیازدهی…", ("low","run",1): "📏 بررسی معیارها…", ("low","run",2): "🧪 امتیازدهی در جریان…", 
+  ("extract","run",0): "🧾 دارم متن خبر را استخراج می‌کنم…", ("extract","run",1): "🔍 دارم بدنه‌ی خبر را می‌خوانم…", ("extract","run",2): "📄 دارم کل مقاله را می‌خوانم…",
+  ("low","run",0): "⏳ دارم امتیاز می‌دهم…", ("low","run",1): "📏 دارم معیارها را می‌سنجم…", ("low","run",2): "🧪 امتیازدهی در جریان است…", 
   ("ad","run",0): "🚫 بررسی تبلیغات…", ("ad","run",1): "🛡 تشخیص تبلیغاتی بودن…", ("ad","run",2): "⚠️ بررسی محتوای تبلیغاتی…",
   ("ai","run",0): "⏳ در حال تولید با مدل…", ("ai","run",1): "⏳ مدل در حال فکر کردن…", ("ai","run",2): "✍️ در حال نگارش…",
   ("queue","run",0): "⏳ در صف انتشار…", ("queue","run",1): "📥 آماده‌ی انتشار شد", ("queue","run",2): "🕐 در انتظار انتشار…",
@@ -2921,6 +2924,13 @@ SPHARSE.update({
   ("src_ai_fail","fail",0): "🧠 مدل نتوانست تولید کند", ("src_ai_fail","fail",1): "❌ خروجی مدل معتبر نبود", ("src_ai_fail","fail",2): "⚠️ مدل پاسخ قابل‌استفاده نداد",
   ("published","ok",0): "✅ منتشر شد", ("published","ok",1): "📣 ارسال به کانال انجام شد", ("published","ok",2): "🎉 در کانال قرار گرفت",
   ("queued","ok",0): "📌 در صف قرار گرفت", ("queued","ok",1): "📥 برای انتشار بعدی ذخیره شد", ("queued","ok",2): "✅ آماده قرار گرفت",
+})
+SPHARSE.update({
+  ("src_extract_fail","fail",0): "📄 متن این خبر خوانده نشد؛ ردش می‌کنم", ("src_extract_fail","fail",1): "❌ محتوای این خبر در دسترس نبود", ("src_extract_fail","fail",2): "⚠️ بدنهٔ خبر خالی آمد؛ ردش کردم",
+  ("src_skip_old","fail",0): "🕰 این خبر قدیمی‌تر از بازهٔ تعیین‌شده بود", ("src_skip_old","fail",1): "⏳ تاریخ خبر گذشته بود؛ کنارش گذاشتم", ("src_skip_old","fail",2): "📅 خبر خارج از بازهٔ زمانی بود",
+  ("src_ad","fail",0): "🚫 این محتوا تبلیغاتی بود؛ پردازش نکردم", ("src_ad","fail",1): "⚠️ تبلیغ تشخیص داده شد؛ کنارش گذاشتم", ("src_ad","fail",2): "🛑 فیلتر تبلیغ این مورد را رد کرد",
+  ("src_ai_fail","fail",0): "🧠 مدل خروجی قابل‌استفاده نداد؛ می‌روم سراغ بعدی", ("src_ai_fail","fail",1): "❌ تولید محتوا ناموفق بود", ("src_ai_fail","fail",2): "⚠️ خروجی مدل معتبر نبود",
+  ("src_low_score","fail",0): "📏 امتیاز این خبر به حداقل کانال نرسید", ("src_low_score","fail",1): "🧪 امتیاز پایین بود؛ ردش کردم", ("src_low_score","fail",2): "⚠️ با معیارها هم‌خوان نبود",
 })
 def _step_text(st, lang):
     cat = st.get("category"); status = st.get("status", "run"); var = int(st.get("variant", 0))
@@ -3211,18 +3221,20 @@ def _ai_status_reporter(context, lang):
                 "failed": "مدل‌های در دسترس پاسخ قابل‌استفاده‌ای ندادند.",
             }
         op = _current_operation.get()
+        body = texts.get(event, reason or "")
         if op is not None:
+            # هر رویداد فقط یک سطر می‌سازد (نه سطر مرحله + سطر وضعیت؛ وگرنه دو جمله‌ی متناقض با هم دیده می‌شود)
             if event == "start":
-                step_add(op, "model_start", key=name, status="run", model=name); op.header_kind = "working"
+                step_add(op, "model_start", key=name, status="run", model=name); op.header_kind = "working"; body = ""
             elif event == "busy":
-                step_add(op, "model_start", key=name, status="run", model=name)
+                step_add(op, "model_start", key=name, status="run", model=name); body = ""
             elif event == "success":
-                step_add(op, "model_start", key=name, status="ok", model=name); step_add(op, "model_ok", key=name, status="ok")
+                step_add(op, "model_start", key=name, status="ok", model=name); body = ""
             elif event == "failure":
-                step_add(op, "model_start", key=name, status="fail", model=name); step_add(op, "model_fail", key=name, status="fail", **{"reason": reason})
+                step_add(op, "model_start", key=name, status="fail", model=name); body = ""
             elif event == "unavailable":
-                step_add(op, "model_start", key=name, status="fail", model=name)
-        await operation_status(context, texts.get(event, reason or "در حال ادامه پردازش…"))
+                step_add(op, "model_start", key=name, status="fail", model=name); body = ""
+        await operation_status(context, body)
     return report
 
 
@@ -3885,7 +3897,13 @@ async def dispatch(update, context, data):
             if d == "enabled": await popup(update, context, tr(lang, "tog_enabled" if new else "tog_disabled")); return await view_channel(update, context, cid)
             else: await popup(update, context, f"{tr(lang, 'tog_' + d)}: {'✅' if new else '⛔'}\n{tr(lang, 'togd_' + d)}")
             return await (view_sched if d == "allow_undated" else view_content)(update, context, cid)
-        if b == "set": return await ask(update, context, f"{FIELD_LABEL[d][1 if lang == 'en' else 0]}\n<code>{esc(strip_tags(str(s.get(d)))[:3500])}</code>", "field", f"a:sch:{cid}" if d in SCHED_FIELDS else f"a:con:{cid}", cid=cid, field=d)
+        if b == "set":
+            shown = (tr(lang, "unlimited") if s.get(d) is None else strip_tags(str(s.get(d)))) if d == "daily_posts_cap" else strip_tags(str(s.get(d)))
+            extra = ""
+            if d == "daily_posts_cap":
+                cap = admin_limits(uid).get("daily_posts")
+                if cap is not None: extra = "\n" + tr(lang, "cap_range", n=cap)
+            return await ask(update, context, f"{FIELD_LABEL[d][1 if lang == 'en' else 0]}\n<code>{esc(shown)[:3500]}</code>{extra}", "field", f"a:sch:{cid}" if d in SCHED_FIELDS else f"a:con:{cid}", cid=cid, field=d)
         if b == "mode": new = "review" if s["mode"] == "auto" else "auto"; update_settings(cid, mode=new); await popup(update, context, tr(lang, "mode_set_auto" if new == "auto" else "mode_set_review")); return await view_sched(update, context, cid)
         if b == "sch": return await view_sched(update, context, cid)
         if b == "quiet": return await view_quiet(update, context, cid)
@@ -4232,8 +4250,12 @@ async def handle_input(update, context, st):
         label = FIELD_LABEL[f][1 if lang == "en" else 0]
         try: v = _input_value(f, raw_text, lang)
         except (ValueError, TypeError) as e: return await popup(update, context, str(e), alert=True)
+        if f == "daily_posts_cap" and v is not None:          # سقف روزانهٔ کانال هرگز از پلن کاربر بالاتر نمی‌رود
+            cap = admin_limits(uid).get("daily_posts")
+            if cap is not None and v > cap:
+                return await popup(update, context, tr(lang, "cap_over_plan", n=cap), alert=True)
         if f == "signature": v = sanitize_html(text_html)[:200]
-        elif f not in INT_FIELDS: v = v[:3000]
+        elif isinstance(v, str): v = v[:3000]
         update_settings(cid, **{f: v}); done(f"{tr(lang, 'saved')} · {label}: {esc(strip_tags(str(v))[:40])}"); return await dispatch(update, context, back)
     if kind == "cat_style":
         s = get_settings(st["cid"]); i = st["idx"]
