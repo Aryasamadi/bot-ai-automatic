@@ -16,8 +16,10 @@ from bs4 import BeautifulSoup
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN", "")
 SUPER_ADMIN_IDS = {int(x) for x in os.getenv("SUPER_ADMIN_IDS", "").split(",") if x.strip().isdigit() and int(x) > 0}
 DB_FILE = os.getenv("DB_FILE", "newsbot.db")
-DATA_TTL_HOURS = int(os.getenv("DATA_TTL_HOURS", "24"))
-MAX_MEDIA_MB = int(os.getenv("MAX_MEDIA_MB", "50"))
+DATA_TTL_HOURS = int(os.getenv("DATA_TTL_HOURS", "48"))   # عمر داده‌های موقت (تکراری/ردشده/ناموفق) — deeplink و داده‌های اصلی دائمی‌اند
+API_BASE = os.getenv("TELEGRAM_API_BASE", "").strip()      # سرور محلی Bot API → سقف آپلود ۲۰۰۰ مگابایت
+MEDIA_UPLOAD_MB = 2000 if API_BASE else 50                  # سقف واقعی آپلود ربات روی Bot API عمومی
+MAX_MEDIA_MB = max(1, min(int(os.getenv("MAX_MEDIA_MB", "50")), MEDIA_UPLOAD_MB))   # هرگز بیشتر از سقف واقعی دانلود نمی‌کنیم
 MAX_MEDIA_BYTES = MAX_MEDIA_MB * 1024 * 1024
 MAX_PAGE_BYTES = int(os.getenv("MAX_PAGE_MB", "8")) * 1024 * 1024   # سقف حجم صفحه/فید دانلودی (جلوگیری از پرشدن حافظه)
 MAX_ARTICLE_CHARS = int(os.getenv("MAX_ARTICLE_CHARS", "28000"))
@@ -141,6 +143,7 @@ CREATE TABLE IF NOT EXISTS posted(channel_id INTEGER, hash TEXT, posted_at TEXT,
 CREATE TABLE IF NOT EXISTS ai_models(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, kind TEXT, base_url TEXT, api_key TEXT, model TEXT, priority INTEGER DEFAULT 10, active INTEGER DEFAULT 1, status TEXT DEFAULT 'ok', fail_count INTEGER DEFAULT 0, last_error TEXT, last_ok TEXT, last_fail TEXT, ok_count INTEGER DEFAULT 0, temperature REAL DEFAULT 0.5, max_tokens INTEGER DEFAULT 2500, owner_id INTEGER);
 CREATE TABLE IF NOT EXISTS deeplinks(key TEXT PRIMARY KEY, admin_id INTEGER, created_at TEXT, local_json TEXT);
 CREATE TABLE IF NOT EXISTS kv_cache(key TEXT PRIMARY KEY, value TEXT, cached_at TEXT);
+CREATE TABLE IF NOT EXISTS dedup(channel_id INTEGER, fp TEXT, ts TEXT, PRIMARY KEY(channel_id, fp));
 CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, level TEXT, admin_id INTEGER, msg TEXT);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS support(user_id INTEGER PRIMARY KEY, open INTEGER DEFAULT 0, opened_at TEXT);
@@ -155,6 +158,7 @@ DB_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_pay_status ON pay_requests(status, id);
 CREATE INDEX IF NOT EXISTS idx_usage_day ON usage(day);
 CREATE INDEX IF NOT EXISTS idx_art_disco ON articles(channel_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_dedup_ts ON dedup(ts);
 """
 MIGRATIONS = [("users", "next_plan_id", "INTEGER"), ("users", "next_plan_days", "INTEGER"), ("users", "lang", "TEXT"), ("users", "remind_key", "TEXT"), ("users", "premium", "INTEGER DEFAULT 0"),
               ("plans", "name_en", "TEXT"), ("plans", "price_en", "TEXT DEFAULT ''"), ("plans", "description_en", "TEXT DEFAULT ''"),
@@ -628,6 +632,12 @@ def _source_fail_count(sid):
 # ============================================================
 # مقالات (مستقل برای هر کانال)
 def article_exists(cid, h): return bool(q("SELECT 1 FROM articles WHERE channel_id=? AND hash=?", (cid, h), one=True))
+def title_fp(t):
+    """اثر انگشت سبک از عنوان: برای تشخیص «همان خبر از آدرس/منبع دیگر» — کم‌حجم و بدون خواندن سنگین."""
+    t = re.sub(r"[\W_]+", " ", str(t or "").lower(), flags=re.UNICODE)
+    return hashlib.sha1(" ".join(t.split()[:8]).encode("utf-8")).hexdigest()[:16]
+def dedup_seen(cid, fp): return bool(q("SELECT 1 FROM dedup WHERE channel_id=? AND fp=?", (cid, fp), one=True))
+def dedup_mark(cid, fp): q("INSERT OR REPLACE INTO dedup(channel_id,fp,ts) VALUES(?,?,?)", (cid, fp, now_iso()), commit=True)
 def article_insert(uid, cid, h, url, title, source_id, published_at, status="discovered", reason=""):
     """اگر رکورد از قبل موجود باشد، INSERT OR IGNORE چیزی درج نمی‌کند و lastrowid بی‌اعتبار می‌شود؛ در آن حالت None برمی‌گردانیم تا محتوای تولیدشده هرگز به مقاله‌ی اشتباه نچسبد."""
     with _lock:
@@ -761,8 +771,9 @@ def cleanup():
     q("DELETE FROM articles WHERE created_at<? AND status NOT IN ('ready','published')", (ttl,), commit=True)
     q("DELETE FROM articles WHERE created_at<? AND status='published'", ((now_utc() - timedelta(hours=72)).isoformat(),), commit=True)
     q("DELETE FROM posted WHERE posted_at<?", ((now_utc() - timedelta(days=90)).isoformat(),), commit=True)
-    q("DELETE FROM kv_cache WHERE cached_at<?", (ttl,), commit=True)
-    q("DELETE FROM deeplinks WHERE created_at<?", ((now_utc() - timedelta(days=30)).isoformat(),), commit=True)
+    q("DELETE FROM dedup WHERE ts<?", (ttl,), commit=True)                                   # ردپای تکراری‌ها فقط ۴۸ ساعت
+    q("DELETE FROM settings WHERE key LIKE 'pubj:%' AND CAST(substr(key,6) AS INTEGER) NOT IN (SELECT id FROM articles)", commit=True)   # ژورنال انتشارِ بی‌صاحب
+    # توجه: kv_cache و deeplinks هرگز پاک نمی‌شوند — متن کامل «بیشتر» باید همیشه در ربات بماند
     q("DELETE FROM logs WHERE id < (SELECT COALESCE(MAX(id),0) FROM logs) - 3000", commit=True)
     q("DELETE FROM usage WHERE day<?", ((now_utc() - timedelta(days=60)).strftime("%Y-%m-%d"),), commit=True)
     q("DELETE FROM support_map WHERE ts<?", ((now_utc() - timedelta(days=7)).isoformat(),), commit=True)
@@ -866,7 +877,8 @@ async def kv_get(key):
 async def store_deeplink(admin_id, payload):
     """payload: {short, full, title, url, show_source, media:{url,kind}|None, ts}"""
     key = secrets.token_urlsafe(6); data = json.dumps(payload, ensure_ascii=False); saved_cf = CF_ENABLED and await kv_put(key, data)
-    q("INSERT INTO deeplinks(key,admin_id,created_at,local_json) VALUES(?,?,?,?)", (key, admin_id, now_iso(), None if saved_cf else data), commit=True)
+    # نسخهٔ محلی همیشه نگه داشته می‌شود: لینک «بیشتر» هیچ‌وقت از بین نمی‌رود و خواندن بعدی نیاز به KV ندارد
+    q("INSERT INTO deeplinks(key,admin_id,created_at,local_json) VALUES(?,?,?,?)", (key, admin_id, now_iso(), data), commit=True)
     q("INSERT OR REPLACE INTO kv_cache VALUES(?,?,?)", (key, data, now_iso()), commit=True); return key
 async def load_deeplink(key):
     r = q("SELECT value FROM kv_cache WHERE key=?", (key,), one=True)
@@ -1715,11 +1727,29 @@ def _find_media(soup, base):
             if _bad_media_url(u): continue
             try: w = int(re.sub(r"\D", "", str(tag.get("width") or "0")) or 0)
             except Exception: w = 0
-            if w >= 300 or re.search(r"\.(jpe?g|png|webp)(\?|$)", u, re.I): img = u; break
+            if w >= 300 or re.search(r"\.(jpe?g|png|webp|gif)(\?|$)", u, re.I): img = u; break
     if img:
-        got = _mk_media(img, "animation" if img.lower().split("?")[0].endswith(".gif") else "photo", base)
-        if got: return got
+        got = _mk_media(img, _ext_kind(img, "photo"), base)     # .gif → animation · .mp4 → video (نه عکسِ ثابت)
+        if got:
+            alts = _alt_media(soup, base, img)                  # اگر عکس اصلی نیامد، نامزدهای بعدی
+            if alts: got["alt"] = alts
+            return got
     return None
+def _alt_media(soup, base, primary, n=2):
+    """تا n تصویر جانشین دیگر از همان صفحه (برای وقتی که منبع اصلی قابل دریافت نیست)."""
+    out, seen = [], {str(primary).split("?")[0]}
+    for tag in soup.find_all("img")[:40]:
+        u = _img_src(tag)
+        if not u: continue
+        u = urljoin(base, u)
+        if _bad_media_url(u) or u.split("?")[0] in seen: continue
+        try: w = int(re.sub(r"\D", "", str(tag.get("width") or "0")) or 0)
+        except Exception: w = 0
+        if w and w < 400: continue
+        if not re.search(r"\.(jpe?g|png|webp|gif)(\?|$)", u, re.I) and w < 600: continue
+        seen.add(u.split("?")[0]); out.append(u)
+        if len(out) >= n: return out
+    return out
 def _soup_text(soup):
     """کل متن صفحه، نه فقط ابتدای آن: همه‌ی بلوک‌های محتوایی با هم ادغام می‌شوند (پاراگراف، بولت، زیرتیتر) و تکراری‌ها حذف می‌شوند."""
     for t in soup(["script", "style", "noscript", "nav", "header", "footer", "aside", "form", "iframe"]): t.decompose()
@@ -1923,6 +1953,13 @@ async def _summarize_article(s, art, on_queue=None, owner_id=None):
     full = (art.get("text") or "").strip()
     if len(full) <= AI_INPUT_TEXT_CHARS:
         return full, None  # کوچک است؛ همان مطلب خام به مدل می‌رسد
+    # این مرحله پیش‌پردازش است و وضعیت زنده Thinking می‌ماند (Working فقط برای مرحلهٔ واقعی تولید)
+    _op = _current_operation.get(); _had = getattr(_op, "prep", False) if _op is not None else False
+    if _op is not None: _op.prep = True
+    try: return await _summarize_chunks(s, full, on_queue=on_queue, owner_id=owner_id)
+    finally:
+        if _op is not None: _op.prep = _had
+async def _summarize_chunks(s, full, on_queue=None, owner_id=None):
     chunks = [full[i:i + AI_INPUT_TEXT_CHARS] for i in range(0, len(full), AI_INPUT_TEXT_CHARS)]
     lines = []
     for idx, chunk in enumerate(chunks):
@@ -1995,7 +2032,7 @@ def compose(s, ch, art, gen):
 # رسانه و انتشار
 def _media_headers(media):
     """Referer دامنه‌ی خبر: بسیاری از سایت‌ها بدون آن به تصویر و ویدیو پاسخ ۴۰۳ می‌دهند (علت اصلی «عکس برداشت نمی‌شود»)."""
-    h = {"Accept": "image/avif,image/webp,image/*,video/*,*/*;q=0.8"}
+    h = {"Accept": "image/avif,image/webp,image/*,video/*,*/*;q=0.8", "User-Agent": UA_BROWSER}
     page = (media or {}).get("page") or ""
     try:
         p = urlparse(page)
@@ -2021,7 +2058,7 @@ async def download_media(media):
                     ct = r.headers.get("content-type", "").lower()
                     if ct.startswith("text/") or "html" in ct: return None
                     try:
-                        if int(r.headers.get("content-length") or 0) > MAX_MEDIA_BYTES: log.info(f"media skipped (> {MAX_MEDIA_MB}MB)"); return None
+                        if int(r.headers.get("content-length") or 0) > MAX_MEDIA_BYTES: log.info(f"media skipped (> {MAX_MEDIA_MB}MB upload ceiling)"); return None
                     except Exception: pass
                     kind = "animation" if "gif" in ct else "photo" if ct.startswith("image/") else "video" if ct.startswith("video/") else _ext_kind(media["url"], media.get("kind") or "document")
                     ext = {"photo": ".jpg", "animation": ".gif", "video": ".mp4"}.get(kind, os.path.splitext(urlparse(media["url"]).path)[1] or ".bin")
@@ -2029,7 +2066,7 @@ async def download_media(media):
                     try:      # فایل موقت در هیچ مسیری (خطا، سقف حجم، فایل ناقص) روی دیسک جا نمی‌ماند
                         async for chunk in r.aiter_bytes(262144):
                             size += len(chunk)
-                            if size > MAX_MEDIA_BYTES: log.info(f"media skipped (> {MAX_MEDIA_MB}MB)"); return None
+                            if size > MAX_MEDIA_BYTES: log.info(f"media skipped (> {MAX_MEDIA_MB}MB upload ceiling)"); return None
                             tmp.write(chunk)
                     finally:
                         tmp.close()
@@ -2058,7 +2095,13 @@ async def _send_media(bot, chat_id, caption, pm, media):
         except (NetworkError, RetryAfter, Forbidden): raise
         except Exception: raise
     if not mf: mf = await download_media(media); media["_file"] = mf
-    if not mf: return None
+    for alt in (media.get("alt") or [])[:2]:          # منبع اصلی نیامد؟ نامزدهای جانشین همان مقاله
+        if mf: break
+        log.info(f"media fallback → {str(alt)[:90]}")
+        mf = await download_media({**media, "url": alt}); media["_file"] = mf
+    if not mf:
+        log.info(f"media dropped ({kind}): دریافت فایل ممکن نشد — پست بدون رسانه می‌رود")
+        return None
     path, k = mf
     try:
         with open(path, "rb") as f:
@@ -2235,6 +2278,7 @@ async def _publish_article_locked(bot, aid, count_usage=True, test_user=None):
 DIAG = {
     "busy": ("⏳ من یک چرخه‌ی دیگر روی همین کانال دارم؛ اول آن را تمام می‌کنم", "⏳ Another cycle is running on this channel"),
     "checks": ("🔎 دارم تنظیمات، پلن و منابع را بررسی می‌کنم…", "🔎 Checking settings, plan and sources…"),
+    "dup": ("🔁 {n} خبر تکراری بود؛ دوباره نساختم", "🔁 {n} duplicate item(s) skipped"),
     "no_channel": ("❌ کانالی برای بررسی پیدا نکردم", "❌ Channel not found"), "plan_inactive": ("⛔ نمی‌توانم منتشر کنم؛ پلن فعال نیست", "⛔ Plan inactive"), "no_sources": ("⚠️ منبعی ثبت نشده که بررسی کنم", "⚠️ No source added"),
     "quota_posts": ("⛔ سهمیه‌ی پست امروز پر است ({used}/{cap})؛ دیگر منتشر نمی‌کنم", "⛔ Today's posts: {used}/{cap}"), "quota_tests": ("⛔ سهمیه‌ی تست امروز پر است ({used}/{cap})؛ الان تست نمی‌گیرم", "⛔ Today's tests: {used}/{cap}"),
     "bot_not_admin": ("❌ نمی‌توانم در کانال بنویسم؛ ربات ادمین نیست یا مجوز ارسال ندارد", "❌ Bot is not admin / can't post"),
@@ -2343,20 +2387,24 @@ async def _cycle(bot, uid, cid, test_mode, progress):
         except Exception as e: return src, name, None, False, "", str(e)[:80]
     results = await asyncio.gather(*[one(src) for src in sources])
     leftovers = q("SELECT id,url,title,published_at FROM articles WHERE channel_id=? AND status='discovered' AND source_id IN (SELECT id FROM sources WHERE active=1 AND channel_id=articles.channel_id) ORDER BY id DESC LIMIT 10", (cid,))
-    candidates, all_items, n_old, seen = [], [], 0, set()
+    candidates, all_items, n_old, n_dup, seen = [], [], 0, 0, set()
     for src, name, items, changed, method, err in results:
-        if err in ("cooldown", "paused"): D.add("src_cooldown", name=name); continue
-        if err: res["errors"] += 1; D.add("src_fail", name=name, err=err); log_event("WARN", f"منبع {src['url']}: {err}", uid); continue
+        step_add(_current_operation.get(), "src_check", key=name, status="run")   # هر منبع جداگانه: «دارم X را بررسی می‌کنم»
+        if err in ("cooldown", "paused"): D.add("src_cooldown", name=name); step_add(_current_operation.get(), "src_cooldown", key=name, status="run"); continue
+        if err: res["errors"] += 1; D.add("src_fail", name=name, err=err); step_add(_current_operation.get(), "src_fail", key=name, status="fail"); log_event("WARN", f"منبع {src['url']}: {err}", uid); continue
         if not changed: D.add("src_notmod", name=name); step_add(_current_operation.get(), "src_notmod", key=name, status="run"); continue
         if not items: D.add("src_empty", name=name); step_add(_current_operation.get(), "src_empty", key=name, status="fail"); continue
         new = 0
         for it in items:
             h = url_hash(it["url"]); all_items.append((it, h))
-            if h in seen or article_exists(cid, h): continue
+            if h in seen or article_exists(cid, h) or posted_before(ch["chat_id"], h): continue   # همان آدرس قبلاً ساخته/منتشر شده
             seen.add(h)
+            fp = title_fp(it["title"] or it["url"])
+            if dedup_seen(cid, fp):        # همان خبر با آدرس/منبع دیگر → تولید دوباره نمی‌شود (این‌کار با خود ربات، نه AI)
+                n_dup += 1; step_add(_current_operation.get(), "src_dup", key=name, status="fail"); continue
             if it.get("published") and not _within_lookback(it["published"], s): article_insert(uid, cid, h, it["url"], it["title"], src["id"], it["published"], "skipped", "old"); n_old += 1; continue
             aid = article_insert(uid, cid, h, it["url"], it["title"], src["id"], it.get("published"))
-            if aid: candidates.append({"aid": aid, "url": it["url"], "title": it["title"], "published": it.get("published"), "html": it.get("html") or "", "media": it.get("media")}); new += 1
+            if aid: candidates.append({"aid": aid, "url": it["url"], "title": it["title"], "published": it.get("published"), "html": it.get("html") or "", "media": it.get("media")}); new += 1; dedup_mark(cid, fp)
         D.add("src_ok", name=name, m=method, n=len(items), new=new)
         step_add(_current_operation.get(), "src_found", key=name, status="ok") if new else step_add(_current_operation.get(), "src_empty", key=name, status="fail")
         if new: q("UPDATE sources SET found_total=found_total+? WHERE id=?", (new, src["id"]), commit=True)
@@ -2364,6 +2412,7 @@ async def _cycle(bot, uid, cid, test_mode, progress):
     lo = [{"aid": r["id"], "url": r["url"], "title": r["title"], "published": r["published_at"], "html": "", "media": None} for r in leftovers if r["id"] not in {c["aid"] for c in candidates}]
     if lo: D.add("leftover", n=len(lo)); candidates += lo
     if n_old: D.add("old", n=n_old, h=s["lookback_hours"])
+    if n_dup: D.add("dup", n=n_dup)
     if not candidates and test_mode and all_items:
         retry = 0
         for it, h in all_items:
@@ -2572,13 +2621,8 @@ async def scheduler_tick(bot):
         if not due:
             log_event("INFO", "scheduler: nothing due this tick")
             return
-        # مدل در دسترس: فقط کانال‌هایی که مدل آماده دارند انجام شوند؛ بقیه در حافظه لاگ می‌شوند
-        ready_uids = set(uid for _, uid, _, _ in due if any_model_available(uid))
-        if not ready_uids:
-            log_event("WARN", f"{len(due)} کانال در انتظار؛ هیچ مدل AI در دسترس نیست (ساختار مدار شکننده فعّال)")
-            return
-        due = [d for d in due if d[1] in ready_uids]
-        log_event("INFO", f"scheduler dispatching {len(due)} cycles")
+        # چرخه هرگز متوقف نمی‌شود: اگر مدلی در دسترس نباشد، خودِ چرخه مدل‌ها را به‌ترتیب امتحان می‌کند و در پایان دلیل واقعی را می‌گوید
+        if not any(any_model_available(uid) for _, uid, _, _ in due): log_event("WARN", f"{len(due)} کانال با مدل‌های در حالت backoff اجرا می‌شوند (امتحان ترتیبی)")
         due.sort(key=lambda x: x[0]); batch = due[:MAX_CYCLES_PER_TICK]
         gset("last_cycle_start", now_iso()); await asyncio.gather(*[_scheduled(bot, uid, ch, s) for _, uid, ch, s in batch]); gset("last_cycle_end", now_iso())
 # ============================================================
@@ -2880,7 +2924,7 @@ def step_add(op, category, key=None, status="run", model=None, **fmt):
     # Thinking غالب می‌ماند: فقط مرحله‌ی تولید و انتشار Working است؛ هر مرحله‌ی بررسی/منبع، هدر را به Thinking برمی‌گرداند
     if category.startswith(("ai_", "model_")) or category in ("post_gen", "post_ready", "published", "queued", "queue"):
         op.header_kind = "working"
-    elif category.startswith("src_") or category in ("extract", "low", "found", "ad"):
+    elif category.startswith("src_") or category in ("extract", "low", "found", "ad", "prep"):
         op.header_kind = "thinking"
 
 DOTS_SEQ = (3, 2, 1, 0, 1, 2)          # ابتدا سه نقطه یکی‌یکی پاک می‌شود، سپس یکی‌یکی برمی‌گردد
@@ -2899,6 +2943,7 @@ SPHARSE = {
   ("model_start","run",0): "⏳ دارم مدل {} را اجرا می‌کنم…", ("model_start","run",1): "🧠 دارم با مدل {} می‌نویسم…", ("model_start","run",2): "▶️ مدل {} را روشن می‌کنم…",
   ("model_start","ok",0): "✅ مدل {} جواب داد؛ دارم خروجی‌اش را بررسی می‌کنم", ("model_start","ok",1): "🎯 خروجی مدل {} سالم بود", ("model_start","ok",2): "✅ مدل {} کارش را درست انجام داد",
   ("model_start","fail",0): "⚠️ مدل {} جواب نداد؛ می‌روم سراغ مدل بعدی", ("model_start","fail",1): "❌ مدل {} از کار افتاده بود؛ مدل بعدی را امتحان می‌کنم", ("model_start","fail",2): "🛑 مدل {} پاسخ نداد؛ سوییچ می‌کنم روی مدل بعدی",
+  ("prep","run",0): "🧾 دارم متن مقاله را برای مدل {} بخش‌بندی و خلاصه می‌کنم…", ("prep","run",1): "📚 دارم کل متن را می‌خوانم تا به مدل {} بدهم…", ("prep","run",2): "🗂 دارم متن را آماده‌ی تحویل به {} می‌کنم…",
   ("post_gen","run",0): "⏳ دارم محتوا را می‌نویسم…", ("post_gen","run",1): "🧠 دارم مطابق سبک کانال می‌نویسم…", ("post_gen","run",2): "✍️ دارم متن را آماده می‌کنم…",
   ("post_ready","ok",0): "✅ محتوا آماده شد", ("post_ready","ok",1): "🎉 پست تولید شد", ("post_ready","ok",2): "📨 دارم به کانال می‌فرستم…",
   ("ai","run",0): "⏳ دارم با مدل تولید می‌کنم…", ("ai","run",1): "🧠 مدل دارد فکر می‌کند…", ("ai","run",2): "✍️ دارم می‌نویسم…",
@@ -2909,11 +2954,12 @@ SPHARSE = {
   ("src_cooldown","run",0): "⏳ {} در بازه‌ی استراحت است؛ فعلاً ردش می‌کنم", ("src_cooldown","run",1): "🔄 {} را تازه بررسی کرده‌ام؛ بعداً سراغش می‌روم", ("src_cooldown","run",2): "💤 {} دارد بازیابی می‌شود",
   ("src_fail","fail",0): "⚠️ {} جواب نداد؛ منبع را کنار می‌گذارم", ("src_fail","fail",1): "❌ نتوانستم به {} وصل شوم", ("src_fail","fail",2): "🔌 {} قطع بود؛ می‌روم منبع بعدی",
   ("src_notmod","run",0): "ℹ️ {} از آخرین بررسی تازه‌تر نشده", ("src_notmod","run",1): "⏳ {} خبر جدیدی نداشت", ("src_notmod","run",2): "📄 محتوای {} همان قبلی است",
-  ("src_extract_fail","fail",0): "📄 متن این خبر خوانده نشد؛ ردش می‌کنم", ("src_extract_fail","fail",1): "❌ نتوانستم محتوای این خبر را بخوانم", ("src_extract_fail","fail",2): "⚠️ بدنهٔ خبر خالی بود؛ ردش کردم",
-  ("src_skip_old","fail",0): "🕰 این خبر قدیمی‌تر از بازهٔ تعیین‌شده بود", ("src_skip_old","fail",1): "⏳ تاریخ خبر گذشته بود؛ کنارش می‌گذارم", ("src_skip_old","fail",2): "📅 این خبر بیرون از بازهٔ زمانی بود",
-  ("src_ad","fail",0): "🚫 این محتوا تبلیغاتی بود؛ پردازش نمی‌کنم", ("src_ad","fail",1): "⚠️ تبلیغ تشخیصش دادم؛ کنارش می‌گذارم", ("src_ad","fail",2): "🛑 فیلتر تبلیغ این مورد را رد کرد",
-  ("src_ai_fail","fail",0): "🧠 مدل خروجی قابل‌استفاده نداد؛ می‌روم سراغ بعدی", ("src_ai_fail","fail",1): "❌ تولید محتوا ناموفق بود", ("src_ai_fail","fail",2): "⚠️ خروجی مدل معتبر نبود",
-  ("src_low_score","fail",0): "📏 امتیاز این خبر به حداقل کانال نرسید", ("src_low_score","fail",1): "🧪 امتیاز پایین بود؛ ردش می‌کنم", ("src_low_score","fail",2): "⚠️ با معیارهای کانال هم‌خوان نبود",
+  ("src_extract_fail","fail",0): "📄 در {} متن خبر خوانده نشد؛ ردش می‌کنم", ("src_extract_fail","fail",1): "❌ {} محتوای قابل‌خواندن نداشت؛ ردش کردم", ("src_extract_fail","fail",2): "⚠️ بدنهٔ خبر در {} خالی بود؛ ردش کردم",
+  ("src_skip_old","fail",0): "🕰 در {} این خبر قدیمی‌تر از بازهٔ تعیین‌شده بود", ("src_skip_old","fail",1): "⏳ در {} تاریخ خبر گذشته بود؛ کنارش می‌گذارم", ("src_skip_old","fail",2): "📅 خبر {} بیرون از بازهٔ زمانی بود",
+  ("src_ad","fail",0): "🚫 محتوای {} تبلیغاتی بود؛ پردازش نمی‌کنم", ("src_ad","fail",1): "⚠️ محتوای {} را تبلیغ تشخیص دادم؛ کنارش می‌گذارم", ("src_ad","fail",2): "🛑 فیلتر تبلیغ، مورد {} را رد کرد",
+  ("src_ai_fail","fail",0): "🧠 مدل {} خروجی قابل‌استفاده نداد؛ می‌روم سراغ بعدی", ("src_ai_fail","fail",1): "❌ تولید محتوا با {} ناموفق بود", ("src_ai_fail","fail",2): "⚠️ خروجی مدل {} معتبر نبود",
+  ("src_dup","fail",0): "🔁 خبر {} را قبلاً پردازش کرده‌ام؛ دوباره نمی‌سازمش", ("src_dup","fail",1): "📌 خبر {} تکراری بود؛ ردش می‌کنم", ("src_dup","fail",2): "♻️ {} خبر تکراری داشت؛ می‌روم سراغ خبر بعدی",
+  ("src_low_score","fail",0): "📏 امتیاز خبر {} به حداقل کانال نرسید", ("src_low_score","fail",1): "🧪 در {} امتیاز پایین بود؛ ردش می‌کنم", ("src_low_score","fail",2): "⚠️ خبر {} با معیارهای کانال هم‌خوان نبود",
   # --- مراحل میانی
   ("found","ok",0): "📥 یک مورد مطابق معیارها پیدا کردم", ("found","ok",1): "✅ یک گزینه‌ی خوب پیدا کردم", ("found","ok",2): "🎯 آیتم مناسب را تشخیص دادم",
   ("extract","run",0): "🧾 دارم متن خبر را استخراج می‌کنم…", ("extract","run",1): "🔍 دارم بدنه‌ی خبر را می‌خوانم…", ("extract","run",2): "📄 دارم کل مقاله را می‌خوانم…",
@@ -3229,7 +3275,9 @@ def _ai_status_reporter(context, lang):
         body = texts.get(event, reason or "")
         if op is not None:
             # هر رویداد فقط یک سطر می‌سازد (نه سطر مرحله + سطر وضعیت؛ وگرنه دو جمله‌ی متناقض با هم دیده می‌شود)
-            if event == "start":
+            if getattr(op, "prep", False) and event in ("start", "busy"):
+                step_add(op, "prep", key=name, status="run", model=name); body = ""     # پیش‌پردازش: هنوز Thinking
+            elif event == "start":
                 step_add(op, "model_start", key=name, status="run", model=name); op.header_kind = "working"; body = ""
             elif event == "busy":
                 step_add(op, "model_start", key=name, status="run", model=name); body = ""
@@ -3287,7 +3335,8 @@ async def popup(update, context, text, alert=False):
     qy = update.callback_query
     if qy and temp is None:
         try:
-            await qy.answer(plain[:200], show_alert=alert); context._callback_answered = True
+            # قاعده: هشدار/وضعیت همیشه نوتیفیکیشن آبی بالای چت (show_alert=False) تا چت را نپوشاند
+            await qy.answer(plain[:200], show_alert=False); context._callback_answered = True
             return
         except Exception: pass
     await send_temp(context, update.effective_chat.id, text, seconds=temp)
@@ -4600,7 +4649,9 @@ def main():
     if not BOT_TOKEN: raise SystemExit("BOT_TOKEN تنظیم نشده است.")
     if not SUPER_ADMIN_IDS: raise SystemExit("SUPER_ADMIN_IDS تنظیم نشده است.")
     _restore_db_snapshot()
-    init_core(); APP = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).concurrent_updates(True).build()
+    init_core(); _bld = Application.builder().token(BOT_TOKEN)
+    if API_BASE: _bld = _bld.base_url(API_BASE)          # سرور محلی Bot API (اختیاری) → پشتیبانی از فایل‌های تا ۲ گیگ
+    APP = _bld.post_init(post_init).post_shutdown(post_shutdown).concurrent_updates(True).build()
     for cmd, fn in (("start", cmd_start), ("create", cmd_create), ("admin", cmd_admin), ("man", cmd_man), ("help", cmd_help), ("about", cmd_about), ("lang", cmd_lang), ("cancel", cmd_cancel)): APP.add_handler(CommandHandler(cmd, managed_command(fn)))
     APP.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.COMMAND, managed_command(cmd_unknown)))
     APP.add_handler(CallbackQueryHandler(on_callback)); APP.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_message)); APP.add_error_handler(on_error)
