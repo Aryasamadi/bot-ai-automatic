@@ -3,7 +3,7 @@
 NewsBot v3 — یک‌فایل کامل: هسته‌ی داده، موتور محتوا، رابط کاربری، پنل مدیر کلان
 نیازمندی‌ها: python-telegram-bot[job-queue]>=21, httpx, feedparser, trafilatura, beautifulsoup4, lxml
 """
-import os, re, json, html, time, random, asyncio, logging, sqlite3, hashlib, secrets, tempfile, threading, ipaddress, socket
+import os, re, json, html, time, random, asyncio, logging, sqlite3, hashlib, secrets, tempfile, threading, ipaddress, socket, contextlib
 from datetime import datetime, timedelta, timezone
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -172,12 +172,13 @@ CREATE INDEX IF NOT EXISTS idx_art_disco ON articles(channel_id, status, created
 CREATE INDEX IF NOT EXISTS idx_dedup_ts ON dedup(ts);
 CREATE INDEX IF NOT EXISTS idx_users_plan_exp ON users(plan_expires);
 CREATE INDEX IF NOT EXISTS idx_chtok_ch ON ch_tokens(channel_id, used_at);
+CREATE INDEX IF NOT EXISTS idx_posted_ch_at ON posted(channel_id, posted_at);
 """
 MIGRATIONS = [("users", "next_plan_id", "INTEGER"), ("users", "next_plan_days", "INTEGER"), ("users", "lang", "TEXT"), ("users", "remind_key", "TEXT"), ("users", "premium", "INTEGER DEFAULT 0"),
               ("plans", "name_en", "TEXT"), ("plans", "price_en", "TEXT DEFAULT ''"), ("plans", "description_en", "TEXT DEFAULT ''"),
               ("channels", "verified_by", "INTEGER"), ("channels", "created_at", "TEXT"), ("channels", "settings", "TEXT"), ("channels", "original_admin_id", "INTEGER"),
               ("sources", "channel_id", "INTEGER"), ("sources", "feed_url", "TEXT"), ("sources", "last_error", "TEXT"), ("articles", "channel_id", "INTEGER"),
-              ("sources", "bot_active", "INTEGER DEFAULT 1"), ("sources", "api_url", "TEXT"), ("sources", "api_key", "TEXT"), ("sources", "api_note", "TEXT DEFAULT ''"),
+              ("articles", "send_fails", "INTEGER DEFAULT 0"), ("sources", "bot_active", "INTEGER DEFAULT 1"), ("sources", "api_url", "TEXT"), ("sources", "api_key", "TEXT"), ("sources", "api_note", "TEXT DEFAULT ''"),
               ("pay_requests", "discount", "TEXT"), ("pay_requests", "final_price", "TEXT"),
               ("ai_models", "temperature", "REAL DEFAULT 0.5"), ("ai_models", "max_tokens", "INTEGER DEFAULT 2500"), ("ai_models", "owner_id", "INTEGER"),
               ("ai_models", "fail_count", "INTEGER DEFAULT 0"), ("ai_models", "next_try_after", "TEXT DEFAULT ''"),
@@ -239,6 +240,14 @@ def q(sql, params=(), one=False, commit=False):
                 if _c is not None: _c.rollback()
             except Exception: pass
             if attempt == 3 or ("locked" not in msg and "busy" not in msg): raise
+        except sqlite3.Error:
+            # خطای تلاش‌نشدنی (مثل IntegrityError) تراکنش ضمنیِ کانکشن را باز می‌گذاشت و بعد از آن
+            # هر نوشتن بعدیِ همین ترد با «cannot start a transaction within a transaction» می‌شکست.
+            try:
+                _c = getattr(_tls, "conn", None)
+                if _c is not None: _c.rollback()
+            except Exception: pass
+            raise
 _COLS = {}
 def _safe_fields(table, f):
     """در SQL پویا فقط ستون‌های واقعیِ همان جدول پذیرفته می‌شوند (نام ستون از ورودی کاربر می‌آید)."""
@@ -330,6 +339,7 @@ def assign_plan(uid, pid, days=None):
         return exp, False
     exp = (cur if active else now) + timedelta(days=d)
     q("UPDATE users SET plan_id=?, plan_expires=?, remind_key=NULL, role=CASE WHEN role='user' THEN 'admin' ELSE role END, free_used=CASE WHEN ?=1 THEN 1 ELSE free_used END WHERE id=?", (pid, exp.isoformat(), p["is_free"], uid), commit=True)
+    admin_limits_invalidate(uid)   # وگرنه تا ۶۰ ثانیه سهمیهٔ کهنه اعمال می‌شود
     return exp, False
 def proration_remaining_days(uid):
     """روزهای باقی‌ماندهٔ واقعیِ پلن فعلی (اعداد کسری برای کمتر از ۲۴ ساعت)؛ اگر active نباشد ۰ است."""
@@ -549,7 +559,7 @@ def get_settings(cid):
     s = default_settings(base if base in LANGS else "fa", ch["username"] if ch else ""); s.update(stored); s["ui_lang"] = base if base in LANGS else "fa"
     if s.get("prompt") in _LEGACY_PROMPTS: s["prompt"] = DEFAULT_PROMPT[s["ui_lang"]]  # مهاجرت پرامپت قدیمی
     for k in list(s):
-        if k.startswith("_"): s.pop(k)
+        if k.startswith("_") and k != "_retry_until": s.pop(k)   # _retry_until وضعیت داخلیِ خواباندن صف است و باید بماند
     s["interval_minutes"] = max(MIN_INTERVAL, int(s.get("interval_minutes") or MIN_INTERVAL)); s["lookback_hours"] = min(MAX_LOOKBACK, max(1, int(s.get("lookback_hours") or 72)))
     # کپشن کانال هرگز از سقف سخت بالاتر نمی‌رود (وگرنه تلگرام پست را دو پیام می‌کند)
     s["post_limit"] = min(POST_LIMIT_MAX, max(300, int(s.get("post_limit") or POST_LIMIT_DEFAULT)))
@@ -638,10 +648,15 @@ def transfer_channel(cid, new_uid, lang="fa"):
     if publication_pending(cid): raise RuntimeError("channel_busy")
     ch = get_channel(cid)
     if not ch: return None
-    q("DELETE FROM sources WHERE channel_id=?", (cid,), commit=True); q("DELETE FROM articles WHERE channel_id=? AND status!='published'", (cid,), commit=True)
-    q("DELETE FROM ch_tokens WHERE channel_id=?", (cid,), commit=True)
-    q("UPDATE channels SET admin_id=?, verified_by=?, settings=? WHERE id=?", (new_uid, new_uid, json.dumps(default_settings(lang, ch["username"]), ensure_ascii=False), cid), commit=True)
-    return ch["admin_id"]
+    old_uid = ch["admin_id"]
+    def _go(conn):
+        conn.execute("DELETE FROM sources WHERE channel_id=?", (cid,))
+        conn.execute("DELETE FROM articles WHERE channel_id=? AND status!='published'", (cid,))
+        conn.execute("DELETE FROM ch_tokens WHERE channel_id=?", (cid,))
+        conn.execute("UPDATE channels SET admin_id=?, verified_by=?, settings=? WHERE id=?",
+                     (new_uid, new_uid, json.dumps(default_settings(lang, ch["username"]), ensure_ascii=False), cid))
+        return old_uid
+    return _trx(_go)   # اتمیک: یا کل انتقال انجام می‌شود یا هیچ‌کدام (قبلاً چهار commit جدا بود)
 def revert_channel_owner(cid, uid):
     """بازگرداندن مالکیت به ثبت‌کنندهٔ نخست، بعد از اینکه مالک فعلی در تلگرام ادمینِ کانال نبود."""
     if publication_pending(cid): raise RuntimeError("channel_busy")
@@ -708,7 +723,8 @@ def article_exists(cid, h): return bool(q("SELECT 1 FROM articles WHERE channel_
 def title_fp(t):
     """اثر انگشت سبک از عنوان: برای تشخیص «همان خبر از آدرس/منبع دیگر» — کم‌حجم و بدون خواندن سنگین."""
     t = re.sub(r"[\W_]+", " ", str(t or "").lower(), flags=re.UNICODE)
-    return hashlib.sha1(" ".join(t.split()[:8]).encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha1(" ".join(t.split()).encode("utf-8")).hexdigest()[:16]   # کل عنوان، نه ۸ کلمهٔ اول:
+    # وگرنه تیترهای متفاوت با شروع مشترک («قیمت دلار امروز در بازار آزاد …») اثر انگشت یکی می‌گرفتند و خبر سالم بی‌صدا دور ریخته می‌شد
 def dedup_seen(cid, fp): return bool(q("SELECT 1 FROM dedup WHERE channel_id=? AND fp=?", (cid, fp), one=True))
 def dedup_mark(cid, fp): q("INSERT OR REPLACE INTO dedup(channel_id,fp,ts) VALUES(?,?,?)", (cid, fp, now_iso()), commit=True)
 def article_insert(uid, cid, h, url, title, source_id, published_at, status="discovered", reason=""):
@@ -741,7 +757,12 @@ def release_publication(aid, journal, reason):
         day = journal.get("reserved_day")
         if day is not None and journal.get("phase") != "in_flight":
             conn.execute("UPDATE usage SET posts=MAX(0,posts-1) WHERE admin_id=? AND day=?", (journal["admin_id"], day))
-        jr = dict(journal, reserved_day=day if journal.get("phase") == "in_flight" else None)
+        if journal.get("phase") == "in_flight":
+            # تحویل نامعلوم: روزِ رزروشده می‌ماند (شاید واقعاً منتشر شده باشد) ولی فاز از in_flight بیرون می‌رود،
+            # وگرنه publication_pending تا ۴۸ ساعت کانال را برای ریست صف/انتقال مالکیت/حذف کانال قفل می‌کند.
+            jr = dict(journal, phase="unsettled", reserved_day=day)
+        else:
+            jr = dict(journal, reserved_day=None)
         conn.execute("UPDATE articles SET reason=? WHERE id=?", (reason, aid))
         if jr.get("phase") == "prepared":
             conn.execute("DELETE FROM settings WHERE key=?", (f"pubj:{aid}",))
@@ -1364,10 +1385,12 @@ def clean_ai_text(t, s=None):
     """زباله‌های مدل حذف می‌شود: دیکشنری امتیازها («معیار»: ۹، ...) و تکه‌های JSON چسبیده به متن پست — هرگز به کانال یا ربات نمی‌رسد."""
     if not t: return t
     t = str(t).replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", " ")
+    t = re.sub(r"[^\S\n]{2,}", " ", t)   # اجرای طولانی فاصله/نویسهٔ نامرئی یک‌بار جمع می‌شود؛ وگرنه الگوی امتیازها
+                                         # (چند خط پایین‌تر) عقب‌نشینی فاجعه‌بار می‌کند و چون این تابع همگام است کل ربات قفل می‌شود
     names = [str(c.get("name", "")).strip() for c in (s or {}).get("criteria", []) if c.get("name")]
     names += ["ارزش محتوایی", "غیرتبلیغاتی بودن", "کیفیت و کامل بودن", "ارتباط با موضوع کانال", "تازگی", "Content value", "Non-promotional", "Quality & completeness", "Relevance to channel topic", "Relevance", "Freshness"]
     num = r'(?:10|[0-9۰-۹])(?:[.,][0-9۰-۹])?'
-    pat = re.compile(r'["“«\']?([^"”»:\n]{2,40})(?:\s*:\s*["”»\']?\s*|\s*["”»\']?\s*:\s*)' + num + r'\s*[,،.؛;]?')
+    pat = re.compile(r'["“«\']?([^"”»:\n]{2,40})(?:[ \t]*:[ \t]*["”»\']?[ \t]*|[ \t]*["”»\']?[ \t]*:[ \t]*)' + num + r'[ \t]*[,،.؛;]?')
     def rep(m):
         label = m.group(1).strip()
         return "" if any(label and (label in n or n in label) for n in names) else m.group(0)
@@ -1918,7 +1941,7 @@ def heuristic_ad_check(art, strict=False):
     if promo >= 2: score += 3; reasons.append(f"promo×{promo}")
     risk = len(re.findall(r"کازینو|casino|شرط\u200c?بندی|پیش\u200c?بینی فوتبال|forex|فارکس|سیگنال ?(?:خرید|فروش)|signal group|وام فوری|سرمایه\u200c?گذاری تضمینی|guaranteed (?:profit|return)|سود تضمینی|بیت ?کوین رایگان", low))
     if risk: score += 3 + min(3, risk); reasons.append(f"risk×{risk}")
-    if re.search(r"/(sponsored|advertorial|advert|ads?|reklama|reportage|رپورتاژ)[-/]", url, re.I): return True, "advertorial-url", round(score + 8, 1)
+    if re.search(r"/(sponsored|advertorial|reklama|رپورتاژ)(?=/|$)", urlparse(url).path.lower()): return True, "advertorial-url", round(score + 8, 1)
     if AD_URL.search(url) and (phones or money): return True, "ad-url+contact", round(score + 5, 1)
     if AD_STRONG_RE and AD_STRONG_RE.search(title.lower()): return True, "advertorial-title", round(score + 9, 1)
     if promo >= 2 and (phones or money): return True, "promo+contact", round(score + 6, 1)
@@ -2081,6 +2104,37 @@ def _ext_kind(u, fallback="photo"):
     if e == ".gif": return "animation"
     if e in (".jpg", ".jpeg", ".png", ".webp", ".bmp"): return "photo"
     return fallback
+class _GuardedStream:
+    """جریان GET برای مدیا با ریدایرکت دستی: هر جهش قبل از رفتن با public_url اعتبارسنجی می‌شود.
+    کلاینت به‌طور پیش‌فرض follow_redirects=True است و همین راه فرارِ SSRF بود؛ fetch این کار را می‌کرد ولی اینجا نمی‌شد.
+    روی تغییر میزبان، هدرهای اعتبارسنجی حذف می‌شوند."""
+    def __init__(self, url, headers, hops=5, timeout=None):
+        self.url = str(url); self.headers = dict(headers or {})
+        self.hops = hops; self.timeout = timeout or httpx.Timeout(180, connect=15)
+        self._stack = contextlib.AsyncExitStack(); self.response = None
+    async def __aenter__(self):
+        await self._stack.__aenter__()
+        current = self.url; headers = dict(self.headers)
+        try:
+            for _ in range(self.hops):
+                if not await asyncio.to_thread(public_url, current):
+                    await self._stack.aclose(); return None
+                r = await self._stack.enter_async_context(http().stream("GET", current, headers=headers, follow_redirects=False, timeout=self.timeout))
+                if r.status_code in (301, 302, 303, 307, 308):
+                    loc = r.headers.get("location")
+                    await r.aclose()
+                    if not loc: await self._stack.aclose(); return None
+                    nxt = urljoin(current, loc)
+                    if (urlparse(nxt).hostname or "").lower().rstrip(".") != (urlparse(current).hostname or "").lower().rstrip("."):
+                        headers = {k: v for k, v in headers.items() if k.lower() not in {"authorization", "x-api-key", "apikey", "cookie"}}
+                    current = nxt
+                    continue
+                return r      # خودِ پاسخ برگردانده می‌شود تا فراخوان مثل قبل r.status_code / aiter_bytes داشته باشد
+            await self._stack.aclose(); return None
+        except BaseException:
+            await self._stack.aclose(); raise
+    async def __aexit__(self, *a): return await self._stack.__aexit__(*a)
+
 async def download_media(media):
     """دانلود جریانی تا سقف MAX_MEDIA_MB (پیش‌فرض ۵۰ مگابایت = سقف آپلود ربات‌های تلگرام). اگر نوبت اول رد شد، یک‌بار با هدر دیگری دوباره تلاش می‌شود."""
     if not media or not media.get("url"): return None
@@ -2089,7 +2143,8 @@ async def download_media(media):
         tmp = None; path = None
         try:
             async with FETCH_SEM:
-                async with http().stream("GET", media["url"], headers=hdr, timeout=httpx.Timeout(180, connect=15)) as r:
+                async with _GuardedStream(media["url"], hdr) as r:
+                    if r is None: continue
                     if r.status_code != 200: continue
                     ct = r.headers.get("content-type", "").lower()
                     if ct.startswith("text/") or "html" in ct: return None
@@ -2284,7 +2339,13 @@ async def _publish_article_locked(bot, aid, count_usage=True, test_user=None):
                 if isinstance(e, RetryAfter):      # محدودیت نرخ تلگرام → به بالا گزارش می‌شود تا صف drain موقتاً بخوابد
                     article_update(aid, reason="rate_limited")
                     return False, f"retry_after:{min(max(int(getattr(e, 'retry_after', 30) or 30), 5), 300)}"
-                article_update(aid, reason="delivery_unknown" if journal.get("phase") == "in_flight" else f"send: {str(e)[:120]}")
+                if journal.get("phase") == "in_flight":
+                    article_update(aid, reason="delivery_unknown")
+                else:
+                    n = (int(a["send_fails"]) if "send_fails" in a.keys() and a["send_fails"] is not None else 0) + 1
+                    # شکست قطعیِ ارسال (پست بلند، Forbidden، خطای پارس): بعد از سه تلاش از صف بیرون می‌رود،
+                    # وگرنه همیشه سرِ صف می‌ماند و هیچ‌کدام از آماده‌های بعدی هرگز منتشر نمی‌شوند.
+                    article_update(aid, reason=f"send: {str(e)[:110]}", send_fails=n, **({"status": "failed"} if n >= 3 else {}))
                 log.exception("publication failed article=%s channel=%s", aid, ch["id"])
                 return False, f"send_failed:{str(e)[:120]}"
             published = True
@@ -2549,6 +2610,7 @@ async def _cycle(bot, uid, cid, test_mode, progress):
                 else:
                     res["errors"] += 1; D.add("pub_fail", err=_pub_err(out, lang))
                     if out == "bot_not_admin": D.hint("hint_admin"); stop = True; break
+                    if isinstance(out, str) and out.startswith("retry_after"): stop = True; break
             else: res["queued"] += 1
     # --- جمع‌بندی
     if cnt["extract"]: D.add("extract_fail", n=cnt["extract"])
@@ -2590,7 +2652,8 @@ async def flush_ready(bot, uid, cid, max_n=2):
                 except ValueError: secs = 60
                 update_settings(cid, _retry_until=(now_utc() + timedelta(seconds=min(max(secs, 5), 300))).isoformat()); break
             else:
-                update_settings(cid, _retry_until=(now_utc() + timedelta(seconds=90)).isoformat()); break
+                # یک مقالهٔ خراب سرِ صف را نمی‌بندد؛ بقیهٔ آماده‌ها در همین گذر تلاش می‌شوند
+                update_settings(cid, _retry_until=(now_utc() + timedelta(seconds=90)).isoformat()); continue
         return sent
 # ============================================================
 # زمان‌بند هوشمند: عادلانه (قدیمی‌ترین اجرا اول)، سقف چرخه در هر تیک، توقف وقتی هیچ مدلی در دسترس نیست
@@ -2870,9 +2933,11 @@ TXT = {
     "dl_notfound": ("🔎 متأسفم، نسخهٔ کامل این مطلب پیدا نشد — ممکن است پاک شده باشد. لطفاً از خودِ کانال پست را باز کن یا چند دقیقه بعد دوباره امتحان کن.", "🔎 Sorry, this full version could not be found — it may have been removed. Please open the post in the channel or try again later."), "dl_source": ("🔗 Source", "🔗 Source"),
 }
 def tr(lang, key, / , **kw):
+    if key not in TXT: return str(key)   # کلید ناشناخته (callback_data دست‌ساز) نباید KeyError بدهد
     s = TXT[key][1 if lang == "en" else 0]
     try: return s.format(**kw) if kw else s
     except Exception: return s
+TOGGLABLE = {"enabled", "hashtags", "include_link", "include_media", "strict_ads", "allow_undated"}
 STATUS = {"discovered": ("🔎 کشف‌شده", "🔎 discovered"), "skipped": ("⏭ خارج از بازه", "⏭ out of window"), "rejected": ("♻️ ردشده", "♻️ rejected"), "failed": ("❌ ناموفق", "❌ failed"), "ready": ("📝 آماده", "📝 ready"), "published": ("✅ منتشرشده", "✅ published")}
 def reason_text(reason, lang):
     """دلیل کوتاه و امن برای مدیر: هیچ نام مدل، Base URL یا متن خطای فنی نشان داده نمی‌شود."""
@@ -3507,6 +3572,9 @@ def _upgrade_price(uid, p, cur, disc_percent):
 async def do_request(update, context, pid):
     uid = update.effective_user.id; lang = L(update); p = get_plan(pid)
     if not p: await popup(update, context, tr(lang, "plan_notfound")); return await view_plans(update, context)
+    if p["is_free"]: return await do_free(update, context, pid)          # پلن رایگان مسیر خودش را دارد (قاعدهٔ یک‌بار دور زده نمی‌شود)
+    if "active" in p.keys() and not p["active"]:
+        await popup(update, context, tr(lang, "plan_notfound"), alert=True); return await view_plans(update, context)
     if pay_pending_for(uid, pid): await popup(update, context, tr(lang, "req_pending"), alert=True); return await view_plan(update, context, pid)
     lim = admin_limits(uid); cur = get_plan(lim["plan_id"]) if lim["plan_id"] else None
     d = _applied_disc(context, pid); new_price, _ = _price_text(p, lang, d)
@@ -3627,8 +3695,8 @@ async def view_content(update, context, cid):
     await render(update, context, text, kb)
 async def view_cats(update, context, cid):
     lang = L(update); s = get_settings(cid)
-    text = tr(lang, "cats_title") + "\n" + "".join(f"\n{c['emoji']} <b>{esc(c['name'])}</b>: {esc(c['style'][:70])}" for c in s["categories"])
-    kb = pairs([B(f"{c['emoji']} {c['name'][:18]}", f"a:catv:{cid}:{i}") for i, c in enumerate(s["categories"])]) + [[B(tr(lang, "cat_add"), f"a:cata:{cid}")], [B(tr(lang, "back"), f"a:con:{cid}")]]; await render(update, context, text, kb)
+    text = tr(lang, "cats_title") + "\n" + "".join(f"\n{esc(c['emoji'])} <b>{esc(c['name'])}</b>: {esc(c['style'][:70])}" for c in s["categories"])
+    kb = pairs([B(f"{esc(c['emoji'])} {c['name'][:18]}", f"a:catv:{cid}:{i}") for i, c in enumerate(s["categories"])]) + [[B(tr(lang, "cat_add"), f"a:cata:{cid}")], [B(tr(lang, "back"), f"a:con:{cid}")]]; await render(update, context, text, kb)
 async def view_cat(update, context, cid, i):
     lang = L(update); s = get_settings(cid); c = s["categories"][i] if 0 <= i < len(s["categories"]) else None
     if not c: return await view_cats(update, context, cid)
@@ -3873,13 +3941,19 @@ async def decide_pay(update, context, rid, approve, from_list):
     lang = L(update); r = pay_get(rid)
     if not r or r["status"] != "pending": await popup(update, context, tr(lang, "s_pay_seen")); return await view_s_pays(update, context) if from_list else None
     ul = user_lang(r["user_id"]) or "fa"; p = get_plan(r["plan_id"])
+    if not p or p["is_free"] or ("active" in p.keys() and not p["active"]):
+        pay_set(rid, "pending"); await popup(update, context, tr(lang, "notfound"), alert=True); return await view_s_pays(update, context) if from_list else None
     # claim the payment first (CAS) so a double-approve callback assigns the plan exactly once
     if not pay_claim(rid):
         await popup(update, context, tr(lang, "s_pay_seen")); return await view_s_pays(update, context) if from_list else None
     if approve:
         if not p:
             pay_set(rid, "pending"); await popup(update, context, tr(lang, "notfound"), alert=True); return await view_s_pays(update, context) if from_list else None
-        exp, queued = assign_plan(r["user_id"], r["plan_id"])
+        try:
+            exp, queued = assign_plan(r["user_id"], r["plan_id"])
+        except Exception:
+            pay_set(rid, "pending")   # تأیید نیمه‌کاره نباید پرداخت را در processing جا بگذارد
+            raise
         if exp is None:
             pay_set(rid, "pending"); await popup(update, context, tr(lang, "notfound"), alert=True); return await view_s_pays(update, context) if from_list else None
         pay_set(rid, "approved")
@@ -3994,11 +4068,13 @@ async def dispatch(update, context, data):
         if b == "chdel": return await render(update, context, tr(lang, "ch_del_q", title=esc(ch["title"])), [[B(tr(lang, "yes"), f"a:chdel2:{cid}"), B(tr(lang, "no"), f"a:ch:{cid}")]])
         if b == "chdel2": del_channel(cid, ch["admin_id"]); await popup(update, context, tr(lang, "ch_deleted")); return await view_admin_home(update, context)
         if b == "tog":
+            if d not in TOGGLABLE: return await popup(update, context, tr(lang, "notfound"), alert=True)
             new = not s.get(d); update_settings(cid, **{d: new})
             if d == "enabled": await popup(update, context, tr(lang, "tog_enabled" if new else "tog_disabled")); return await view_channel(update, context, cid)
             else: await popup(update, context, f"{tr(lang, 'tog_' + d)}: {'✅' if new else '⛔'}\n{tr(lang, 'togd_' + d)}")
             return await (view_sched if d == "allow_undated" else view_content)(update, context, cid)
         if b == "set":
+            if d not in FIELD_LABEL: return await popup(update, context, tr(lang, "notfound"), alert=True)
             shown = (tr(lang, "unlimited") if s.get(d) is None else strip_tags(str(s.get(d)))) if d == "daily_posts_cap" else strip_tags(str(s.get(d)))
             extra = ""
             if d == "daily_posts_cap":
@@ -4012,7 +4088,9 @@ async def dispatch(update, context, data):
         if b == "qe": a0 = ud.pop("qs", 0); update_settings(cid, quiet_start=a0, quiet_end=int(d)); await popup(update, context, tr(lang, "quiet_set", a=f"{a0:02d}", b=f"{int(d):02d}")); return await view_sched(update, context, cid)
         if b == "qoff": update_settings(cid, quiet_start=None, quiet_end=None); await popup(update, context, tr(lang, "quiet_cleared")); return await view_sched(update, context, cid)
         if b == "tz": return await view_tz(update, context, cid)
-        if b == "tzs": z, off = TZ_ZONES[int(d)]; update_settings(cid, utc_offset=off); await popup(update, context, tr(lang, "tz_set", city=tz_city(off, lang), tz=off_label(off), loc=local_clock(off))); return await view_sched(update, context, cid)
+        if b == "tzs":
+            if not d.isdigit() or int(d) >= len(TZ_ZONES): return await popup(update, context, tr(lang, "notfound"), alert=True)
+            z, off = TZ_ZONES[int(d)]; update_settings(cid, utc_offset=off); await popup(update, context, tr(lang, "tz_set", city=tz_city(off, lang), tz=off_label(off), loc=local_clock(off))); return await view_sched(update, context, cid)
         if b == "con": return await view_content(update, context, cid)
         if b == "cat": return await view_cats(update, context, cid)
         if b == "cata": return await wiz_start(update, context, "cat_add", f"a:cat:{cid}", cid=cid)
@@ -4194,6 +4272,11 @@ def _input_value(field, raw, lang, name_limit=100):
     """Validate before advancing pending input; errors are ready for a popup."""
     def invalid(fa, en): raise ValueError(en if lang == "en" else fa)
     text = raw.strip()
+    if field == "emoji":
+        # ایموجی یک ایموجی است، نه HTML: تگ نامتوازن پنل دسته‌ها را برای همیشه می‌شکست
+        if not text or len(text) > 4 or any(ch in text for ch in "<>&"):
+            invalid("فقط یک ایموجی بفرستید (بدون تگ و نویسهٔ اضافه).", "Send a single emoji (no markup).")
+        return text
     if field == "base_url" or field in ("source_url", "api_url"):
         try: return _input_url(raw, explicit_scheme=field == "base_url")
         except (ValueError, TypeError, UnicodeError):
@@ -4555,7 +4638,10 @@ async def support_forward(context, user, msg):
     header = _sup_header(user); sent = 0
     for sid in SUPER_ADMIN_IDS:
         try:
-            if msg.text: m = await context.bot.send_message(sid, f"{header}\n{msg.text_html}", parse_mode=HTML, disable_web_page_preview=True)
+            if msg.text:
+                m = None
+                for part in split_html(f"{header}\n{msg.text_html}")[:2]:   # پیام بلند بی‌صدا گم نمی‌شود
+                    m = await context.bot.send_message(sid, part, parse_mode=HTML, disable_web_page_preview=True)
             else:
                 try: m = await context.bot.copy_message(sid, msg.chat_id, msg.message_id, caption=(f"{header}\n{msg.caption_html or ''}")[:1000], parse_mode=HTML)
                 except Exception: m = await context.bot.copy_message(sid, msg.chat_id, msg.message_id)
@@ -4606,6 +4692,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # دستورات و دیپ‌لینک
 def managed_command(handler):
     async def command(update, context):
+        u = update.effective_user
+        try:
+            if u and not is_super(u.id) and get_user(u.id) and get_user(u.id)["banned"]: return
+        except Exception: pass
         return await run_user_operation(update, context, f"command:{handler.__name__}", None, lambda: handler(update, context), replace=True)
     return command
 
