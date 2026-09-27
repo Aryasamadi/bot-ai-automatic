@@ -9,6 +9,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from urllib.parse import urljoin, urlparse
+from email.utils import parsedate_to_datetime
 import httpx, feedparser, trafilatura
 from bs4 import BeautifulSoup
 #  ============================================================
@@ -45,7 +46,7 @@ MODEL_PROBE_MIN = 10
 MODEL_PROBE_BATCH = int(os.getenv("MODEL_PROBE_BATCH", "3"))    # چند مدل خراب در هر تیک آزمایش شود (بازیابی سریع‌تر)
 MAX_DAILY_POSTS_CAP = int(os.getenv("MAX_DAILY_POSTS_CAP", "500"))   # سقف مطلقِ «پست در روز» برای هر کانال
 MIN_INTERVAL = int(os.getenv("MIN_INTERVAL", "30"))            # حداقل فاصله‌ی چرخه (دقیقه)
-MAX_LOOKBACK = 48            # حداکثر بازه‌ی مقالات (ساعت)
+MAX_LOOKBACK = 168           # حداکثر بازه‌ی مقالات (ساعت) — تا یک هفته، چون بیشتر منابع روزانه منتشر نمی‌کنند
 MAX_PPC = 5                  # حداکثر پست در هر چرخه
 POST_LIMIT_DEFAULT = 900     # پیش‌فرض سقف کاراکتر کپشن کانال
 POST_LIMIT_MAX = 900         # سقف سخت کپشن کانال: همیشه زیر محدودیت ۱۰۲۴ تلگرام می‌ماند تا پست هرگز دو پیام نشود     # سقف کاراکتر کپشن کانال (محتوا/امضا/بیشتر در دیپ‌لینک می‌آید) طبق درخواست ادمین (پیش‌فرض) — تنظیم طبق دستور مدیر فاز ۳ (قبلی 700)
@@ -70,9 +71,23 @@ TZ_ZONES = [("tehran", 3.5), ("istanbul", 3), ("dubai", 4), ("kabul", 4.5), ("ka
 def now_utc(): return datetime.now(UTC)
 def now_iso(): return now_utc().isoformat()
 def parse_dt(s):
+    """تاریخ را از هر قالبی که فید/سایت‌مپ می‌دهد می‌فهمد: ISO، RFC-822 («Sun, 27 Sep 2026 16:30:00 +0000») و قالب‌های رایج.
+    پیش‌تر فقط ISO فهمیده می‌شد و رشته‌های RFC-822 ⇒ None ⇒ خبر «قدیمی/بی‌تاریخ» تلقی و دور ریخته می‌شد."""
     if not s: return None
+    t = str(s).strip()
     try:
-        d = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        d = datetime.fromisoformat(t.replace("Z", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=UTC)
+    except Exception: pass
+    for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %Z", "%a, %d %b %Y %H:%M %z",
+                "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M",
+                "%d %b %Y %H:%M:%S %z", "%d %b %Y %H:%M:%S", "%d.%m.%Y %H:%M", "%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y"):
+        try:
+            d = datetime.strptime(t, fmt)
+            return d if d.tzinfo else d.replace(tzinfo=UTC)
+        except Exception: continue
+    try:
+        d = parsedate_to_datetime(t)
         return d if d.tzinfo else d.replace(tzinfo=UTC)
     except Exception: return None
 def tz_of(off):
@@ -520,7 +535,7 @@ def default_settings(lang="fa", channel_username=""):
     lang = lang if lang in LANGS else "fa"
     return {"ui_lang": lang, "enabled": True, "mode": "auto", "prompt": DEFAULT_PROMPT[lang], "topic": "", "language": "فارسی" if lang == "fa" else "English",
             "categories": [dict(c) for c in DEFAULT_CATEGORIES[lang]], "criteria": [dict(c) for c in DEFAULT_CRITERIA[lang]], "min_score": 60,
-            "lookback_hours": 24, "allow_undated": True, "quiet_start": None, "quiet_end": None, "utc_offset": DEFAULT_UTC_OFFSET,
+            "lookback_hours": 72, "allow_undated": True, "quiet_start": None, "quiet_end": None, "utc_offset": DEFAULT_UTC_OFFSET,
             "include_media": True, "include_link": True, "signature": f"@{channel_username}" if channel_username else "@channel", "max_words": 500, "post_limit": POST_LIMIT_DEFAULT,  # پیش‌فرض کلمات طبق دستور فاز ۳ (قبلی ۱۵۰)
             "strict_ads": False, "interval_minutes": 60, "posts_per_cycle": 1, "hashtags": True, "daily_posts_cap": None,
             "last_run": None, "last_end": None, "last_result": "", "last_diag": None, "last_notified_diag": ""}
@@ -535,7 +550,7 @@ def get_settings(cid):
     if s.get("prompt") in _LEGACY_PROMPTS: s["prompt"] = DEFAULT_PROMPT[s["ui_lang"]]  # مهاجرت پرامپت قدیمی
     for k in list(s):
         if k.startswith("_"): s.pop(k)
-    s["interval_minutes"] = max(MIN_INTERVAL, int(s.get("interval_minutes") or MIN_INTERVAL)); s["lookback_hours"] = min(MAX_LOOKBACK, max(1, int(s.get("lookback_hours") or 24)))
+    s["interval_minutes"] = max(MIN_INTERVAL, int(s.get("interval_minutes") or MIN_INTERVAL)); s["lookback_hours"] = min(MAX_LOOKBACK, max(1, int(s.get("lookback_hours") or 72)))
     # کپشن کانال هرگز از سقف سخت بالاتر نمی‌رود (وگرنه تلگرام پست را دو پیام می‌کند)
     s["post_limit"] = min(POST_LIMIT_MAX, max(300, int(s.get("post_limit") or POST_LIMIT_DEFAULT)))
     s["posts_per_cycle"] = min(MAX_PPC, max(1, int(s.get("posts_per_cycle") or 1))); s["post_limit"] = min(4000, max(300, int(s.get("post_limit") or POST_LIMIT_DEFAULT)))
@@ -1899,7 +1914,16 @@ def heuristic_ad_check(art, strict=False):
     if len(re.findall(r"t\.me/|telegram\.me/|instagram\.com/|wa\.me/|whatsapp\.com/", text)) > 1: score += 2; reasons.append("social-link")
     if len(re.findall(r"https?://", text)) / n > 6: score += 2; reasons.append("many-links")
     if len(text) < 300: score += 1.5; reasons.append("short")
-    threshold = 6 if strict else 9; return score >= threshold, ", ".join(reasons), round(score, 1)
+    promo = len(re.findall(r"کد ?تخفیف|promo ?code|coupon|ارسال رایگان|free shipping|ثبت\u200c?نام کنید|sign ?up now|همین حالا سفارش|order now|تماس بگیرید|call now|کاتالوگ|نمایندگی|limited offer|فرصت محدود", low))
+    if promo >= 2: score += 3; reasons.append(f"promo×{promo}")
+    risk = len(re.findall(r"کازینو|casino|شرط\u200c?بندی|پیش\u200c?بینی فوتبال|forex|فارکس|سیگنال ?(?:خرید|فروش)|signal group|وام فوری|سرمایه\u200c?گذاری تضمینی|guaranteed (?:profit|return)|سود تضمینی|بیت ?کوین رایگان", low))
+    if risk: score += 3 + min(3, risk); reasons.append(f"risk×{risk}")
+    if re.search(r"/(sponsored|advertorial|advert|ads?|reklama|reportage|رپورتاژ)[-/]", url, re.I): return True, "advertorial-url", round(score + 8, 1)
+    if AD_URL.search(url) and (phones or money): return True, "ad-url+contact", round(score + 5, 1)
+    if AD_STRONG_RE and AD_STRONG_RE.search(title.lower()): return True, "advertorial-title", round(score + 9, 1)
+    if promo >= 2 and (phones or money): return True, "promo+contact", round(score + 6, 1)
+    if risk >= 2: return True, "betting/forex", round(score + 5, 1)
+    threshold = 5 if strict else 8; return score >= threshold, ", ".join(reasons), round(score, 1)
 # ============================================================
 # پرامپت، تولید و ترکیب نهایی
 def build_prompt(s, art, want_full):
@@ -1922,17 +1946,17 @@ FORMATTING RULES (mandatory, not optional — these override any conflicting sty
 - RTL: if the output language reads right-to-left (Persian, Arabic, …), open every paragraph and sentence with a word of that language, then place any English term after it; keep English runs short — long English runs scramble right-to-left text. A quoted English phrase in a blockquote may start with English.
 - SITES: only when the story itself recommends a tool, service or website, state its name and its full URL in plain text; NEVER the article's own source or any news site — the source link is added by the system itself, not by you.
 - PURE TEXT: "post" and "full" contain only the article itself — never scores, ratings, field names or JSON fragments; those live only in their own JSON fields.
-- FORMAT CONTRACT: paragraphs are separated by ONE blank line; never end mid-sentence — finish the sentence or compress the story; plain words only (no 'quoted' terms, no [markdown](links)); a sale price, discount or original-price comparison in the story means is_ad=true.
+- FORMAT CONTRACT: paragraphs are separated by ONE blank line; never end mid-sentence — finish the sentence or compress the story; plain words only (no 'quoted' terms, no [markdown](links)); Do not judge advertising yourself — the bot screens that locally before you ever see the text.
 - VARY THE SUBJECT: name the main person/thing once at first mention, then use pronouns or natural substitutes — never open every paragraph with the same name.
 - UNKNOWN NAMES: a little-known person, company or term gets a one-clause introduction at first mention.
 - NEUTRAL & SOURCE-ONLY: strictly neutral — no judgment, opinion, praise or personal analysis; never add or invent anything beyond the source; never pad to reach the cap — shorter is fine.
 - "post": an engaging, COMPLETE mini-story — max {s['max_words']} words and at most {s["post_limit"]} characters total; never leave the story half-told: if space is tight, compress the whole story instead of dropping its second half.{', ending with 2–4 relevant hashtags on the last line' if s['hashtags'] else ''}.
 - "full": {'the EXPANDED bot version: everything the post says PLUS the deeper details, background, numbers and context — it must NOT merely repeat the post; start fresh and go deeper. Same format: <b> sub-headings, bullets, at least two <blockquote> highlights (400–900 words, max 4000 characters).' if want_full else 'null'}
-- If the text is an advertisement / advertorial / product-for-sale / betting promotion: is_ad=true.
+- The bot screens advertising itself; you do NOT decide ads. Instead score honestly and strictly: sponsored, product-for-sale or promotional text scores LOW on the "non-promotional" criterion.
 - No preamble, never talk about yourself.
 REMINDER: the entire output — title, post, full, hashtags — must be in {s['language']} only.
 Return ONLY one valid JSON object (no code fences) with exactly this structure:
-{{"is_ad": false, "ad_reason": "", "category": "category name", "title": "headline", "scores": {{"criterion name": 0-10}}, "post": "HTML", "full": "HTML or null"}}"""
+{{"category": "category name", "title": "headline", "scores": {{"criterion name": 0-10}}, "post": "HTML", "full": "HTML or null"}}"""
     raw_text = art.get('text') or ""
     text = raw_text[:AI_INPUT_TEXT_CHARS]
     if len(raw_text) > len(text): log.warning("prompt input truncated %d -> %d chars (summarizer did not converge)", len(raw_text), len(text))
@@ -2355,9 +2379,12 @@ class Diag:
             except Exception: lines.append(DIAG[k][i])
         return "\n".join(lines)
     def to_json(self): return json.dumps({"items": self.items, "hints": self.hints, "stage": self.stage}, ensure_ascii=False)
-def _within_lookback(pub_iso, s):
+def _within_lookback(pub_iso, s, hours=None):
     if not pub_iso: return bool(s["allow_undated"])
-    d = parse_dt(pub_iso); return bool(d and (now_utc() - d) <= timedelta(hours=int(s["lookback_hours"])))
+    d = parse_dt(pub_iso)
+    if d is None: return bool(s.get("allow_undated", True))     # بدون تاریخ ⇒ تصمیم با تنظیم کانال (پیش‌تر همیشه رد می‌شد)
+    h = int(hours if hours is not None else (s.get("lookback_hours") or 72))
+    return (now_utc() - d) <= timedelta(hours=h)
 def _pub_err(code, lang):
     if code == "bot_not_admin": return DIAG["bot_not_admin"][1 if lang == "en" else 0]
     if code == "duplicate": return "duplicate" if lang == "en" else "تکراری"
@@ -2436,14 +2463,15 @@ async def _cycle(bot, uid, cid, test_mode, progress):
     if lo: D.add("leftover", n=len(lo)); candidates += lo
     if n_old: D.add("old", n=n_old, h=s["lookback_hours"])
     if n_dup: D.add("dup", n=n_dup)
-    if not candidates and test_mode and all_items:
+    if not candidates and all_items:
+        # پنجره‌ی نرم: هیچ‌چیز در بازه‌ی کانال نبود ⇒ تازه‌ترین خبرهای همین منابع را برمی‌داریم تا چرخه دست‌خالی نماند
         retry = 0
         for it, h in all_items:
             row = q("SELECT id,status FROM articles WHERE channel_id=? AND hash=?", (cid, h), one=True)
             if row and row["status"] in ("skipped", "rejected", "failed") and not posted_before(ch["chat_id"], h):
-                article_update(row["id"], status="discovered", reason=""); candidates.append({"aid": row["id"], "url": it["url"], "title": it["title"], "published": it.get("published"), "html": it.get("html") or "", "media": it.get("media")}); retry += 1
-                if retry >= 5: break
-        if retry: D.add("retry", n=retry)
+                article_update(row["id"], status="discovered", reason=""); candidates.append({"aid": row["id"], "url": it["url"], "title": it["title"], "published": it.get("published"), "html": it.get("html") or "", "media": it.get("media"), "soft": True}); retry += 1
+                if retry >= 8: break
+        if retry: D.add("soft_window", n=retry)
     res["found"] = len(candidates); await p(40, P["found"].format(n=len(candidates)))
     if not candidates: D.add("none_found"); D.hint("hint_sources"); return fin()
     D.add("found", n=len(candidates))
@@ -2484,7 +2512,9 @@ async def _cycle(bot, uid, cid, test_mode, progress):
             D.stage = "filter"
             # هر نامزد (کشف‌شده، مانده‌ی صف یا تلاش مجدد) بلافاصله پیش از تولید دوباره با پنجره‌ی زمانی سنجیده می‌شود
             pub_when = art.get("published") or c.get("published")
-            if not _within_lookback(pub_when, s):
+            window_ok = _within_lookback(pub_when, s)
+            if not window_ok and c.get("soft"): window_ok = _within_lookback(pub_when, s, hours=MAX_LOOKBACK)
+            if not window_ok:
                 article_update(aid, status="skipped", reason="old" if pub_when else "undated", **({"published_at": pub_when} if pub_when else {}))
                 if not pub_when: cnt["undated"] += 1
                 step_add(_current_operation.get(), "src_skip_old", key=src_name, status="fail")
@@ -2499,7 +2529,6 @@ async def _cycle(bot, uid, cid, test_mode, progress):
                 step_add(_current_operation.get(), "src_ai_fail", key=src_name, status="fail", model=model)
                 continue
             D.stage = "score"
-            if gen.get("is_ad"): article_update(aid, status="rejected", reason=f"ai_ad: {gen.get('ad_reason', '')}", score=gen["score"]); res["rejected"] += 1; cnt["ai_ad"] += 1; details.append((art["title"], f"AI ad: {str(gen.get('ad_reason', ''))[:40]}")); step_add(_current_operation.get(), "src_ad", key=src_name, status="fail"); continue
             best = max(best, gen["score"])
             if gen["score"] < float(s["min_score"]): article_update(aid, status="rejected", reason=f"score {gen['score']} < {s['min_score']}", score=gen["score"]); res["rejected"] += 1; cnt["low"] += 1; details.append((art["title"], f"score {gen['score']}")); step_add(_current_operation.get(), "src_low_score", key=src_name, status="fail", score=gen["score"]); continue
             post, full = compose(s, ch, art, gen)
@@ -2782,8 +2811,8 @@ TXT = {
     # ---- زمان‌بندی
     "sched_title": ("⏰ <b>زمان‌بندی کانال {title}</b>\n⏱ فاصله‌ی چرخه: هر {iv} دقیقه · 📦 در هر چرخه {ppc} پست\n🗓 بازه‌ی خبری: {lb} ساعت گذشته · 📅 خبر بدون تاریخ: {ud}\n🌙 {quiet} · 🌍 {city} {tz} (⌚ {loc} · UTC {utc})\n🔁 {mode}", "⏰ <b>Schedule — {title}</b>\n⏱ every {iv}′ · 📦 {ppc} posts/cycle · 🕰 last {lb}h · 📅 undated {ud}\n🌙 {quiet} · 🌍 {city} {tz} (⌚ {loc} · UTC {utc})\n🔁 {mode}"),
     "mode_auto": ("⚡ خودکار — انتشار مستقیم", "⚡ auto — publish directly"), "mode_review": ("📝 بازبینی — تأیید دستی در صف", "📝 review — manual approval in queue"), "none": ("—", "—"),
-    "b_interval": ("⏱ فاصله‌ی چرخه: هر {n} دقیقه", "⏱ Cycle interval: every {n} min"), "b_ppc": ("📦 در هر چرخه {n} پست منتشر شود", "📦 Publish {n} post(s) per cycle"), "b_lookback": ("🗓 فقط خبرهای {n} ساعت گذشته", "🗓 Only news from the last {n} hours"), "b_undated": ("📅 خبرهای بدون تاریخ: {i}", "📅 Undated news: {i}"),
-    "b_daily_cap": ("📊 در روز حداکثر {n} پست منتشر شود", "📊 Publish at most {n} post(s) per day"), "cap_over_plan": ("⚠️ بیشتر از سقف پلن شما ({n} پست در روز) قابل تنظیم نیست.", "⚠️ Cannot exceed your plan limit ({n} posts/day)."), "cap_range": ("حداکثر تا {n} پست در روز (طبق پلن شما)", "Max {n} posts/day (your plan)"), "b_quiet": ("🌙 خاموشی", "🌙 Quiet hours"), "b_tz": ("🌍 منطقه زمانی", "🌍 Time zone"), "b_mode": ("🔁 {m}", "🔁 {m}"),
+    "b_interval": ('⏱ هر {n} دقیقه', '⏱ every {n} min'), "b_ppc": ('📦 {n} پست در چرخه', '📦 {n} post(s)/cycle'), "b_lookback": ('🗓 پنجره {n} ساعت', '🗓 window {n}h'), "b_undated": ('📅 بدون تاریخ: {i}', '📅 undated: {i}'),
+    "b_daily_cap": ('📊 سقف روزانه {n}', '📊 daily cap {n}'), "cap_over_plan": ("⚠️ بیشتر از سقف پلن شما ({n} پست در روز) قابل تنظیم نیست.", "⚠️ Cannot exceed your plan limit ({n} posts/day)."), "cap_range": ("حداکثر تا {n} پست در روز (طبق پلن شما)", "Max {n} posts/day (your plan)"), "b_quiet": ("🌙 خاموشی", "🌙 Quiet hours"), "b_tz": ("🌍 منطقه زمانی", "🌍 Time zone"), "b_mode": ("🔁 {m}", "🔁 {m}"),
     "mode_set_auto": ("⚡ خودکار: انتشار مستقیم", "⚡ Auto: publish directly"), "mode_set_review": ("📝 بازبینی: منتظر تأیید در صف", "📝 Review: waits for approval"),
     "quiet_pick_start": ("🌙 <b>خاموشی</b> · ساعت <b>شروع</b> ({tz} · الان {loc}):", "🌙 <b>Quiet hours</b> · <b>start</b> hour ({tz} · now {loc}):"), "quiet_pick_end": ("🌙 شروع {h}:00 · ساعت <b>پایان</b>:", "🌙 Start {h}:00 · <b>end</b> hour:"),
     "quiet_off": ("🚫 بدون خاموشی", "🚫 No quiet hours"), "quiet_set": ("🌙 خاموشی {a}:00 → {b}:00", "🌙 Quiet {a}:00 → {b}:00"), "quiet_cleared": ("🌙 خاموشی حذف شد", "🌙 Quiet hours cleared"),
@@ -2977,7 +3006,7 @@ SPHARSE = {
   # --- مدل‌ها (وضعیت Working) — همیشه با ضمیر اول‌شخص
   ("model_start","run",0): "⏳ دارم مدل {} را اجرا می‌کنم…", ("model_start","run",1): "🧠 دارم با مدل {} می‌نویسم…", ("model_start","run",2): "▶️ مدل {} را روشن می‌کنم…",
   ("model_start","ok",0): "✅ مدل {} جواب داد؛ دارم خروجی‌اش را بررسی می‌کنم", ("model_start","ok",1): "🎯 خروجی مدل {} سالم بود", ("model_start","ok",2): "✅ مدل {} کارش را درست انجام داد",
-  ("model_start","fail",0): "⚠️ مدل {} جواب نداد؛ می‌روم سراغ مدل بعدی", ("model_start","fail",1): "❌ مدل {} از کار افتاده بود؛ مدل بعدی را امتحان می‌کنم", ("model_start","fail",2): "🛑 مدل {} پاسخ نداد؛ سوییچ می‌کنم روی مدل بعدی",
+  ("model_start","fail",0): '⚠️ مدل {} جواب نداد', ("model_start","fail",1): "❌ مدل {} از کار افتاده بود؛ مدل بعدی را امتحان می‌کنم", ("model_start","fail",2): "🛑 مدل {} پاسخ نداد؛ سوییچ می‌کنم روی مدل بعدی",
   ("prep","run",0): "🧾 دارم متن مقاله را برای مدل {} بخش‌بندی و خلاصه می‌کنم…", ("prep","run",1): "📚 دارم کل متن را می‌خوانم تا به مدل {} بدهم…", ("prep","run",2): "🗂 دارم متن را آماده‌ی تحویل به {} می‌کنم…",
   ("post_gen","run",0): "⏳ دارم محتوا را می‌نویسم…", ("post_gen","run",1): "🧠 دارم مطابق سبک کانال می‌نویسم…", ("post_gen","run",2): "✍️ دارم متن را آماده می‌کنم…",
   ("post_ready","ok",0): "✅ محتوا آماده شد", ("post_ready","ok",1): "🎉 پست تولید شد", ("post_ready","ok",2): "📨 دارم به کانال می‌فرستم…",
@@ -2985,18 +3014,18 @@ SPHARSE = {
   # --- منابع (وضعیت Thinking)
   ("src_check","run",0): "🔎 دارم {} را بررسی می‌کنم…", ("src_check","run",1): "⏳ خب، می‌روم سراغ {}…", ("src_check","run",2): "📖 دارم {} را می‌خوانم…",
   ("src_found","ok",0): "✅ در {} یک مورد مناسب پیدا کردم", ("src_found","ok",1): "📝 {} یک خبر به‌درد‌بخور داشت", ("src_found","ok",2): "🎯 در {} یک گزینه‌ی خوب دیدم",
-  ("src_empty","fail",0): "📭 در {} چیزی به کارم نیامد؛ می‌روم منبع بعدی", ("src_empty","fail",1): "⚠️ خروجی {} با معیارهای کانال نمی‌خواند", ("src_empty","fail",2): "📭 {} خبر تازه‌ای نداشت",
+  ("src_empty","fail",0): '📭 {} خبری نداشت', ("src_empty","fail",1): "⚠️ خروجی {} با معیارهای کانال نمی‌خواند", ("src_empty","fail",2): "📭 {} خبر تازه‌ای نداشت",
   ("src_cooldown","run",0): "⏳ {} در بازه‌ی استراحت است؛ فعلاً ردش می‌کنم", ("src_cooldown","run",1): "🔄 {} را تازه بررسی کرده‌ام؛ بعداً سراغش می‌روم", ("src_cooldown","run",2): "💤 {} دارد بازیابی می‌شود",
-  ("src_fail","fail",0): "⚠️ {} جواب نداد؛ منبع را کنار می‌گذارم", ("src_fail","fail",1): "❌ نتوانستم به {} وصل شوم", ("src_fail","fail",2): "🔌 {} قطع بود؛ می‌روم منبع بعدی",
+  ("src_fail","fail",0): '⚠️ {} پاسخ نداد', ("src_fail","fail",1): "❌ نتوانستم به {} وصل شوم", ("src_fail","fail",2): "🔌 {} قطع بود؛ می‌روم منبع بعدی",
   ("src_notmod","run",0): "ℹ️ {} از آخرین بررسی تازه‌تر نشده", ("src_notmod","run",1): "⏳ {} خبر جدیدی نداشت", ("src_notmod","run",2): "📄 محتوای {} همان قبلی است",
   ("src_extract_fail","fail",0): "📄 در {} متن خبر خوانده نشد؛ ردش می‌کنم", ("src_extract_fail","fail",1): "❌ {} محتوای قابل‌خواندن نداشت؛ ردش کردم", ("src_extract_fail","fail",2): "⚠️ بدنهٔ خبر در {} خالی بود؛ ردش کردم",
-  ("src_skip_old","fail",0): "🕰 در {} این خبر قدیمی‌تر از بازهٔ تعیین‌شده بود", ("src_skip_old","fail",1): "⏳ در {} تاریخ خبر گذشته بود؛ کنارش می‌گذارم", ("src_skip_old","fail",2): "📅 خبر {} بیرون از بازهٔ زمانی بود",
+  ("src_skip_old","fail",0): "🕰 در {} این خبر قدیمی‌تر از بازهٔ تعیین‌شده بود", ("src_skip_old","fail",1): '⏳ {} قدیمی بود', ("src_skip_old","fail",2): "📅 خبر {} بیرون از بازهٔ زمانی بود",
   ("src_ad","fail",0): "🚫 محتوای {} تبلیغاتی بود؛ پردازش نمی‌کنم", ("src_ad","fail",1): "⚠️ محتوای {} را تبلیغ تشخیص دادم؛ کنارش می‌گذارم", ("src_ad","fail",2): "🛑 فیلتر تبلیغ، مورد {} را رد کرد",
   ("src_ai_fail","fail",0): "🧠 مدل {} خروجی قابل‌استفاده نداد؛ می‌روم سراغ بعدی", ("src_ai_fail","fail",1): "❌ تولید محتوا با {} ناموفق بود", ("src_ai_fail","fail",2): "⚠️ خروجی مدل {} معتبر نبود",
   ("src_dup","fail",0): "🔁 خبر {} را قبلاً پردازش کرده‌ام؛ دوباره نمی‌سازمش", ("src_dup","fail",1): "📌 خبر {} تکراری بود؛ ردش می‌کنم", ("src_dup","fail",2): "♻️ {} خبر تکراری داشت؛ می‌روم سراغ خبر بعدی",
   ("src_low_score","fail",0): "📏 امتیاز خبر {} به حداقل کانال نرسید", ("src_low_score","fail",1): "🧪 در {} امتیاز پایین بود؛ ردش می‌کنم", ("src_low_score","fail",2): "⚠️ خبر {} با معیارهای کانال هم‌خوان نبود",
   # --- مراحل میانی
-  ("found","ok",0): "📥 یک مورد مطابق معیارها پیدا کردم", ("found","ok",1): "✅ یک گزینه‌ی خوب پیدا کردم", ("found","ok",2): "🎯 آیتم مناسب را تشخیص دادم",
+  ("found","ok",0): '📥 یک مورد مناسب', ("found","ok",1): "✅ یک گزینه‌ی خوب پیدا کردم", ("found","ok",2): "🎯 آیتم مناسب را تشخیص دادم",
   ("extract","run",0): "🧾 دارم متن خبر را استخراج می‌کنم…", ("extract","run",1): "🔍 دارم بدنه‌ی خبر را می‌خوانم…", ("extract","run",2): "📄 دارم کل مقاله را می‌خوانم…",
   ("low","run",0): "⏳ دارم امتیاز می‌دهم…", ("low","run",1): "📏 دارم معیارها را می‌سنجم…", ("low","run",2): "🧪 دارم محتوا را ارزیابی می‌کنم…",
   ("ad","run",0): "🚫 دارم تبلیغاتی بودن را بررسی می‌کنم…", ("ad","run",1): "🛡 دارم نشانه‌های تبلیغ را می‌گردم…", ("ad","run",2): "⚠️ دارم محتوای تبلیغاتی را جدا می‌کنم…",
@@ -3517,12 +3546,11 @@ async def view_channel(update, context, cid):
     text = (tr(lang, "ch_panel", title=esc(ch["title"])) + (f" · @{ch['username']}" if ch["username"] else "") + "\n" + tr(lang, "ch_status", i="🟢" if on else "🔴", st=tr(lang, "on" if on else "off"), mode=tr(lang, "auto" if s["mode"] == "auto" else "review")) + "\n" +
             tr(lang, "ch_stats", s=len(list_sources(cid, True)), q=ready_count(cid), p=count_articles(cid=cid, hours=24, status="published"), r=count_articles(cid=cid, hours=24, status="rejected"), a=ago_text(s["last_run"], lang)))
     text += quota_bars([("📝", channel_posts_today(cid, admin_offset(uid)), s.get("daily_posts_cap"))])
-    kb = [[B(tr(lang, "report"), f"a:rep:{cid}"), B(tr(lang, "test"), f"a:test:{cid}")],
-          [B(tr(lang, "sources", n=len(list_sources(cid))), f"a:src:{cid}"), B(tr(lang, "content"), f"a:con:{cid}")],
-          [B(tr(lang, "sched"), f"a:sch:{cid}"), B(tr(lang, "queue", n=ready_count(cid)), f"a:que:{cid}")],
-          [B(tr(lang, "rejected"), f"a:rej:{cid}")],
-          [B(tr(lang, "automation", i="🟢" if on else "🔴"), f"a:tog:{cid}:enabled"), B(tr(lang, "ch_del"), f"a:chdel:{cid}")],
-          [B(tr(lang, "back"), "a:home")]]
+    kb = [[B(tr(lang, "test"), f"a:test:{cid}"), B(tr(lang, "report"), f"a:rep:{cid}")],
+          [B(tr(lang, "sources", n=len(list_sources(cid))), f"a:src:{cid}"), B(tr(lang, "queue", n=ready_count(cid)), f"a:que:{cid}")],
+          [B(tr(lang, "sched"), f"a:sch:{cid}"), B(tr(lang, "content"), f"a:con:{cid}")],
+          [B(tr(lang, "rejected"), f"a:rej:{cid}"), B(tr(lang, "automation", i="🟢" if on else "🔴"), f"a:tog:{cid}:enabled")],
+          [B(tr(lang, "ch_del"), f"a:chdel:{cid}"), B(tr(lang, "back"), "a:home")]]
     await render(update, context, text, kb)
 async def channel_claim(update, context, existing, uid, lang, back, ud):
     """کانالی که در پنل دیگری است: ثبت‌کنندهٔ نخست «بررسی» می‌گیرد؛ دیگران باید توکن ۱۰ رقمی مالک را بیاورند."""
