@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-""" 
+"""
 NewsBot v3 — یک‌فایل کامل: هسته‌ی داده، موتور محتوا، رابط کاربری، پنل مدیر کلان
 نیازمندی‌ها: python-telegram-bot[job-queue]>=21, httpx, feedparser, trafilatura, beautifulsoup4, lxml
 """
-import os, re, json, html, time, random, asyncio, logging, sqlite3, hashlib, secrets, tempfile, threading, ipaddress, socket, gzip
+import os, re, json, html, time, random, asyncio, logging, sqlite3, hashlib, secrets, tempfile, threading, ipaddress, socket
 from datetime import datetime, timedelta, timezone
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -22,9 +22,10 @@ MEDIA_UPLOAD_MB = 2000 if API_BASE else 50                  # سقف واقعی 
 MAX_MEDIA_MB = max(1, min(int(os.getenv("MAX_MEDIA_MB", "50")), MEDIA_UPLOAD_MB))   # هرگز بیشتر از سقف واقعی دانلود نمی‌کنیم
 MAX_MEDIA_BYTES = MAX_MEDIA_MB * 1024 * 1024
 MAX_PAGE_BYTES = int(os.getenv("MAX_PAGE_MB", "8")) * 1024 * 1024   # سقف حجم صفحه/فید دانلودی (جلوگیری از پرشدن حافظه)
-MAX_ARTICLE_CHARS = int(os.getenv("MAX_ARTICLE_CHARS", "28000"))
-MAX_ARTICLE_PAGES = int(os.getenv("MAX_ARTICLE_PAGES", "3"))
+MAX_ARTICLE_CHARS = int(os.getenv("MAX_ARTICLE_CHARS", "120000"))  # سقف خواندن متن منبع — سخاوتمندانه تا محتوا از قلم نیفتد (~۲۰٬۰۰۰ کلمه، بیش از هر خبر واقعی)
+MAX_ARTICLE_PAGES = int(os.getenv("MAX_ARTICLE_PAGES", "5"))    # مقالات چندصفحه‌ای تا این تعداد صفحه دنبال می‌شوند
 AI_INPUT_TEXT_CHARS = int(os.getenv("AI_INPUT_TEXT_CHARS", "8000"))  # limit on article text sent to the model
+AI_MERGE_MAX_DEPTH = int(os.getenv("AI_MERGE_MAX_DEPTH", "3"))       # سقف لایه‌های جمع‌کردن خلاصه‌ها؛ هیچ محتوایی دور ریخته نمی‌شود
 CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "")
 CF_KV_NAMESPACE_ID = os.getenv("CF_KV_NAMESPACE_ID") or os.getenv("CF_KV_ID", "")
 CF_API_TOKEN = os.getenv("CF_API_TOKEN", "")
@@ -40,14 +41,16 @@ SOURCE_COOLDOWN_MIN = 10     # حداقل فاصله‌ی دو بررسی یک �
 SOURCE_FAIL_LIMIT = 3         # فقط پس از چند شکست متوالی، منبع خاموش می‌شود
 SOURCE_PAUSE_MIN = int(os.getenv("SOURCE_PAUSE_MIN", "30"))   # توقف موقت منبع شکست‌خورده تا backoff باز شود
 MODEL_BACKOFF_MAX_MIN = int(os.getenv("MODEL_BACKOFF_MAX_MIN", "120"))  # سقف backoff نمایی مدل سالم‌نشده
-PERSIST_INTERVAL_SECONDS = max(60, int(os.getenv("PERSIST_INTERVAL_SECONDS", "300")))
 MODEL_PROBE_MIN = 10
-MIN_INTERVAL = 30            # حداقل فاصله‌ی چرخه (دقیقه)
+MODEL_PROBE_BATCH = int(os.getenv("MODEL_PROBE_BATCH", "3"))    # چند مدل خراب در هر تیک آزمایش شود (بازیابی سریع‌تر)
+MAX_DAILY_POSTS_CAP = int(os.getenv("MAX_DAILY_POSTS_CAP", "500"))   # سقف مطلقِ «پست در روز» برای هر کانال
+MIN_INTERVAL = int(os.getenv("MIN_INTERVAL", "30"))            # حداقل فاصله‌ی چرخه (دقیقه)
 MAX_LOOKBACK = 48            # حداکثر بازه‌ی مقالات (ساعت)
 MAX_PPC = 5                  # حداکثر پست در هر چرخه
 POST_LIMIT_DEFAULT = 900     # پیش‌فرض سقف کاراکتر کپشن کانال
 POST_LIMIT_MAX = 900         # سقف سخت کپشن کانال: همیشه زیر محدودیت ۱۰۲۴ تلگرام می‌ماند تا پست هرگز دو پیام نشود     # سقف کاراکتر کپشن کانال (محتوا/امضا/بیشتر در دیپ‌لینک می‌آید) طبق درخواست ادمین (پیش‌فرض) — تنظیم طبق دستور مدیر فاز ۳ (قبلی 700)
-BOT_FULL_MAX = 12000         # سقف کاراکتر محتوای کامل داخل ربات («بیشتر») — تلگرام خودش چندبخشی می‌کند
+BOT_FULL_MAX = 20000         # سقف کاراکتر محتوای کامل داخل ربات («بیشتر») — تلگرام خودش چندبخشی می‌کند
+BOT_FULL_HARD_MAX = int(os.getenv("BOT_FULL_HARD_MAX", "60000"))   # سقف سخت ذخیره‌سازی؛ بسیار بالاتر از خروجی واقعی مدل
 LANGS = ("fa", "en")
 # ---- محافظت در برابر فشار (قابل تنظیم با متغیر محیطی)
 AI_CONCURRENCY = int(os.getenv("AI_CONCURRENCY", "3"))          # درخواست هم‌زمان به مدل‌ها
@@ -60,7 +63,6 @@ CB_RATE = float(os.getenv("CB_RATE", "0.6"))                    # حداقل ف�
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("core")
-logging.getLogger("TEST_DEBUG").setLevel(logging.DEBUG)
 # ============================================================
 # ابزار زمان (فقط بر پایه‌ی آفست UTC)
 TZ_ZONES = [("tehran", 3.5), ("istanbul", 3), ("dubai", 4), ("kabul", 4.5), ("karachi", 5), ("delhi", 5.5), ("moscow", 3), ("berlin", 1), ("london", 0),
@@ -95,14 +97,6 @@ def ago_text(iso, lang="fa"):
     if lang == "en": return f"{s}s" if s < 60 else f"{s//60}m" if s < 3600 else f"{s//3600}h" if s < 86400 else f"{s//86400}d"
     return f"{s} ثانیه" if s < 60 else f"{s//60} دقیقه" if s < 3600 else f"{s//3600} ساعت" if s < 86400 else f"{s//86400} روز"
 def url_hash(u): return hashlib.sha1(u.strip().encode()).hexdigest()[:20]
-def _parse_expiry_unused(text):
-    """«30» → ۳۰ روز بعد · «2025-12-31» → پایان همان روز (UTC). خروجی: iso یا None"""
-    t = str(text).strip().translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789"))
-    if t.isdigit(): return (now_utc() + timedelta(days=int(t))).isoformat()
-    m = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$", t)
-    if not m: return None
-    try: return datetime(int(m[1]), int(m[2]), int(m[3]), 23, 59, tzinfo=UTC).isoformat()
-    except Exception: return None
 # ============================================================
 # محافظت در برابر فشار: قفل‌ها، سمافورها، محدودکننده‌ی نرخ
 AI_SEM = asyncio.Semaphore(AI_CONCURRENCY)
@@ -130,21 +124,24 @@ def rate_clear(key): _rl.pop(key, None)
 def rate_left(key, min_gap): return max(0, int(min_gap - (time.time() - _rl.get(key, 0))))
 # ============================================================
 # دیتابیس + مهاجرت خودکار
-_conn, _lock = None, threading.RLock()
+_lock = threading.RLock()      # فقط نوشتن‌ها را بین تردها سریال می‌کند
+_tls = threading.local()       # هر ترد کانکشن SQLite مخصوص خودش را دارد
+_SCHEMA_READY = False          # اسکیما/مایگریشن فقط یک‌بار در هر پروسه اجرا می‌شود
+SCHEMA_VERSION = 1             # نسخهٔ اسکیما (در جدول meta نگه داشته می‌شود)
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT, name TEXT, role TEXT DEFAULT 'user', plan_id INTEGER, plan_expires TEXT, next_plan_id INTEGER, next_plan_days INTEGER, free_used INTEGER DEFAULT 0, banned INTEGER DEFAULT 0, lang TEXT, remind_key TEXT, premium INTEGER DEFAULT 0, created_at TEXT, last_seen TEXT);
 CREATE TABLE IF NOT EXISTS plans(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, name_en TEXT, days INTEGER, daily_posts INTEGER, max_sources INTEGER, max_channels INTEGER, daily_tests INTEGER, price TEXT DEFAULT '', price_en TEXT DEFAULT '', description TEXT DEFAULT '', description_en TEXT DEFAULT '', is_free INTEGER DEFAULT 0, active INTEGER DEFAULT 1, sort INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS discounts(code TEXT PRIMARY KEY, percent INTEGER, expires TEXT, max_uses INTEGER DEFAULT 0, used INTEGER DEFAULT 0, active INTEGER DEFAULT 1, created_at TEXT);
-CREATE TABLE IF NOT EXISTS channels(id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER, chat_id INTEGER, title TEXT, username TEXT, lock_code TEXT, verified_by INTEGER, created_at TEXT, settings TEXT);
+CREATE TABLE IF NOT EXISTS channels(id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER, chat_id INTEGER, title TEXT, username TEXT, verified_by INTEGER, created_at TEXT, settings TEXT, original_admin_id INTEGER);
 CREATE TABLE IF NOT EXISTS sources(id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER, channel_id INTEGER, url TEXT, feed_url TEXT, title TEXT DEFAULT '', active INTEGER DEFAULT 1, bot_active INTEGER DEFAULT 1, api_url TEXT, api_key TEXT, api_note TEXT DEFAULT '', etag TEXT, last_modified TEXT, last_fetch TEXT, fail_count INTEGER DEFAULT 0, found_total INTEGER DEFAULT 0, last_error TEXT);
 CREATE TABLE IF NOT EXISTS usage(admin_id INTEGER, day TEXT, posts INTEGER DEFAULT 0, tests INTEGER DEFAULT 0, PRIMARY KEY(admin_id, day));
-CREATE TABLE IF NOT EXISTS articles(id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER, channel_id INTEGER, hash TEXT, url TEXT, title TEXT, source_id INTEGER, published_at TEXT, created_at TEXT, status TEXT, reason TEXT, score REAL, category TEXT, text TEXT, post_html TEXT, full_html TEXT, media TEXT, links TEXT, model TEXT, UNIQUE(channel_id, hash));
+CREATE TABLE IF NOT EXISTS articles(id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER, channel_id INTEGER, hash TEXT, url TEXT, title TEXT, source_id INTEGER, published_at TEXT, created_at TEXT, status TEXT, reason TEXT, score REAL, category TEXT, post_html TEXT, full_html TEXT, media TEXT, links TEXT, model TEXT, UNIQUE(channel_id, hash));
 CREATE TABLE IF NOT EXISTS posted(channel_id INTEGER, hash TEXT, posted_at TEXT, PRIMARY KEY(channel_id, hash));
+CREATE TABLE IF NOT EXISTS ch_tokens(token TEXT PRIMARY KEY, channel_id INTEGER, issued_to INTEGER, issued_at TEXT, expires_at TEXT, used_at TEXT);
 CREATE TABLE IF NOT EXISTS ai_models(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, kind TEXT, base_url TEXT, api_key TEXT, model TEXT, priority INTEGER DEFAULT 10, active INTEGER DEFAULT 1, status TEXT DEFAULT 'ok', fail_count INTEGER DEFAULT 0, last_error TEXT, last_ok TEXT, last_fail TEXT, ok_count INTEGER DEFAULT 0, temperature REAL DEFAULT 0.5, max_tokens INTEGER DEFAULT 2500, owner_id INTEGER);
 CREATE TABLE IF NOT EXISTS deeplinks(key TEXT PRIMARY KEY, admin_id INTEGER, created_at TEXT, local_json TEXT);
 CREATE TABLE IF NOT EXISTS kv_cache(key TEXT PRIMARY KEY, value TEXT, cached_at TEXT);
 CREATE TABLE IF NOT EXISTS dedup(channel_id INTEGER, fp TEXT, ts TEXT, PRIMARY KEY(channel_id, fp));
-CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, level TEXT, admin_id INTEGER, msg TEXT);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS support(user_id INTEGER PRIMARY KEY, open INTEGER DEFAULT 0, opened_at TEXT);
 CREATE TABLE IF NOT EXISTS support_map(msg_id INTEGER PRIMARY KEY, user_id INTEGER, ts TEXT);
@@ -152,17 +149,18 @@ CREATE TABLE IF NOT EXISTS pay_requests(id INTEGER PRIMARY KEY AUTOINCREMENT, us
 CREATE INDEX IF NOT EXISTS idx_art_ch_status ON articles(channel_id, status);
 CREATE INDEX IF NOT EXISTS idx_art_created ON articles(created_at);
 CREATE INDEX IF NOT EXISTS idx_src_ch ON sources(channel_id);
-CREATE INDEX IF NOT EXISTS idx_logs_admin ON logs(admin_id, id);
 """
 DB_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_pay_status ON pay_requests(status, id);
 CREATE INDEX IF NOT EXISTS idx_usage_day ON usage(day);
 CREATE INDEX IF NOT EXISTS idx_art_disco ON articles(channel_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_dedup_ts ON dedup(ts);
+CREATE INDEX IF NOT EXISTS idx_users_plan_exp ON users(plan_expires);
+CREATE INDEX IF NOT EXISTS idx_chtok_ch ON ch_tokens(channel_id, used_at);
 """
 MIGRATIONS = [("users", "next_plan_id", "INTEGER"), ("users", "next_plan_days", "INTEGER"), ("users", "lang", "TEXT"), ("users", "remind_key", "TEXT"), ("users", "premium", "INTEGER DEFAULT 0"),
               ("plans", "name_en", "TEXT"), ("plans", "price_en", "TEXT DEFAULT ''"), ("plans", "description_en", "TEXT DEFAULT ''"),
-              ("channels", "lock_code", "TEXT"), ("channels", "verified_by", "INTEGER"), ("channels", "created_at", "TEXT"), ("channels", "settings", "TEXT"),
+              ("channels", "verified_by", "INTEGER"), ("channels", "created_at", "TEXT"), ("channels", "settings", "TEXT"), ("channels", "original_admin_id", "INTEGER"),
               ("sources", "channel_id", "INTEGER"), ("sources", "feed_url", "TEXT"), ("sources", "last_error", "TEXT"), ("articles", "channel_id", "INTEGER"),
               ("sources", "bot_active", "INTEGER DEFAULT 1"), ("sources", "api_url", "TEXT"), ("sources", "api_key", "TEXT"), ("sources", "api_note", "TEXT DEFAULT ''"),
               ("pay_requests", "discount", "TEXT"), ("pay_requests", "final_price", "TEXT"),
@@ -170,33 +168,60 @@ MIGRATIONS = [("users", "next_plan_id", "INTEGER"), ("users", "next_plan_days", 
               ("ai_models", "fail_count", "INTEGER DEFAULT 0"), ("ai_models", "next_try_after", "TEXT DEFAULT ''"),
               ("plans", "daily_tests", "INTEGER DEFAULT 2"), ("plans", "price_num", "REAL DEFAULT 0"), ("sources", "found_total", "INTEGER DEFAULT 0"), ("sources", "title", "TEXT DEFAULT ''")
               , ("sources", "fail_count", "INTEGER DEFAULT 0"), ("sources", "next_try_after", "TEXT DEFAULT \'\'")]
-def db():
-    global _conn
-    if _conn is None:
-        _conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
-        _conn.row_factory = sqlite3.Row
-        for pr in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL", "PRAGMA busy_timeout=8000", "PRAGMA cache_size=-16000", "PRAGMA temp_store=MEMORY"): _conn.execute(pr)
-        _conn.executescript(SCHEMA + "\n" + DB_INDEXES)
+def _init_conn():
+    """یک کانکشن SQLite تازه برای ترد جاری (WAL + busy_timeout)."""
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    conn.row_factory = sqlite3.Row
+    for pr in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL", "PRAGMA busy_timeout=15000", "PRAGMA cache_size=-16000", "PRAGMA temp_store=MEMORY"):
+        try: conn.execute(pr)
+        except sqlite3.OperationalError: pass
+    return conn
+
+def _ensure_schema(conn):
+    """اسکیمای پایه + مایگریشن idempotent (با PRAGMA table_info) + ثبت نسخهٔ اسکیما — یک‌بار در هر پروسه."""
+    global _SCHEMA_READY
+    with _lock:
+        if _SCHEMA_READY: return
+        conn.executescript(SCHEMA + "\n" + DB_INDEXES)
+        conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+        have = {}
         for tbl, col, decl in MIGRATIONS:
-            try: _conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {decl}")
-            except sqlite3.OperationalError: pass
-        _conn.commit()
-    return _conn
+            if tbl not in have: have[tbl] = {r["name"] for r in conn.execute(f"PRAGMA table_info({tbl})")}
+            if col not in have[tbl]:
+                conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {decl}")
+                have[tbl].add(col)
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
+        conn.execute("UPDATE channels SET original_admin_id=admin_id WHERE original_admin_id IS NULL")
+        conn.execute("DROP TABLE IF EXISTS logs")   # جدول لاگ و نمایشگرش حذف شدند؛ در دیتابیس‌های قدیمی هم پاک می‌شود
+        conn.commit()
+        _SCHEMA_READY = True
+
+def db():
+    """کانکشن مخصوص همین ترد؛ هر ترد فقط با کانکشن خودش کار می‌کند (رفع ناایمنی اشتراک کانکشن)."""
+    conn = getattr(_tls, "conn", None)
+    if conn is None:
+        conn = _init_conn()
+        _tls.conn = conn
+        _ensure_schema(conn)
+    return conn
 class _NullLock:
     def __enter__(self): return self
     def __exit__(self, *a): return False
 _NUL = _NullLock()
 def q(sql, params=(), one=False, commit=False):
-    """خواندن آزاد با WAL (بدون قفل)؛ نوشتن/commit زیر قفل؛ retry فقط روی locked/busy."""
+    """خواندن آزاد با WAL روی کانکشن همان ترد؛ نوشتن/commit زیر قفل سراسری نوشتن؛ retry فقط روی locked/busy."""
     for attempt in range(4):
         try:
+            conn = db()
             with (_lock if commit else _NUL):
-                cur = db().execute(sql, params)
-                if commit: db().commit(); return cur.lastrowid
+                cur = conn.execute(sql, params)
+                if commit: conn.commit(); return cur.lastrowid
                 return cur.fetchone() if one else cur.fetchall()
         except sqlite3.OperationalError as e:
             msg = str(e).lower()
-            try: db().rollback()
+            try:
+                _c = getattr(_tls, "conn", None)
+                if _c is not None: _c.rollback()
             except Exception: pass
             if attempt == 3 or ("locked" not in msg and "busy" not in msg): raise
 _COLS = {}
@@ -211,13 +236,7 @@ def gget(k, default=None):
     r = q("SELECT value FROM settings WHERE key=?", (k,), one=True)
     return json.loads(r["value"]) if r else default
 def log_event(level, msg, admin_id=None):
-    q("INSERT INTO logs(ts,level,admin_id,msg) VALUES(?,?,?,?)", (now_iso(), level, admin_id, str(msg)[:600]), commit=True)
     (log.error if level == "ERROR" else log.warning if level == "WARN" else log.info)(f"[{admin_id}] {msg}")
-def recent_logs(n=30, admin_id=None, level=None):
-    sql, p = "SELECT * FROM logs WHERE 1=1", []
-    if admin_id: sql += " AND admin_id=?"; p.append(admin_id)
-    if level: sql += " AND level=?"; p.append(level)
-    return q(sql + " ORDER BY id DESC LIMIT ?", (*p, n))
 # ============================================================
 # متن‌های سراسری دوزبانه (قابل ویرایش توسط مدیر کلان)
 DEFAULT_TEXTS = {
@@ -249,7 +268,6 @@ def ensure_user(uid, username="", name="", premium=None):
               (username or u["username"], name or u["name"], now_iso(), (1 if premium else 0) if premium is not None else (u["premium"] or 0), 1 if is_super(uid) else 0, uid), commit=True)
         else: return u
     return get_user(uid)
-def set_role(uid, role): q("UPDATE users SET role=? WHERE id=?", (role, uid), commit=True)
 def role_of(uid):
     if is_super(uid): return "super"
     u = get_user(uid); return u["role"] if u else "user"
@@ -267,7 +285,6 @@ def seed_plans():
         create_plan(name="حرفه‌ای", name_en="Pro", days=30, daily_posts=20, max_sources=15, max_channels=3, daily_tests=5, price="توافقی", price_en="Contact us", description="۲۰ پست روزانه · ۱۵ منبع · ۳ کانال", description_en="20 posts/day · 15 sources · 3 channels", is_free=0, sort=1)
 def list_plans(active_only=True): return q("SELECT * FROM plans" + (" WHERE active=1" if active_only else "") + " ORDER BY sort, id")
 def get_plan(pid): return q("SELECT * FROM plans WHERE id=?", (pid,), one=True) if pid else None
-def free_plan(): return q("SELECT * FROM plans WHERE is_free=1 AND active=1 ORDER BY id LIMIT 1", one=True)
 def plan_txt(p, field, lang="fa"):
     if not p: return ""
     if lang == "en" and p[f"{field}_en"]: return p[f"{field}_en"]
@@ -307,19 +324,13 @@ def proration_remaining_days(uid):
     now = now_utc()
     if not cur or not u["plan_id"] or cur <= now: return 0.0
     return max(0.0, (cur - now).total_seconds() / 86400.0)
-def proration_remaining_value(uid, new_price_num, cur_price_num, cur_days):
+def proration_remaining_value(uid, cur_price_num, cur_days):
     """ارزش باقی‌ماندهٔ پلن فعلی بر اساس spec: current_plan_price × (remaining_time / original_plan_duration).
     اگر قیمت عددیِ پلن فعلی ثبت نشده باشد (0)، ارزش قابل‌محاسبه نیست → ۰ (بدون اعتبار؛ مبلغ کامل جدید)."""
     rem = proration_remaining_days(uid)
     if rem <= 0 or not cur_days or cur_days <= 0 or not cur_price_num:
         return 0.0
     return round(cur_price_num * (rem / cur_days), 2)
-def upgrade_amount(cur_price_num, new_price_num, cur_days, uid):
-    """مبلغ نهاییِ ارتقا با proration: max(0, new − remaining_value)؛ اگر قیمت جدید عددی نباشد None (حساب نمی‌شود)."""
-    if not new_price_num: return None
-    rv = proration_remaining_value(uid, new_price_num, cur_price_num, cur_days)
-    amt = new_price_num - rv
-    return round(max(0.0, amt), 2)
 def upgrade_carryover_days(uid):
     """روزهای باقی‌ماندهٔ واقعیِ پلن فعلی به‌صورت کسری (float) برای transfer به پلن جدید."""
     return proration_remaining_days(uid)
@@ -342,7 +353,11 @@ def expiring_users():
     رزرو یک‌سویه است → تیک‌های مکرر و ری‌استارت تکرار نمی‌کنند؛ ارتقا/تمدید remind_key را NULL می‌کنند و هشدارهای
     انقضای تازهٔ جدید دوباره فعال می‌شوند. خروجی: [(u, key, left_h), ...]"""
     out, now = [], now_utc()
-    for u in q("SELECT * FROM users WHERE plan_expires IS NOT NULL AND banned=0", ()):
+    # پنجره در SQL بسته می‌شود تا هر تیک کل جدول کاربران خوانده نشود؛ همه‌ی نویسنده‌های plan_expires
+    # مقدار را با isoformat روی دیت‌تایم UTC-aware ذخیره می‌کنند ⇒ مقایسه‌ی رشته‌ای دقیقاً ترتیب زمانی است.
+    soon = (now + timedelta(hours=48)).isoformat()
+    for u in q("SELECT * FROM users WHERE plan_expires IS NOT NULL AND banned=0 AND plan_expires>? AND plan_expires<=?",
+               (now.isoformat(), soon)):
         exp = parse_dt(u["plan_expires"])
         if not exp or exp <= now: continue
         left = (exp - now).total_seconds() / 3600
@@ -356,10 +371,12 @@ def expiring_users():
         else:
             continue
         cur_k = u["remind_key"]
-        # atomic claim: only the worker that successfully updates the row may send the reminder
+        # ادعای اتمی با محافظ «خوش‌بینانه»: فقط اگر از زمانی که خواندیم کسی مقدار را عوض نکرده باشد.
+        # حیاتی است که کلیدِ جدید (key) در شرط نیاید؛ وگرنه وقتی کارگری مقدار را روی key می‌گذارد،
+        # کارگرهای بعدی همان مقدار را مطابق می‌بینند و همه با هم ادعا می‌کنند (هشدار تکراری).
         with _lock:
-            cur = db().execute("UPDATE users SET remind_key=? WHERE id=? AND (remind_key IN (?, ?) OR remind_key IS NULL)",
-                              (key, u["id"], cur_k, key))
+            cur = db().execute("UPDATE users SET remind_key=? WHERE id=? AND (remind_key IS NULL OR remind_key=?)",
+                              (key, u["id"], cur_k))
             db().commit()
         if cur.rowcount:
             out.append((u, key, left))
@@ -387,35 +404,37 @@ def admin_offset(uid):
 def usage_today(uid):
     r = q("SELECT posts,tests FROM usage WHERE admin_id=? AND day=?", (uid, today_str(admin_offset(uid))), one=True)
     return {"posts": r["posts"], "tests": r["tests"]} if r else {"posts": 0, "tests": 0}
-def usage_inc(uid, field):
-    q(f"INSERT INTO usage(admin_id,day,posts,tests) VALUES(?,?,{'1' if field=='posts' else '0'},{'1' if field=='tests' else '0'}) ON CONFLICT(admin_id,day) DO UPDATE SET {field}={field}+1", (uid, today_str(admin_offset(uid))), commit=True)
 def usage_reset(uid, field="tests"): q(f"UPDATE usage SET {field}=0 WHERE admin_id=? AND day=?", (uid, today_str(admin_offset(uid))), commit=True)
-def usage_reserve(uid, field="posts"):
-    """سهمیه را پیشاپیش و اتمیک رزرو می‌کند تا چند چرخه‌ی هم‌زمان از سقف پلن عبور نکنند. خروجی: (ok, day) — day سطلِ همان رزرو است."""
-    lim = admin_limits(uid); cap = lim["daily_posts"] if field == "posts" else lim["daily_tests"]
-    if field == "posts":
-        try:
-            ch = list_channels(uid)[0] if list_channels(uid) else None
-            if ch:
-                st = get_settings(ch["id"]).get("daily_posts_cap")
-                if st: cap = min(cap, int(st)) if cap is not None else int(st)
-        except Exception: pass
-    if cap is None: return True, None
-    with _lock:
-        d = today_str(admin_offset(uid))
-        cur = db().execute(f"INSERT INTO usage(admin_id,day,posts,tests) VALUES(?,?,{'1' if field=='posts' else '0'},{'1' if field=='tests' else '0'}) ON CONFLICT(admin_id,day) DO UPDATE SET {field}={field}+1 WHERE {field}<?", (uid, d, cap))
-        db().commit(); return cur.rowcount > 0, d
-def remaining(uid, field="posts"):
-    lim = admin_limits_cached(uid); cap = lim["daily_posts"] if field == "posts" else lim["daily_tests"]
-    if field == "posts":
-        try:
-            ch = list_channels(uid)[0] if list_channels(uid) else None
-            if ch:
-                st = get_settings(ch["id"]).get("daily_posts_cap")
-                if st: cap = min(cap, int(st)) if cap is not None else int(st)
-        except Exception: pass
-    if cap is None: return None
-    return max(0, cap - usage_today(uid)[field])
+def channel_posts_today(cid, off):
+    """تعداد پست‌های منتشرشده‌ی «امروزِ» خودِ این کانال (بر پایه‌ی ساعت محلی کانال) از جدول posted.
+    سهمیه‌ی usage سراسریِ ادمین است؛ سقف روزانه‌ی کانال باید از شمارش همان کانال دربیاید."""
+    try:
+        ch = get_channel(cid)
+        if not ch: return 0
+        off = float(off); loc = now_utc() + timedelta(hours=off)
+        start = (datetime(loc.year, loc.month, loc.day, tzinfo=UTC) - timedelta(hours=off)).isoformat()
+        r = q("SELECT COUNT(*) c FROM posted WHERE channel_id=? AND posted_at>=?", (ch["chat_id"], start), one=True)
+        return int(r["c"]) if r else 0
+    except Exception:
+        log.debug("channel_posts_today failed cid=%s", cid, exc_info=True); return 0
+def remaining(uid, field="posts", cid=None):
+    """مانده‌ی سهمیه‌ی امروز. برای پست‌ها سقفِ روزانه‌ی همان کانال هم اعمال می‌شود (min با سقف پلن).
+    cid=None یعنی نمای کلی کاربر → مثل قبل سقف کانال نخست مبنا است."""
+    lim = admin_limits_cached(uid)
+    if field != "posts":
+        cap = lim["daily_tests"]
+        return None if cap is None else max(0, cap - usage_today(uid)["tests"])
+    left = None
+    if lim["daily_posts"] is not None: left = max(0, lim["daily_posts"] - usage_today(uid)["posts"])
+    if cid is None:
+        chs = list_channels(uid); cid = chs[0]["id"] if chs else None
+    if cid is not None:
+        try: ch_cap = get_settings(cid).get("daily_posts_cap")
+        except Exception: ch_cap = None
+        if ch_cap:
+            ch_left = max(0, int(ch_cap) - channel_posts_today(cid, admin_offset(uid)))
+            left = ch_left if left is None else min(left, ch_left)
+    return left
 # ============================================================
 # کدهای تخفیف
 _FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
@@ -548,7 +567,38 @@ def in_quiet(s):
     return (a <= h < b) if a < b else (h >= a or h < b)
 # ============================================================
 # کانال‌ها + لایه‌ی امنیتی (کد قفل)
-def _lock_code(): return f"{random.SystemRandom().randint(0, 999999):06d}"
+# --- توکن انتقال مالکیت: ۱۰ رقمی، یک‌بارمصرف، ۵ دقیقه اعتبار
+TRANSFER_TTL_MIN = 5
+def _new_transfer_token(): return f"{random.SystemRandom().randint(0, 10**10 - 1):010d}"
+def issue_transfer_token(cid, issued_to):
+    """توکن تازه صادر می‌کند و توکن‌های مصرف‌نشده‌ی قبلیِ همان کانال را باطل می‌کند (همیشه یکی فعال است)."""
+    now = now_utc()
+    q("DELETE FROM ch_tokens WHERE channel_id=? AND used_at IS NULL", (cid,), commit=True)
+    for _ in range(6):
+        tok = _new_transfer_token()
+        try:
+            q("INSERT INTO ch_tokens(token,channel_id,issued_to,issued_at,expires_at) VALUES(?,?,?,?,?)",
+              (tok, cid, issued_to, now.isoformat(), (now + timedelta(minutes=TRANSFER_TTL_MIN)).isoformat()), commit=True)
+            return tok
+        except sqlite3.IntegrityError:
+            continue
+    return None
+def check_transfer_token(cid, token):
+    """اعتبارسنجی بدون مصرف (پیش‌بررسی): ۱۰ رقم، همان کانال، مصرف‌نشده، منقضی‌نشده."""
+    tok = str(token or "").strip()
+    if len(tok) != 10 or not tok.isdigit(): return None
+    row = q("SELECT * FROM ch_tokens WHERE token=? AND channel_id=?", (tok, cid), one=True)
+    if not row or row["used_at"]: return None
+    exp = parse_dt(row["expires_at"])
+    return row if (exp and now_utc() <= exp) else None
+def consume_transfer_token(cid, token):
+    """مصرف اتمی یک‌بارمصرف: فقط برندهٔ UPDATE اجازهٔ انتقال می‌گیرد."""
+    row = check_transfer_token(cid, token)
+    if not row: return None
+    with _lock:
+        cur = db().execute("UPDATE ch_tokens SET used_at=? WHERE token=? AND used_at IS NULL", (now_iso(), row["token"]))
+        db().commit()
+    return row if cur.rowcount else None
 def list_channels(uid): return q("SELECT * FROM channels WHERE admin_id=? ORDER BY id", (uid,))
 def get_channel(cid): return q("SELECT * FROM channels WHERE id=?", (cid,), one=True)
 def channel_owned(cid, uid):
@@ -556,31 +606,42 @@ def channel_owned(cid, uid):
 def channel_by_chat(chat_id): return q("SELECT * FROM channels WHERE chat_id=?", (chat_id,), one=True)
 def add_channel(uid, chat_id, title, username, verified_by, lang="fa"):
     if channel_by_chat(chat_id): return None
-    return q("INSERT INTO channels(admin_id,chat_id,title,username,lock_code,verified_by,created_at,settings) VALUES(?,?,?,?,?,?,?,?)",
-             (uid, chat_id, title, username or "", _lock_code(), verified_by, now_iso(), json.dumps(default_settings(lang, username), ensure_ascii=False)), commit=True)
+    return q("INSERT INTO channels(admin_id,chat_id,title,username,verified_by,created_at,settings,original_admin_id) VALUES(?,?,?,?,?,?,?,?)",
+             (uid, chat_id, title, username or "", verified_by, now_iso(), json.dumps(default_settings(lang, username), ensure_ascii=False), uid), commit=True)
+def first_registrant(cid):
+    """ثبت‌کنندهٔ نخست کانال: مرجع نهایی مالکیت. هرگز با انتقال عوض نمی‌شود."""
+    ch = get_channel(cid)
+    return (ch["original_admin_id"] or ch["admin_id"]) if ch else None
 def publication_pending(cid):
     if ch_lock(cid).locked(): return True
     rows = q("SELECT s.value FROM articles a JOIN settings s ON s.key='pubj:'||a.id WHERE a.channel_id=? AND s.value!='null'", (cid,))
     return any((json.loads(r["value"]) or {}).get("phase") in ("in_flight", "partial", "ack") for r in rows)
 
 def transfer_channel(cid, new_uid, lang="fa"):
+    """انتقال مالکیت. منابع و صفِ تأییدنشده پاک می‌شوند تا داده‌ی مالک قبلی همراهش نرود.
+    توکن‌های انتقالِ باقی‌مانده باطل می‌شوند (هر انتقال تنها یک توکن مصرف می‌کند)."""
     if publication_pending(cid): raise RuntimeError("channel_busy")
     ch = get_channel(cid)
     if not ch: return None
     q("DELETE FROM sources WHERE channel_id=?", (cid,), commit=True); q("DELETE FROM articles WHERE channel_id=? AND status!='published'", (cid,), commit=True)
-    q("UPDATE channels SET admin_id=?, verified_by=?, lock_code=?, settings=? WHERE id=?", (new_uid, new_uid, _lock_code(), json.dumps(default_settings(lang, ch["username"]), ensure_ascii=False), cid), commit=True)
+    q("DELETE FROM ch_tokens WHERE channel_id=?", (cid,), commit=True)
+    q("UPDATE channels SET admin_id=?, verified_by=?, settings=? WHERE id=?", (new_uid, new_uid, json.dumps(default_settings(lang, ch["username"]), ensure_ascii=False), cid), commit=True)
     return ch["admin_id"]
-def regen_lock(cid): code = _lock_code(); q("UPDATE channels SET lock_code=? WHERE id=?", (code, cid), commit=True); return code
-def reset_channel_link(cid):
-    """بازتولید کد قفل ⇒ پیوند کانال از نظر امنیتی باطل می‌شود: کد تازه صادر می‌شود، صف انتشار (تأیید‌نشده‌ها) پاک می‌شود، اتوماسیون خاموش و وضعیت چرخه صفر می‌شود. منابع و آرشیو منتشر‌شده دست‌نخورده می‌مانند."""
-    code = _lock_code()
+def revert_channel_owner(cid, uid):
+    """بازگرداندن مالکیت به ثبت‌کنندهٔ نخست، بعد از اینکه مالک فعلی در تلگرام ادمینِ کانال نبود."""
     if publication_pending(cid): raise RuntimeError("channel_busy")
-    q("UPDATE channels SET lock_code=? WHERE id=?", (code, cid), commit=True)
+    ch = get_channel(cid)
+    if not ch: return None
+    q("DELETE FROM ch_tokens WHERE channel_id=?", (cid,), commit=True)
+    q("UPDATE channels SET admin_id=?, verified_by=? WHERE id=?", (uid, uid, cid), commit=True)
+    return ch["admin_id"]
+def reset_channel_queue(cid):
+    """صف انتشار (تأییدنشده‌ها) پاک، اتوماسیون خاموش و وضعیت چرخه صفر می‌شود. منابع و آرشیو منتشر‌شده دست‌نخورده می‌مانند."""
+    if publication_pending(cid): raise RuntimeError("channel_busy")
     n = q("SELECT COUNT(*) c FROM articles WHERE channel_id=? AND status!='published'", (cid,), one=True)["c"]
     q("DELETE FROM articles WHERE channel_id=? AND status!='published'", (cid,), commit=True)
     update_settings(cid, enabled=False, last_run=None, last_end=None, last_result="", last_diag=None, last_notified_diag="")
-    return code, n
-def check_lock(cid, code): ch = get_channel(cid); return bool(ch and ch["lock_code"] and str(code).strip() == ch["lock_code"])
+    return n
 def del_channel(cid, uid):
     if publication_pending(cid): raise RuntimeError("channel_busy")
     q("DELETE FROM sources WHERE channel_id=? AND admin_id=?", (cid, uid), commit=True); q("DELETE FROM articles WHERE channel_id=? AND admin_id=?", (cid, uid), commit=True)
@@ -612,9 +673,6 @@ def toggle_source(sid, uid, col="active"):
     """col='active' ⇒ منبعِ محتوای کانال · col='bot_active' ⇒ منبعِ محتوای ربات (نسخه‌ی کامل داخل ربات)"""
     if col not in ("active", "bot_active"): col = "active"
     q(f"UPDATE sources SET {col}=1-COALESCE({col},1) WHERE id=? AND admin_id=?", (sid, uid), commit=True); s = get_source(sid); return bool(s and s[col])
-def source_bot_ok(sid):
-    if not sid: return True
-    s = get_source(sid); return bool(s is None or s["bot_active"] is None or s["bot_active"])
 def set_source_api(sid, api_url="", api_key="", api_note=""):
     """ثبت/حذف API یک منبع. خالی‌بودن api_url ⇒ حذف API و برگشت به مسیر عادی RSS/HTML."""
     q("UPDATE sources SET api_url=?, api_key=?, api_note=? WHERE id=?", ((api_url or "").strip() or None, (api_key or "").strip() or None, (api_note or "").strip(), sid), commit=True)
@@ -736,7 +794,7 @@ def settle_publication(aid, ch, journal):
     _trx(_go)
     if journal.get("test_user") is not None: rate_mark(f"test:{ch['id']}")
 def recover_publications():
-    for row in q("SELECT a.id,a.channel_id,a.reason FROM articles a JOIN settings s ON s.key='pubj:'||a.id WHERE s.value!='null'"):
+    for row in q("SELECT a.id,a.channel_id,a.reason,a.status FROM articles a JOIN settings s ON s.key='pubj:'||a.id WHERE s.value!='null'"):
         if ch_lock(row["channel_id"]).locked(): continue
         journal = get_pub_journal(row["id"])
         if not journal: continue
@@ -745,7 +803,11 @@ def recover_publications():
                 ch = get_channel(row["channel_id"])
                 if ch: settle_publication(row["id"], ch, journal)
             else:
-                release_publication(row["id"], journal, "delivery_unknown" if journal.get("phase") == "in_flight" else row["reason"] or "")
+                _unknown = journal.get("phase") == "in_flight"
+                release_publication(row["id"], journal, "delivery_unknown" if _unknown else row["reason"] or "")
+                if _unknown and row["status"] == "ready":
+                    # نباید سرِ صف «آماده» بماند؛ وگرنه drain برای همیشه روی همین مقاله می‌ایستد.
+                    article_update(row["id"], status="failed", reason="delivery_unknown")
         except Exception: log.exception("publication recovery failed article=%s", row["id"])
 
 def articles_by_status(cid, status, limit=50, automatic=False):
@@ -774,7 +836,6 @@ def cleanup():
     q("DELETE FROM dedup WHERE ts<?", (ttl,), commit=True)                                   # ردپای تکراری‌ها فقط ۴۸ ساعت
     q("DELETE FROM settings WHERE key LIKE 'pubj:%' AND CAST(substr(key,6) AS INTEGER) NOT IN (SELECT id FROM articles)", commit=True)   # ژورنال انتشارِ بی‌صاحب
     # توجه: kv_cache و deeplinks هرگز پاک نمی‌شوند — متن کامل «بیشتر» باید همیشه در ربات بماند
-    q("DELETE FROM logs WHERE id < (SELECT COALESCE(MAX(id),0) FROM logs) - 3000", commit=True)
     q("DELETE FROM usage WHERE day<?", ((now_utc() - timedelta(days=60)).strftime("%Y-%m-%d"),), commit=True)
     q("DELETE FROM support_map WHERE ts<?", ((now_utc() - timedelta(days=7)).isoformat(),), commit=True)
     q("DELETE FROM pay_requests WHERE status!='pending' AND decided_at<?", ((now_utc() - timedelta(days=90)).isoformat(),), commit=True)
@@ -814,7 +875,6 @@ def http():
                                   headers={"User-Agent": UA_BROWSER, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language": "fa,en;q=0.8", "Accept-Encoding": "identity"})
     return _http
 _PRIVATE_HOSTS = ("localhost", "metadata.google.internal")
-_host_ok = {}
 def public_url(u):
     """آدرس بیرونی و امن است؟ DNS ناموفق یا هر IP غیرعمومی ⇒ رد می‌شود (SSRF fail-closed)."""
     try: p = urlparse(str(u))
@@ -876,7 +936,8 @@ async def kv_get(key):
     except Exception as e: log_event("ERROR", f"KV get: {e}"); return None
 async def store_deeplink(admin_id, payload):
     """payload: {short, full, title, url, show_source, media:{url,kind}|None, ts}"""
-    key = secrets.token_urlsafe(6); data = json.dumps(payload, ensure_ascii=False); saved_cf = CF_ENABLED and await kv_put(key, data)
+    key = secrets.token_urlsafe(6); data = json.dumps(payload, ensure_ascii=False)
+    if CF_ENABLED: await kv_put(key, data)
     # نسخهٔ محلی همیشه نگه داشته می‌شود: لینک «بیشتر» هیچ‌وقت از بین نمی‌رود و خواندن بعدی نیاز به KV ندارد
     q("INSERT INTO deeplinks(key,admin_id,created_at,local_json) VALUES(?,?,?,?)", (key, admin_id, now_iso(), data), commit=True)
     q("INSERT OR REPLACE INTO kv_cache VALUES(?,?,?)", (key, data, now_iso()), commit=True); return key
@@ -887,64 +948,11 @@ async def load_deeplink(key):
     if data: q("INSERT OR REPLACE INTO kv_cache VALUES(?,?,?)", (key, data, now_iso()), commit=True); return json.loads(data)
     return None
 
-CF_STATE_KEY = "__newsbot_sqlite_state_v3__"
-CF_STATE_MAX = 24 * 1024 * 1024
-
-def _db_snapshot_bytes():
-    fd, path = tempfile.mkstemp(prefix="newsbot-snapshot-", suffix=".db")
-    os.close(fd)
-    try:
-        with _lock:
-            conn = db(); dst = sqlite3.connect(path)
-            try: conn.backup(dst)
-            finally: dst.close()
-        with open(path, "rb") as f: return gzip.compress(f.read(), compresslevel=6)
-    finally:
-        try: os.unlink(path)
-        except OSError: pass
-
-def _restore_db_snapshot():
-    if not CF_ENABLED or (os.path.exists(DB_FILE) and os.path.getsize(DB_FILE) > 0): return False
-    try:
-        with httpx.Client(timeout=httpx.Timeout(25, connect=10)) as client:
-            r = client.get(CF_BASE + CF_STATE_KEY, headers={"Authorization": f"Bearer {CF_API_TOKEN}"})
-        if r.status_code != 200 or not r.content: return False
-        raw = gzip.decompress(r.content)
-        if not raw or len(raw) > 100 * 1024 * 1024: return False
-        folder = os.path.dirname(os.path.abspath(DB_FILE)); os.makedirs(folder, exist_ok=True)
-        fd, path = tempfile.mkstemp(prefix="newsbot-restore-", suffix=".db", dir=folder); os.close(fd)
-        try:
-            with open(path, "wb") as f: f.write(raw)
-            check = sqlite3.connect(path)
-            try:
-                ok = check.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-            finally: check.close()
-            if not ok: return False
-            os.replace(path, DB_FILE)
-        finally:
-            if os.path.exists(path):
-                try: os.unlink(path)
-                except OSError: pass
-        log.info("Cloudflare KV: SQLite state restored")
-        return True
-    except Exception as e:
-        log.warning(f"Cloudflare KV restore skipped: {e}")
-        return False
-
-async def persist_db():
-    if not CF_ENABLED: return False
-    try:
-        blob = await asyncio.to_thread(_db_snapshot_bytes)
-        if len(blob) > CF_STATE_MAX:
-            log.warning("Cloudflare KV: database snapshot is too large; persistence skipped")
-            return False
-        r = await http().put(CF_BASE + CF_STATE_KEY, content=blob, headers={"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/octet-stream"})
-        ok = r.status_code in (200, 201)
-        if not ok: log.warning(f"Cloudflare KV persistence failed: HTTP {r.status_code}")
-        return ok
-    except Exception as e:
-        log.warning(f"Cloudflare KV persistence failed: {e}")
-        return False
+# ---- فاز ۱: ذخیره‌سازی «وضعیت» روی Cloudflare KV حذف شد ----
+# دلیل: اسنپ‌شات کل SQLite روی KV با سقف ۲۴ مگابایت، دیر یا زود از سقف رد می‌شد و
+# persistence قطع می‌شد؛ ضمناً گرفتن backup + gzip کل دیتابیس، event loop را ثانیه‌ها می‌خواباند.
+# تمام وضعیت (dedup، مقالات، ژورنال‌ها، دیپ‌لینک‌ها، سهمیه) همان‌جای اول یعنی در خود SQLite می‌ماند.
+# mirror اختیاری دیپ‌لینک روی KV (kv_put/kv_get پایین‌تر) دست‌نخورده است چون حجمش ناچیز است و DB مرجع اصلی است.
 
 def init_core():
     db(); seed_plans(); recover_publications()
@@ -1000,7 +1008,6 @@ def _err_text(r):
 class AIResponseError(RuntimeError):
     pass
 
-
 def _provider_json(r):
     if r.status_code >= 400: raise AIResponseError(_err_text(r))
     try: j = r.json()
@@ -1009,13 +1016,11 @@ def _provider_json(r):
     if j.get("error"): raise AIResponseError("provider error response")
     return j
 
-
 def _ai_text(value):
     if not isinstance(value, str): raise AIResponseError("invalid response text")
     value = value.strip()
     if not value: raise AIResponseError("empty response")
     return value
-
 
 def _openai_content(j):
     choices = j.get("choices")
@@ -1058,11 +1063,6 @@ async def _call_model(m, system, user):
     r = await _post(url, headers=headers, json=body)
     if r.status_code == 404 and not re.search(r"/v\d", base): r = await _post(base + "/v1/chat/completions", headers=headers, json=body)
     return _openai_content(_provider_json(r))
-def _model_fail_count(mid):
-    r = q("SELECT fail_count c FROM ai_models WHERE id=?", (mid,), one=True); return int(r["c"]) if r else 0
-def _model_next_try(mid):
-    wait = min(5 * (2 ** _model_fail_count(mid)), MODEL_BACKOFF_MAX_MIN)
-    return (now_utc() + timedelta(minutes=wait)).isoformat()
 async def _mark_fail(m, err):
     cur = get_model(m["id"]) or m   # اسنپ‌شاتِ ورودی ممکن است کهنه باشد؛ شمارنده از سطر فعلی خوانده می‌شود
     fc = (cur["fail_count"] or 0) + 1
@@ -1102,7 +1102,6 @@ def _model_ready(m):
     lf = parse_dt(m["last_fail"]); return bool(not lf or (now_utc() - lf) >= timedelta(minutes=MODEL_PROBE_MIN))
 _ai_events = ContextVar("ai_events", default=None)
 
-
 def is_url_like(x):
     x=(x or "").strip().lower()
     return x.startswith("http") or ("." in x and " " not in x and "/" not in x)
@@ -1115,11 +1114,9 @@ def _model_label(m, owner_id=None):
     if nm and is_url_like(nm): nm = ""
     return (nm or (m["model"] or "").strip()) or ("Public model" if lang == "en" else "مدل عمومی")
 
-
 async def _ai_event(event, label="", code=None):
     callback = _ai_events.get()
     if callback: await callback(event, label, code)
-
 
 def _validate_output(text):
     text = _ai_text(text)
@@ -1129,10 +1126,8 @@ def _validate_output(text):
         if not isinstance(j, dict) or j.get("error"): raise AIResponseError("invalid AI output")
     return text
 
-
 def _validate_ready(text):
     if _ai_text(text).upper() != "READY": raise AIResponseError("invalid health-check output")
-
 
 def _validate_generation(text):
     _validate_output(text)
@@ -1143,7 +1138,6 @@ def _validate_generation(text):
     scores = j.get("scores")
     if not isinstance(post, str) or not strip_tags(post).strip(): raise AIResponseError("invalid empty post")
     if not isinstance(scores, dict) or not scores: raise AIResponseError("missing scores")
-
 
 async def _try_models(groups, system, user, owner_id=None, on_queue=None, validate=None, explicit_id=None):
     def _sort_key(m):
@@ -1186,7 +1180,6 @@ async def _try_models(groups, system, user, owner_id=None, on_queue=None, valida
     await _ai_event("failed", code=last)
     return None, None, last
 
-
 async def ai_chat(system, user, on_queue=None, owner_id=None, selected_id=None, validate=None):
     personal = [m for m in list_models(active_only=True, owner_id=owner_id) if _model_ready(m)] if owner_id else []
     if selected_id is not None:
@@ -1201,7 +1194,6 @@ async def ai_chat(system, user, on_queue=None, owner_id=None, selected_id=None, 
     return await _try_models([("personal", personal), ("test", test), ("public", shared)], system, user,
                              owner_id, on_queue, validate, selected_id)
 
-
 async def test_model(mid):
     m = get_model(mid); t = time.monotonic()
     if not m: return False, "no model", 0.0
@@ -1209,9 +1201,13 @@ async def test_model(mid):
                                       "Say: READY", validate=_validate_ready, explicit_id=mid)
     return out is not None, out[:100] if out else err, round(time.monotonic() - t, 1)
 async def probe_down_models():
-    for m in q("SELECT * FROM ai_models WHERE active=1 AND status='down' ORDER BY last_fail LIMIT 1"):
+    """چند مدل خراب در هر تیک آزمایش می‌شود تا بازیابی به چند ده دقیقه کشیده نشود."""
+    rows = q("SELECT * FROM ai_models WHERE active=1 AND status='down' ORDER BY COALESCE(last_fail,'') LIMIT ?", (MODEL_PROBE_BATCH,))
+    for m in rows:
         lf = parse_dt(m["last_fail"])
-        if not lf or (now_utc() - lf) >= timedelta(minutes=MODEL_PROBE_MIN): await test_model(m["id"])
+        if lf and (now_utc() - lf) < timedelta(minutes=MODEL_PROBE_MIN): continue
+        try: await test_model(m["id"])
+        except Exception: log.exception("model probe failed id=%s", m["id"])
 def any_model_available(owner_id=None): return any(_model_ready(m) for m in list_models(active_only=True, owner_id=owner_id)) or (bool(owner_id) and any(_model_ready(m) for m in list_models(active_only=True)))
 def parse_json(text):
     if not text: return None
@@ -1360,8 +1356,8 @@ def clean_ai_text(t, s=None):
     def rep(m):
         label = m.group(1).strip()
         return "" if any(label and (label in n or n in label) for n in names) else m.group(0)
-    prev = None
-    while prev != t: prev = t; t = pat.sub(rep, t)
+    prev, guard = None, 0
+    while prev != t and guard < 6: prev = t; t = pat.sub(rep, t); guard += 1   # سقف تکرار: جلوگیری از حلقه‌ی طولانی روی متن‌های عجیب
     t = re.sub(r'(?m)^\s*["”»،,{}\[\].…؛:!؟]+\s*$\n?', "", t)   # خط‌های زباله‌ی JSON (مثل «",» یا «10.» تنها)
     t = re.sub(r"\[([^\]\n]{1,160})\]\((https?://[^)\s\"']{4,})\)", lambda m: m.group(2) if m.group(1).strip() in m.group(2) else f'<a href="{m.group(2)}">{m.group(1).replace(chr(34), "")}</a>', t)   # لینک مارک‌داونی → لینک واقعی
     t = re.sub(r"\[([^\]\n]{0,160})\]\(\s*\)", r"\1", t)
@@ -1411,8 +1407,6 @@ def preview_text(html_text, n=100):
     t = re.sub(r"\s+", " ", strip_tags(html_text).replace("\n", " ")).strip()
     if len(t) <= n: return html.escape(t)
     cut = t[:n]; sp = cut.rfind(" "); return html.escape(cut[:sp] if sp > n * 0.6 else cut) + " …"
-def headline_of(html_text):
-    first = (html_text or "").strip().split("\n", 1)[0]; return sanitize_html(first)[:900]
 # ============================================================
 # کشف مقاله — فید (RSS/Atom/RDF) → سایت‌مپ → لینک‌های HTML ؛ آدرس فید پیدا‌شده کش می‌شود
 FEED_ACCEPT = "application/rss+xml, application/atom+xml, application/rdf+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.5"
@@ -1848,9 +1842,12 @@ async def extract_article(url, fallback_html=""):
         page["text"] = _merge_text(page["text"], p2["text"])
         if not page.get("media") and p2.get("media"): page["media"] = p2["media"]
         nxt = p2.get("next") or ""
-    if len(page["text"]) < 120 and fallback_html:
+    # محتوای فید (content:encoded) همیشه با متن صفحه ادغام می‌شود، نه فقط وقتی صفحه خالی است:
+    # فیدها اغلب نسخهٔ کامل خبر را دارند و استخراج صفحه می‌تواند ناقص باشد. هدف: اجتماع محتوا.
+    if fallback_html:
         fb = await asyncio.to_thread(_html_to_text, fallback_html)
-        if len(fb) > len(page["text"]): page["text"] = fb
+        if len(fb) >= 120:
+            page["text"] = _merge_text(page["text"], fb) if len(page["text"]) >= 120 else fb
     if len(page["text"]) < 120: return None
     page["url"] = url; page["pages"] = hops + 1; page["text"] = page["text"][:MAX_ARTICLE_CHARS]; return page
 # ============================================================
@@ -1930,13 +1927,16 @@ FORMATTING RULES (mandatory, not optional — these override any conflicting sty
 - UNKNOWN NAMES: a little-known person, company or term gets a one-clause introduction at first mention.
 - NEUTRAL & SOURCE-ONLY: strictly neutral — no judgment, opinion, praise or personal analysis; never add or invent anything beyond the source; never pad to reach the cap — shorter is fine.
 - "post": an engaging, COMPLETE mini-story — max {s['max_words']} words and at most {s["post_limit"]} characters total; never leave the story half-told: if space is tight, compress the whole story instead of dropping its second half.{', ending with 2–4 relevant hashtags on the last line' if s['hashtags'] else ''}.
-- "full": {'the EXPANDED bot version: everything the post says PLUS the deeper details, background, numbers and context — it must NOT merely repeat the post; start fresh and go deeper. Same format: <b> sub-headings, bullets, at least two <blockquote> highlights (300–700 words, max 2500 characters).' if want_full else 'null'}
+- "full": {'the EXPANDED bot version: everything the post says PLUS the deeper details, background, numbers and context — it must NOT merely repeat the post; start fresh and go deeper. Same format: <b> sub-headings, bullets, at least two <blockquote> highlights (400–900 words, max 4000 characters).' if want_full else 'null'}
 - If the text is an advertisement / advertorial / product-for-sale / betting promotion: is_ad=true.
 - No preamble, never talk about yourself.
 REMINDER: the entire output — title, post, full, hashtags — must be in {s['language']} only.
 Return ONLY one valid JSON object (no code fences) with exactly this structure:
 {{"is_ad": false, "ad_reason": "", "category": "category name", "title": "headline", "scores": {{"criterion name": 0-10}}, "post": "HTML", "full": "HTML or null"}}"""
-    text = art['text'][:AI_INPUT_TEXT_CHARS]; user = f"TITLE: {art['title']}\nSOURCE: {art['url']}\nDATE: {art.get('published') or 'unknown'}\n\nARTICLE TEXT:\n{text}"; return system, user
+    raw_text = art.get('text') or ""
+    text = raw_text[:AI_INPUT_TEXT_CHARS]
+    if len(raw_text) > len(text): log.warning("prompt input truncated %d -> %d chars (summarizer did not converge)", len(raw_text), len(text))
+    user = f"TITLE: {art['title']}\nSOURCE: {art['url']}\nDATE: {art.get('published') or 'unknown'}\n\nARTICLE TEXT:\n{text}"; return system, user
 def weighted_score(s, scores):
     tot, acc = 0, 0.0
     for c in s["criteria"]:
@@ -1959,21 +1959,29 @@ async def _summarize_article(s, art, on_queue=None, owner_id=None):
     try: return await _summarize_chunks(s, full, on_queue=on_queue, owner_id=owner_id)
     finally:
         if _op is not None: _op.prep = _had
-async def _summarize_chunks(s, full, on_queue=None, owner_id=None):
+async def _summarize_chunks(s, full, on_queue=None, owner_id=None, _depth=0):
+    """خلاصه‌سازی بدون‌حذف: **همهٔ** قطعات متن خلاصه می‌شوند و اگر خروجی هنوز بزرگ بود لایه‌به‌لایه
+    جمع می‌شود تا به اندازهٔ ورودی مدل برسد — هیچ بخشی از منبع دور ریخته نمی‌شود."""
     chunks = [full[i:i + AI_INPUT_TEXT_CHARS] for i in range(0, len(full), AI_INPUT_TEXT_CHARS)]
+    # بودجهٔ هر قطعه از کل ظرفیت ورودی مدل تقسیم می‌شود تا مجموعِ خلاصه‌ها همیشه جا شود:
+    # این‌طور هیچ قطعه‌ای حذف نمی‌شود و به‌جای بریدن انتهای متن، فشرده‌سازی بین همهٔ قطعات پخش می‌گردد.
+    per_chunk = max(300, AI_INPUT_TEXT_CHARS // max(1, len(chunks)))
     lines = []
     for idx, chunk in enumerate(chunks):
         sysc = (
             "You summarize a technical/news article chunk in the channel's output LANGUAGE ({}). "
-            "Produce a compact list of key points only, prose style, no markdown headers beyond bullets."
-        ).format(s.get("language") or "فارسی")
+            "Produce a compact list of key points only, prose style, no markdown headers beyond bullets. "
+            "Never drop facts, numbers, names, quotes or conclusions. "
+            "Answer with at most {} characters."
+        ).format(s.get("language") or "فارسی", per_chunk)
         user_msg = f"Chunk {idx+1}/{len(chunks)} — summarize:\n{chunk}"
         raw, _, err = await ai_chat(sysc, user_msg, on_queue=on_queue, owner_id=owner_id, validate=None)
         if err: return None, err
         lines.append(raw or "")
-    # merge: keep all bullet-like lines, truncate any headers if model added them
     merged = "\n".join(x for x in lines if x and x.strip())
-    return merged, None
+    if len(merged) <= AI_INPUT_TEXT_CHARS or _depth >= AI_MERGE_MAX_DEPTH: return merged, None
+    # خروجی هنوز از ورودی مدل بزرگ‌تر است → یک لایه جمع‌کردن دیگر (بدون حذف هیچ بخشی)
+    return await _summarize_chunks(s, merged, on_queue=on_queue, owner_id=owner_id, _depth=_depth + 1)
 
 async def generate(s, art, on_queue=None, owner_id=None):
     """خروجی: (json, model_name, error_code) — error_code کلید امن است (never متن خطای مدل یا base url)."""
@@ -2017,7 +2025,11 @@ def ensure_quote(t):
 def compose(s, ch, art, gen):
     post = sanitize_html(ensure_quote(clean_ai_text(salvage_post(gen.get("post") or ""), s)))
     full = clean_ai_text(salvage_post(gen["full"]), s) if gen.get("full") and str(gen["full"]).lower() != "null" else None
-    if full: full = finish_ok(fit_html(sanitize_html(ensure_quote(full)), BOT_FULL_MAX)[0])
+    if full:
+        full = finish_ok(sanitize_html(ensure_quote(full)))     # کل متن کامل نگه داشته می‌شود (پیش‌تر فقط بخش اول می‌ماند)
+        if len(full) > BOT_FULL_HARD_MAX:
+            log.warning("model 'full' hit hard storage cap: %d -> %d", len(full), BOT_FULL_HARD_MAX)
+            full = full[:BOT_FULL_HARD_MAX]
     core = re.sub(r"#[^\s#]+", " ", re.sub(r"<[^>]+>", " ", post)); core = re.sub(r"[\s‌]+", " ", core).strip()
     if len(core) < 120 and full and len(re.sub(r"<[^>]+>", " ", full)) >= 200:
         # پست تهی/یک‌خطی (فقط ایموجی و امضا): آغاز نسخه‌ی کامل به‌عنوان پست کانال ساخته می‌شود تا کانال هرگز خالی نماند
@@ -2175,9 +2187,11 @@ def channel_caption(s, ch, post_html, full_html, title, url):
         return post, tail, None
     cut, rest = split_post_html(post, budget)
     body_full = full.strip() or ((f"<b>{html.escape(title or '')}</b>\n\n" + rest) if rest else "")
+    # split_post_html قرارداد درست را دارد: (بخش، باقی‌مانده). پیش‌تر fit_html که (متن, بولین) برمی‌گرداند
+    # این‌جا استفاده شده بود؛ نتیجه بولین به‌عنوان «باقی‌مانده» می‌نشست و برای متن بلندتر از سقف TypeError می‌داد.
     parts = []
     while body_full:
-        chunk, body_full = fit_html(body_full, BOT_FULL_MAX)
+        chunk, body_full = split_post_html(body_full, BOT_FULL_MAX)
         parts.append(chunk)
     return cut, tail, "\n".join(parts)
 
@@ -2199,21 +2213,27 @@ async def _publish_article_locked(bot, aid, count_usage=True, test_user=None):
         settle_publication(aid, ch, journal)
         return True, link
     if journal:
-        journal = release_publication(aid, journal, "delivery_unknown" if journal.get("phase") == "in_flight" else (a["reason"] or ""))
-        if journal.get("phase") == "in_flight": return False, "delivery_unknown"
+        unknown = journal.get("phase") == "in_flight"
+        journal = release_publication(aid, journal, "delivery_unknown" if unknown else (a["reason"] or ""))
+        if unknown:
+            # تحویل نامعلوم است: دوباره منتشر نمی‌شود (خطر پست تکراری) و در صف «آماده» هم نمی‌ماند،
+            # چون ماندن در صف سرِ صف را برای همیشه می‌بست و بقیه‌ی آماده‌ها هرگز منتشر نمی‌شدند.
+            article_update(aid, status="failed", reason="delivery_unknown")
+            return False, "delivery_unknown"
     if ch["admin_id"] != admin_id: return False, "no_channel"
     if posted_before(ch["chat_id"], a["hash"]): article_update(aid, status="rejected", reason="duplicate"); return False, "duplicate"
     journal = reserve_publication(aid, admin_id, count_usage, test_user, journal)
     if journal is None: return False, "quota"
     media = None; published = False
     try:
-        s = get_settings(ch["id"]); lang = s["ui_lang"]
+        s = get_settings(ch["id"])
         if not await bot_can_post(bot, ch["chat_id"]):
             article_update(aid, reason="bot_not_admin"); return False, "bot_not_admin"
         operation_checkpoint()
         if posted_before(ch["chat_id"], a["hash"]):
             article_update(aid, status="rejected", reason="duplicate"); return False, "duplicate"
-        media = json.loads(a["media"]) if a["media"] and s["include_media"] else None
+        try: media = json.loads(a["media"]) if a["media"] and s["include_media"] else None
+        except (ValueError, TypeError): media = None; log.warning("corrupt media payload article=%s", aid)
         cut, tail, full_for_bot = channel_caption(s, ch, a["post_html"], a["full_html"], a["title"], a["url"])
         text = cut + tail
         if full_for_bot:
@@ -2237,6 +2257,9 @@ async def _publish_article_locked(bot, aid, count_usage=True, test_user=None):
                 if journal.get("phase") == "ack":
                     published = True
                     raise
+                if isinstance(e, RetryAfter):      # محدودیت نرخ تلگرام → به بالا گزارش می‌شود تا صف drain موقتاً بخوابد
+                    article_update(aid, reason="rate_limited")
+                    return False, f"retry_after:{min(max(int(getattr(e, 'retry_after', 30) or 30), 5), 300)}"
                 article_update(aid, reason="delivery_unknown" if journal.get("phase") == "in_flight" else f"send: {str(e)[:120]}")
                 log.exception("publication failed article=%s channel=%s", aid, ch["id"])
                 return False, f"send_failed:{str(e)[:120]}"
@@ -2350,12 +2373,12 @@ PROG = {"fa": {"start": "شروع…", "src": "بررسی {n} منبع…", "fou
 def _res(D): return {"found": 0, "processed": 0, "accepted": 0, "rejected": 0, "queued": 0, "published": 0, "errors": 0, "links": [], "src": "", "pub": [], "diag": D, "msg": ""}
 async def run_channel_cycle(bot, uid, cid, test_mode=False, progress=None):
     lk = ch_lock(cid)
-    _dbg(f"run_channel_cycle ENTER cid={cid} test_mode={test_mode} ch_lock_locked={lk.locked()}")
+
     if lk.locked():
-        _dbg(f"run_channel_cycle BLOCKED ch_lock locked")
+
         D = Diag(); D.add("busy"); r = _res(D); r["msg"] = D.render(get_settings(cid)["ui_lang"], False); return r
     async with lk:
-        _dbg(f"run_channel_cycle ACQUIRED ch_lock")
+
         async with CYCLE_SEM: return await _cycle(bot, uid, cid, test_mode, progress)
 async def _cycle(bot, uid, cid, test_mode, progress):
     D = Diag(); res = _res(D); s = get_settings(cid); ch = get_channel(cid); lim = admin_limits(uid); lang = s["ui_lang"]; P = PROG[lang if lang in PROG else "fa"]
@@ -2371,7 +2394,7 @@ async def _cycle(bot, uid, cid, test_mode, progress):
     sources = list_sources(cid, active_only=True)
     if not sources: D.add("no_sources"); D.hint("hint_sources"); return fin()
     admin_limits_cached(uid, max_age=_LIMITS_TTL)
-    field = "tests" if test_mode else "posts"; rem = remaining(uid, field)
+    field = "tests" if test_mode else "posts"; rem = remaining(uid, field, cid if field == "posts" else None)
     if rem is not None and rem <= 0: D.add("quota_tests" if test_mode else "quota_posts", used=usage_today(uid)[field], cap=lim["daily_tests" if test_mode else "daily_posts"]); D.hint("hint_quota"); return fin()
     if not await bot_can_post(bot, ch["chat_id"]): D.add("bot_not_admin"); D.hint("hint_admin"); return fin()
     target = 1 if test_mode else min(rem if rem is not None else 99, int(s["posts_per_cycle"])); update_settings(cid, last_run=now_iso()); await p(5, P["start"])
@@ -2430,7 +2453,7 @@ async def _cycle(bot, uid, cid, test_mode, progress):
     drained = 0
     if not test_mode and s["mode"] == "auto" and not quiet:
         backlog = [r["id"] for r in articles_by_status(cid, "ready", 50, automatic=True)]
-        rem_now = remaining(uid, "posts")
+        rem_now = remaining(uid, "posts", cid)
         if backlog and (rem_now is None or rem_now > 0):
             D.add("leftover", n=len(backlog)); D.stage = "publish"
             for aid_b in backlog:
@@ -2525,16 +2548,18 @@ async def flush_ready(bot, uid, cid, max_n=2):
         if s["mode"] != "auto" or in_quiet(s) or not s["enabled"]: return 0
         ru = parse_dt(s.get("_retry_until") or "")
         if ru and now_utc() < ru: return 0
-        rem = remaining(uid, "posts"); sent = 0
+        rem = remaining(uid, "posts", cid); sent = 0
         for a in articles_by_status(cid, "ready", max_n, automatic=True):
             if rem is not None and rem <= 0: break
             operation_checkpoint()
             ok, out = await _publish_article_locked(bot, a["id"])
             if ok: sent += 1; rem = None if rem is None else rem - 1
-            elif out == "duplicate": continue
-            elif isinstance(out, RetryAfter):
+            elif out in ("duplicate", "delivery_unknown"): continue
+            elif isinstance(out, str) and out.startswith("retry_after:"):
                 # توقف موقت drain با ذخیره‌ی زمان بازگشتی (۵ دقیقه سقف) تا چرخه‌ی بعدی دوباره تلاش کند
-                update_settings(cid, _retry_until=(now_utc() + timedelta(seconds=min(int(getattr(out, "retry_after", 30)), 300))).isoformat()); break
+                try: secs = int(out.split(":", 1)[1])
+                except ValueError: secs = 60
+                update_settings(cid, _retry_until=(now_utc() + timedelta(seconds=min(max(secs, 5), 300))).isoformat()); break
             else:
                 update_settings(cid, _retry_until=(now_utc() + timedelta(seconds=90)).isoformat()); break
         return sent
@@ -2598,14 +2623,13 @@ async def scheduler_tick(bot):
             uid = u["id"]
             if not admin_limits(uid)["active"]:
                 skipped.append((uid, "plan_expired")); continue
-            rem = remaining(uid, "posts")
             for ch in list_channels(uid):
                 s = get_settings(ch["id"])
                 if not s["enabled"]:
                     skipped.append((uid, ch["id"], "disabled")); continue
                 try: await flush_ready(bot, uid, ch["id"])
                 except Exception as e: log_event("ERROR", f"flush {ch['title']}: {e}", uid)
-                rem = remaining(uid, "posts")
+                rem = remaining(uid, "posts", ch["id"])
                 if rem is not None and rem <= 0:
                     skipped.append((uid, ch["id"], "quota")); continue
                 if in_quiet(s) and s["mode"] == "auto":
@@ -2661,8 +2685,8 @@ APP: Application = None
 TXT = {
     "back": ("🔙 بازگشت", "🔙 Back"), "home": ("🏠 خانه", "🏠 Home"), "cancel": ("❌ انصراف", "❌ Cancel"), "cancelled": ("↩️ لغو شد", "↩️ Cancelled"),
     "saved": ("✅ ذخیره شد", "✅ Saved"), "deleted": ("🗑 حذف شد", "🗑 Deleted"), "on": ("روشن", "on"), "off": ("خاموش", "off"), "yes": ("✅ بله", "✅ Yes"), "no": ("❌ خیر", "❌ No"),
-    "send_value": ("مقدار را بفرستید", "Send the value"), "step": ("🧩 <b>{i}/{n}</b>", "🧩 <b>{i}/{n}</b>"), "need_int": ("⚠️ عدد بفرستید", "⚠️ Send a number"), "empty": ("⚠️ خالی است", "⚠️ Empty"),
-    "range": ("⚠️ بازه‌ی مجاز: {lo}–{hi}", "⚠️ Allowed range: {lo}–{hi}"), "notfound": ("❌ یافت نشد", "❌ Not found"), "error": ("❌ {e}", "❌ {e}"),
+    "send_value": ("مقدار را بفرستید", "Send the value"), "step": ("🧩 <b>{i}/{n}</b>", "🧩 <b>{i}/{n}</b>"), "empty": ("⚠️ خالی است", "⚠️ Empty"),
+    "notfound": ("❌ یافت نشد", "❌ Not found"), "error": ("❌ {e}", "❌ {e}"),
     "choose_lang": ("🌐 <b>زبان / Language</b>", "🌐 <b>زبان / Language</b>"), "lang_set": ("✅ فارسی", "✅ English"), "banned": ("⛔ دسترسی مسدود است", "⛔ Access blocked"),
     "lang_set_n": (" · {n} کانال هم‌زبان شد", " · {n} channel(s) relocalized"),
     "busy_click": ("⏳ کمی آهسته‌تر", "⏳ Slow down a bit"),
@@ -2685,32 +2709,42 @@ TXT = {
     "today_line": ("📢 {p}/{pc} پست · 🧪 {t}/{tc} تست · 📣 {c}/{cc} کانال · 🌐 {s}/{sc} منبع", "📢 {p}/{pc} posts · 🧪 {t}/{tc} tests · 📣 {c}/{cc} channels · 🌐 {s}/{sc} sources"),
     "plan_inactive": ("⚠️ <b>پلن فعال نیست</b> → تمدید/ارتقا", "⚠️ <b>Plan inactive</b> → renew/upgrade"), "pick_channel": ("کانال را انتخاب کنید (هر کانال تنظیمات مستقل دارد):", "Pick a channel (each has its own settings):"),
     "no_channels": ("هنوز کانالی ندارید. ربات را در کانال ادمین کنید و «افزودن کانال» را بزنید.", "No channel yet. Make the bot admin of your channel, then tap “Add channel”."),
-    "ch_add": ("➕ افزودن کانال", "➕ Add channel"), "my_plan": ("🧾 پلن من", "🧾 My plan"), "logs": ("📜 لاگ", "📜 Logs"), "super_panel": ("👑 مدیر کلان", "👑 Super admin"),
+    "ch_add": ("➕ افزودن کانال", "➕ Add channel"), "my_plan": ("🧾 پلن من", "🧾 My plan"), "super_panel": ("👑 مدیر کلان", "👑 Super admin"),
     "ch_add_prompt": ("۱) ربات را در کانال <b>ادمین</b> کنید (مجوز ارسال پیام)\n۲) یک پیام از کانال <b>فوروارد</b> کنید یا آیدی بفرستید (<code>@mychannel</code> / <code>-100…</code>)\n\n🔐 فقط ادمین همان کانال می‌تواند ثبت کند.", "1) Make the bot channel <b>admin</b> (post permission)\n2) <b>Forward</b> a channel message or send its ID (<code>@mychannel</code> / <code>-100…</code>)\n\n🔐 Only that channel's admin can register it."),
-    "ch_no_access": ("❌ دسترسی به کانال ممکن نیست: {e}", "❌ Can't access channel: {e}"), "ch_need_fwd": ("⚠️ پیام فورواردشده یا آیدی کانال بفرستید", "⚠️ Forward a channel message or send its ID"),
+    "ch_need_fwd": ("⚠️ پیام فورواردشده یا آیدی کانال بفرستید", "⚠️ Forward a channel message or send its ID"),
     "ch_bot_not_admin": ("❌ ربات ادمین این کانال نیست / مجوز ارسال ندارد", "❌ Bot is not admin of this channel / can't post"), "ch_user_not_admin": ("🔐 شما ادمین این کانال نیستید", "🔐 You are not an admin of this channel"),
     "ch_exists_mine": ("⚠️ این کانال قبلاً ثبت شده", "⚠️ Channel already registered"),
-    "ch_locked": ("🔐 <b>این کانال در پنل کاربر دیگری است.</b>\nبرای انتقال، <b>کد قفل ۶ رقمی</b> را بفرستید (مالک فعلی در «کد قفل» می‌بیند). با انتقال، تنظیمات مالک قبلی جدا و به او اطلاع داده می‌شود.", "🔐 <b>This channel belongs to another user's panel.</b>\nTo transfer, send its <b>6-digit lock code</b> (owner sees it under “Lock code”). The previous owner's settings are detached and they get notified."),
-    "ch_lock_bad": ("❌ کد اشتباه؛ به مالک اطلاع داده شد", "❌ Wrong code; owner notified"), "ch_lock_ok": ("✅ «{title}» به پنل شما منتقل شد", "✅ “{title}” transferred to your panel"),
-    "ch_owner_alert": ("🚨 <b>هشدار امنیتی</b>\n{who} برای «{title}» کد قفل اشتباه وارد کرد.", "🚨 <b>Security alert</b>\n{who} entered a wrong lock code for “{title}”."),
-    "ch_owner_moved": ("⚠️ «{title}» با کد معتبر به {who} منتقل شد. اگر شما نبودید: /man", "⚠️ “{title}” was transferred to {who} with a valid code. If this wasn't you: /man"),
+    "ch_owner_moved": ("⚠️ «{title}» با <b>توکن معتبر</b> به {who} منتقل شد. اگر شما نبودید: /man", "⚠️ “{title}” was transferred to {who} with a <b>valid token</b>. If this wasn't you: /man"),
+    "ch_taken": ("🔐 <b>این کانال در پنل کاربر دیگری است.</b>\n👤 مالک فعلی: {who}\nبرای انتقال، مالک باید توکن ۱۰ رقمی بدهد.", "🔐 <b>This channel is in another user's panel.</b>\n👤 Current owner: {who}\nTo transfer, the owner must hand over a 10-digit token."),
+    "ch_token_sent": ("🔑 <b>توکن انتقال برای {who} ارسال شد.</b>\nآن را از مالک بگیر و همین‌جا بفرست.\n⏳ اعتبار: <b>{min} دقیقه</b> · یک‌بارمصرف", "🔑 <b>A transfer token was sent to {who}.</b>\nAsk the owner for it and send it here.\n⏳ Valid for <b>{min} min</b> · single use"),
+    "ch_token_ok": ("✅ توکن تأیید شد؛ «{title}» به پنل شما منتقل شد.", "✅ Token accepted; “{title}” was transferred to your panel."),
+    "ch_token_bad": ("❌ توکن نادرست، منقضی یا قبلاً مصرف‌شده است.", "❌ The token is wrong, expired, or already used."),
+    "ch_token_dm": ("🔑 <b>درخواست انتقال «{title}»</b>\n👤 {who} می‌خواهد این کانال را در پنل خودش ثبت کند.\n\nاگر خودت به او اجازه می‌دهی، این توکن را بده:\n<tg-spoiler>🔢 <code>{token}</code></tg-spoiler>\n\n⏳ {min} دقیقه اعتبار دارد و یک‌بارمصرف است.\n⚠️ به هیچ‌کس جز فرد مورداعتماد نده. اگر تو نبودی، این را نادیده بگیر و «بررسی» را از پنل بزن.", "🔑 <b>Transfer request for “{title}”</b>\n👤 {who} wants to register this channel in their panel.\n\nIf you approve, hand them this token:\n<tg-spoiler>🔢 <code>{token}</code></tg-spoiler>\n\n⏳ Valid for {min} min and single-use.\n⚠️ Give it only to someone you trust. If this wasn't you, ignore it and use “Recheck” in your panel."),
+    "ch_recover_text": ("🔐 «{title}» الان در پنل {who} است.\n\nاگر او را از ادمین‌های کانال در تلگرام برداشتی، «بررسی» را بزن تا مالکیت برگردد.", "🔐 “{title}” is currently in {who}'s panel.\n\nOnce you remove them from the channel admins in Telegram, press “Recheck” to take ownership back."),
+    "b_recheck": ("🔄 بررسی", "🔄 Recheck"),
+    "ch_recheck_ok": ("✅ مالکیت «{title}» برگشت.", "✅ Ownership of “{title}” is back with you."),
+    "ch_recheck_still": ("⚠️ {who} هنوز ادمینِ کانال است.\nاول در تلگرام دسترسی‌اش را سلب کن، بعد «بررسی» را بزن.", "⚠️ {who} is still a channel admin.\nRemove their access in Telegram first, then press “Recheck”."),
+    "ch_recheck_err": ("⚠️ نتوانستم وضعیت ادمین را از تلگرام بپرسم؛ کمی بعد دوباره تلاش کن.", "⚠️ Could not check the admin status with Telegram; try again shortly."),
+    "ch_reverted": ("♻️ مالکیت «{title}» به ثبت‌کنندهٔ نخست برگشت ({who} دیگر ادمین کانال نبود).", "♻️ Ownership of “{title}” returned to the original registrant ({who} was no longer a channel admin)."),
+    "more_steps": ("… {n} مرحلهٔ پیشین", "… {n} earlier step(s)"),
+    "queue_reset": ("🧹 ریست صف", "🧹 Reset queue"),
+    "queue_reset_q": ("⚠️ این کار صفِ انتشارِ <b>تأییدنشده</b> را پاک می‌کند، اتوماسیون را خاموش می‌کند و وضعیت چرخه را صفر می‌کند.\nمنابع و پست‌های منتشرشده دست‌نخورده می‌مانند.\n\nادامه می‌دهید؟", "⚠️ This clears the <b>unapproved</b> publish queue, turns automation off, and resets the cycle state.\nSources and published posts stay untouched.\n\nContinue?"),
+    "queue_reset_ok": ("✅ صف ریست شد ({n} مورد پاک شد) · 🔴 اتوماسیون خاموش شد", "✅ Queue reset ({n} item(s) cleared) · 🔴 automation turned off"),
     "ch_added": ("✅ «{title}» اضافه شد", "✅ “{title}” added"), "limit_channels": ("⚠️ سقف کانال پلن: {n}", "⚠️ Plan channel limit: {n}"), "limit_sources": ("⚠️ سقف منبع پلن: {n}", "⚠️ Plan source limit: {n}"),
     "limit_posts": ("⚠️ سهمیه‌ی پست امروز تمام شد ({n})", "⚠️ Today's post quota used ({n})"), "limit_tests": ("⚠️ سهمیه‌ی تست امروز تمام شد ({n})", "⚠️ Today's test quota used ({n})"),
     # ---- پنل کانال
     "ch_panel": ("📣 <b>{title}</b>", "📣 <b>{title}</b>"), "ch_status": ("{i} اتوماسیون {st} · {mode}", "{i} Automation {st} · {mode}"), "auto": ("⚡ خودکار", "⚡ auto"), "review": ("📝 بازبینی", "📝 review"),
     "ch_stats": ("🌐 {s} منبع · 📝 صف {q} · ✅ ۲۴h {p} · ♻️ رد {r} · 🕐 {a}", "🌐 {s} sources · 📝 queue {q} · ✅ 24h {p} · ♻️ rejected {r} · 🕐 {a}"),
     "report": ("📊 گزارش", "📊 Report"), "test": ("🧪 تست فوری", "🧪 Quick test"), "sources": ("🌐 منابع ({n})", "🌐 Sources ({n})"), "content": ("✍️ محتوا", "✍️ Content"), "sched": ("⏰ زمان‌بندی", "⏰ Schedule"),
-    "queue": ("📝 صف انتشار ({n})", "📝 Publish queue ({n})"), "rejected": ("♻️ ردشده‌ها", "♻️ Rejected"), "automation": ("{i} اتوماسیون", "{i} Automation"), "lock": ("🔐 کد قفل", "🔐 Lock code"), "ch_del": ("🗑 حذف کانال", "🗑 Remove channel"),
+    "queue": ("📝 صف انتشار ({n})", "📝 Publish queue ({n})"), "rejected": ("♻️ ردشده‌ها", "♻️ Rejected"), "automation": ("{i} اتوماسیون", "{i} Automation"), "ch_del": ("🗑 حذف کانال", "🗑 Remove channel"),
     "refresh": ("🔄 بروزرسانی", "🔄 Refresh"), "ch_del_q": ("❓ «{title}» با منابع، تنظیمات و صف حذف شود؟", "❓ Remove “{title}” with its sources, settings and queue?"), "ch_deleted": ("🗑 کانال حذف شد", "🗑 Channel removed"),
     "tog_enabled": ("🟢 اتوماسیون روشن شد", "🟢 Automation on"), "tog_disabled": ("🔴 اتوماسیون خاموش شد", "🔴 Automation off"),
-    "lock_text": ("🔐 <b>کد قفل «{title}»</b>\n\nاگر کسی بخواهد این کانال را در پنل خود ثبت کند باید این کد را بدهد؛ وگرنه رد می‌شود و به شما خبر می‌رسد.\n\n🔑 <code>{code}</code>\n\n⚠️ محرمانه نگه دارید؛ در صورت لو رفتن بازتولید کنید.", "🔐 <b>Lock code of “{title}”</b>\n\nAnyone trying to register this channel in their panel must enter this code; otherwise it's rejected and you're notified.\n\n🔑 <code>{code}</code>\n\n⚠️ Keep it secret; regenerate if leaked."),
-    "lock_regen": ("🔁 بازتولید", "🔁 Regenerate"), "lock_regen_ok": ("✅ کد جدید صادر شد", "✅ New code issued"),
     # ---- منابع
     "src_title": ("🌐 <b>منابع — {title}</b> · {n}/{cap}\n💡 بهترین نتیجه با سایت‌هایی است که <b>RSS</b> دارند؛ آدرس فید یا خود سایت را بدهید (ربات فید/سایت‌مپ را خودش پیدا می‌کند).\nستون اول = محتوای کانال · ستون دوم = محتوای ربات", "🌐 <b>Sources — {title}</b> · {n}/{cap}\n💡 Best results with sites that have <b>RSS</b>; give the feed or the site URL (the bot finds feed/sitemap itself).\nFirst mark = channel content · second = bot content"),
     "src_line": ("\n{i}{b} {host} · 🆕 {n}{err}", "\n{i}{b} {host} · 🆕 {n}{err}"), "src_err": (" · ⚠️×{n}", " · ⚠️×{n}"), "src_add": ("➕ افزودن منبع", "➕ Add source"),
     "src_add_prompt": ("آدرس منبع را بفرستید:\n<code>https://example.com/feed</code>\n\n💡 ترجیحاً سایتی بدهید که <b>RSS</b> دارد (آدرس‌هایی مثل <code>/feed</code> ، <code>/rss</code> ، <code>/atom.xml</code>)؛ اگر آدرس صفحه‌ی اصلی را بدهید ربات خودش فید و سایت‌مپ را می‌جوید.\nℹ️ اگر <code>https://</code> را ننویسید خودکار به ابتدای آدرس اضافه می‌شود.", "Send the source URL:\n<code>https://example.com/feed</code>\n\n💡 Prefer a site that has <b>RSS</b> (paths like <code>/feed</code>, <code>/rss</code>, <code>/atom.xml</code>); if you give the homepage, the bot will look for a feed/sitemap itself.\nℹ️ If you omit <code>https://</code> it is added automatically."),
-    "src_bad": ("⚠️ آدرس نامعتبر", "⚠️ Invalid URL"), "src_dup": ("⚠️ منبع تکراری", "⚠️ Duplicate source"), "src_checking": ("🔎 بررسی منبع…", "🔎 Checking source…"),
-    "src_added": ("✅ منبع اضافه شد · {n} مقاله [{m}]", "✅ Source added · {n} articles [{m}]"), "src_added_empty": ("\n⚠️ چیزی پیدا نشد؛ آدرس فید را مستقیم بدهید.", "\n⚠️ Nothing found; give the feed URL directly."),
+    "src_dup": ("⚠️ منبع تکراری", "⚠️ Duplicate source"), "src_checking": ("🔎 بررسی منبع…", "🔎 Checking source…"),
+    "src_added": ("✅ منبع اضافه شد · {n} مقاله [{m}]", "✅ Source added · {n} articles [{m}]"),
     "src_403": ("🚫 این سایت به ربات‌ها اجازه‌ی خواندن نمی‌دهد (HTTP 403)؛ از این سایت (یا سایت‌های مشابه) نمی‌توان محتوایی دریافت کرد.", "🚫 This site blocks bots (HTTP 403); content can't be fetched from this site (or similar sites)."),
     "src_dead": ("⚠️ تست بارگذاری موفق نبود؛ نمی‌توان از این سایت محتوا تولید کرد. اگر فید RSS دارد، آدرس فید را مستقیم بدهید.", "⚠️ Load test failed; content can't be produced from this site. If it has an RSS feed, give the feed URL directly."),
     "src_added_off": ("\n➕ منبع اضافه شد اما 🔴 خاموش است.", "\n➕ The source was added but is 🔴 off."), "src_now_off": ("\n🔴 منبع خاموش شد.", "\n🔴 The source was turned off."),
@@ -2724,7 +2758,7 @@ TXT = {
     "src_api_key": ("کلید API را بفرستید (اگر لازم نیست بنویسید <code>-</code>):", "Send the API key (send <code>-</code> if not needed):"),
     "src_api_ok": ("✅ API ثبت شد · {n} آیتم خوانده شد", "✅ API saved · {n} items read"), "src_api_bad": ("⚠️ پاسخ API قابل استفاده نبود؛ ثبت شد اما منبع 🔴 خاموش است.", "⚠️ API response wasn't usable; saved but the source is 🔴 off."),
     "src_api_del": ("🗑 API حذف شد", "🗑 API removed"),
-    "src_on": ("🟢 منبع روشن شد", "🟢 Source on"), "src_off": ("🔴 منبع خاموش شد", "🔴 Source off"), "src_deleted": ("🗑 منبع حذف شد", "🗑 Source deleted"), "src_recheck": ("🔎 بررسی دوباره", "🔎 Re-check"),
+    "src_deleted": ("🗑 منبع حذف شد", "🗑 Source deleted"), "src_recheck": ("🔎 بررسی دوباره", "🔎 Re-check"),
     # ---- محتوا
     "content_title": ("✍️ <b>محتوا — {title}</b>\n🎯 {topic} · 🗣 {lang}\n📝 <i>{prompt}</i>\n✒️ {sig}", "✍️ <b>Content — {title}</b>\n🎯 {topic} · 🗣 {lang}\n📝 <i>{prompt}</i>\n✒️ {sig}"),
     "general": ("عمومی", "general"), "b_topic": ("🎯 موضوع", "🎯 Topic"), "b_lang": ("🗣 زبان خروجی", "🗣 Output language"), "b_prompt": ("📝 پرامپت", "📝 Prompt"), "b_sig": ("✒️ امضا", "✒️ Signature"),
@@ -2749,7 +2783,7 @@ TXT = {
     "sched_title": ("⏰ <b>زمان‌بندی کانال {title}</b>\n⏱ فاصله‌ی چرخه: هر {iv} دقیقه · 📦 در هر چرخه {ppc} پست\n🗓 بازه‌ی خبری: {lb} ساعت گذشته · 📅 خبر بدون تاریخ: {ud}\n🌙 {quiet} · 🌍 {city} {tz} (⌚ {loc} · UTC {utc})\n🔁 {mode}", "⏰ <b>Schedule — {title}</b>\n⏱ every {iv}′ · 📦 {ppc} posts/cycle · 🕰 last {lb}h · 📅 undated {ud}\n🌙 {quiet} · 🌍 {city} {tz} (⌚ {loc} · UTC {utc})\n🔁 {mode}"),
     "mode_auto": ("⚡ خودکار — انتشار مستقیم", "⚡ auto — publish directly"), "mode_review": ("📝 بازبینی — تأیید دستی در صف", "📝 review — manual approval in queue"), "none": ("—", "—"),
     "b_interval": ("⏱ فاصله‌ی چرخه: هر {n} دقیقه", "⏱ Cycle interval: every {n} min"), "b_ppc": ("📦 در هر چرخه {n} پست منتشر شود", "📦 Publish {n} post(s) per cycle"), "b_lookback": ("🗓 فقط خبرهای {n} ساعت گذشته", "🗓 Only news from the last {n} hours"), "b_undated": ("📅 خبرهای بدون تاریخ: {i}", "📅 Undated news: {i}"),
-    "b_daily_cap": ("📊 در روز حداکثر {n} پست منتشر شود", "📊 Publish at most {n} post(s) per day"), "cap_over_plan": ("⚠️ بیشتر از سقف پلن شما ({n} پست در روز) قابل تنظیم نیست.", "⚠️ Cannot exceed your plan limit ({n} posts/day)."), "cap_range": ("حداکثر تا {n} پست در روز (طبق پلن شما)", "Max {n} posts/day (your plan)"), "unlimited": ("نامحدود", "unlimited"), "b_quiet": ("🌙 خاموشی", "🌙 Quiet hours"), "b_tz": ("🌍 منطقه زمانی", "🌍 Time zone"), "b_mode": ("🔁 {m}", "🔁 {m}"),
+    "b_daily_cap": ("📊 در روز حداکثر {n} پست منتشر شود", "📊 Publish at most {n} post(s) per day"), "cap_over_plan": ("⚠️ بیشتر از سقف پلن شما ({n} پست در روز) قابل تنظیم نیست.", "⚠️ Cannot exceed your plan limit ({n} posts/day)."), "cap_range": ("حداکثر تا {n} پست در روز (طبق پلن شما)", "Max {n} posts/day (your plan)"), "b_quiet": ("🌙 خاموشی", "🌙 Quiet hours"), "b_tz": ("🌍 منطقه زمانی", "🌍 Time zone"), "b_mode": ("🔁 {m}", "🔁 {m}"),
     "mode_set_auto": ("⚡ خودکار: انتشار مستقیم", "⚡ Auto: publish directly"), "mode_set_review": ("📝 بازبینی: منتظر تأیید در صف", "📝 Review: waits for approval"),
     "quiet_pick_start": ("🌙 <b>خاموشی</b> · ساعت <b>شروع</b> ({tz} · الان {loc}):", "🌙 <b>Quiet hours</b> · <b>start</b> hour ({tz} · now {loc}):"), "quiet_pick_end": ("🌙 شروع {h}:00 · ساعت <b>پایان</b>:", "🌙 Start {h}:00 · <b>end</b> hour:"),
     "quiet_off": ("🚫 بدون خاموشی", "🚫 No quiet hours"), "quiet_set": ("🌙 خاموشی {a}:00 → {b}:00", "🌙 Quiet {a}:00 → {b}:00"), "quiet_cleared": ("🌙 خاموشی حذف شد", "🌙 Quiet hours cleared"),
@@ -2760,24 +2794,51 @@ TXT = {
     "art_nobody": ("<i>(محتوایی تولید نشده)</i>", "<i>(no content generated)</i>"), "art_pub": ("🚀 انتشار", "🚀 Publish"), "art_edit": ("✏️ ویرایش", "✏️ Edit"), "art_full": ("📖 نسخه کامل", "📖 Full version"), "art_view": ("👁 مشاهده", "👁 View"),
     "art_del_arch": ("🗑 حذف از آرشیو", "🗑 Remove from archive"), "art_to_ready": ("♻️ به صف انتشار", "♻️ To publish queue"), "art_edit_prompt": ("متن جدید پست (فرمت تلگرام حفظ می‌شود):", "New post text (Telegram formatting kept):"),
     "art_updated": ("✅ متن بروزرسانی شد", "✅ Text updated"), "art_moved": ("♻️ به صف منتقل شد", "♻️ Moved to queue"), "publishing": ("⏳ انتشار…", "⏳ Publishing…"), "published_ok": ("✅ منتشر شد", "✅ Published"), "pub_failed": ("❌ انتشار: {e}", "❌ Publish: {e}"), "full_head": ("📖 <b>نسخه‌ی کامل</b>\n\n", "📖 <b>Full version</b>\n\n"),
-    # ---- پلن من / لاگ
+    # ---- پلن من
     "myplan": ("🧾 <b>پلن من: {name}</b>\n{st}{exp}{nxt}\n📢 {p}/{pc} پست · 🧪 {t}/{tc} تست (امروز)\n🌐 {s}/{sc} منبع · 📣 {c}/{cc} کانال", "🧾 <b>My plan: {name}</b>\n{st}{exp}{nxt}\n📢 {p}/{pc} posts · 🧪 {t}/{tc} tests (today)\n🌐 {s}/{sc} sources · 📣 {c}/{cc} channels"),
     "st_active": ("🟢 فعال", "🟢 active"), "st_expired": ("🔴 غیرفعال", "🔴 inactive"), "exp_at": (" · تا {d}", " · until {d}"), "upgrade_btn": ("⬆️ ارتقا / تمدید", "⬆️ Upgrade / renew"),
-    "logs_title": ("📜 <b>لاگ</b>{lvl}\n\n", "📜 <b>Logs</b>{lvl}\n\n"), "logs_empty": ("— خالی —", "— empty —"), "all": ("همه", "All"), "errors": ("خطاها", "Errors"), "warns": ("هشدارها", "Warnings"),
-    "logs_note": ("\n\n<i>۱۰ مورد آخر</i>", "\n\n<i>last 10 entries</i>"),
     # ---- دلیل کوتاه ردشده‌ها (بدون جزئیات فنی)
     "rj_extract": ("متن قابل استخراج نبود", "no extractable text"), "rj_ad": ("فیلتر تبلیغ", "ad filter"), "rj_ai_ad": ("تبلیغ (تشخیص AI)", "ad (AI)"), "rj_score": ("امتیاز کمتر از حداقل", "below minimum score"),
     "rj_ai": ("سرویس هوش مصنوعی پاسخ نداد", "AI service did not respond"), "rj_send": ("ارسال به کانال ناموفق", "sending to channel failed"), "rj_dup": ("تکراری", "duplicate"),
     "rj_admin": ("ربات ادمین کانال نیست", "bot is not channel admin"), "rj_old": ("قدیمی‌تر از بازه", "older than window"), "rj_undated": ("بدون تاریخ", "undated"), "rj_other": ("نامشخص", "unspecified"),
     # ---- تست
-    "test_head": ("🧪 <b>تست — {title}</b>", "🧪 <b>Test — {title}</b>"), "preparing": ("آماده‌سازی…", "Preparing…"), "test_wait": ("⏳ تست بعدی تا {n} ثانیه دیگر", "⏳ Next test in {n}s"), "test_busy": ("⏳ چرخه‌ای روی این کانال در حال اجراست", "⏳ A cycle is already running on this channel"),
+    "preparing": ("آماده‌سازی…", "Preparing…"), "test_wait": ("⏳ تست بعدی تا {n} ثانیه دیگر", "⏳ Next test in {n}s"), "test_busy": ("⏳ چرخه‌ای روی این کانال در حال اجراست", "⏳ A cycle is already running on this channel"),
     "test_ok": ("✅ <b>منتشر شد</b>", "✅ <b>Published</b>"), "test_queued": ("📝 در <b>صف انتشار</b> منتظر تأیید (حالت بازبینی)", "📝 Waiting in <b>publish queue</b> (review mode)"), "test_fail": ("⚠️ <b>چیزی منتشر نشد</b>", "⚠️ <b>Nothing published</b>"),
     "test_summary_ok": ("{n} مقاله موفقانه منتشر شد", "{n} articles published successfully"), "test_summary_fail": ("تست ناموفق بود", "Test failed"),
-    "test_log": ("📋 {d}", "📋 {d}"), "test_quota_note": ("ℹ️ سهمیه‌ی تست فقط با انتشار موفق کسر می‌شود", "ℹ️ Test quota is deducted only on success"), "back_panel": ("🔙 پنل کانال", "🔙 Channel panel"),
+    "test_log": ("📋 {d}", "📋 {d}"), "back_panel": ("🔙 پنل کانال", "🔙 Channel panel"),
     "test_retry_note": ("ℹ️ سهمیه و محدودیت زمانی اعمال نشد؛ می‌توانید همین حالا دوباره تست کنید.", "ℹ️ No quota or cooldown was applied; you can retry right away."),
     "test_src": ("🌐 تولید از منبع: <b>{name}</b>", "🌐 Generated from source: <b>{name}</b>"),
-    "lock_reset_q": ("⚠️ با بازتولید کد قفل، این کانال از نظر امنیتی <b>ریست</b> می‌شود:\n• کد قفل تازه صادر می‌شود\n• صفِ انتشارِ تأییدنشده پاک می‌شود\n• اتوماسیون خاموش می‌شود\n\nمنابع و پست‌های منتشرشده دست‌نخورده می‌مانند. ادامه می‌دهید؟", "⚠️ Regenerating the lock code <b>resets</b> this channel for security:\n• a new lock code is issued\n• the unapproved publish queue is cleared\n• automation is turned off\n\nSources and already-published posts stay untouched. Continue?"),
-    "lock_reset_ok": ("✅ کد جدید صادر شد · کانال ریست شد ({n} مورد از صف پاک شد) · 🔴 اتوماسیون خاموش شد", "✅ New code issued · channel reset ({n} queued items cleared) · 🔴 automation turned off"),
+    # --- merged in phase 6: model/pricing panel, support, deeplink and queue texts ---
+    "s_title": ("👑 <b>مدیر کلان</b>\n🤖 مدل‌ها {m} ({ms}) · 👥 مدیران {a} / کاربران {u}\n🛎 پرداخت معلق {p} · 🎟 کد تخفیف {dc} · ⚖️ صف {due}\n💓 {hb}", "👑 <b>Super admin</b>\n🤖 models {m} ({ms}) · 👥 admins {a} / users {u}\n🛎 pending payments {p} · 🎟 discount codes {dc} · ⚖️ queue {due}\n💓 {hb}"),
+    "s_all_ok": ("سالم", "healthy"), "s_down": ("{n} خراب 🔴", "{n} down 🔴"), "s_report": ("📊 گزارش", "📊 Report"), "s_plans": ("🧾 پلن‌ها", "🧾 Plans"), "s_users": ("👥 کاربران", "👥 Users"),
+    "s_models": ("🤖 مدل‌ها", "🤖 Models"), "s_pays": ("🛎 پرداخت‌ها ({n})", "🛎 Payments ({n})"), "s_discs": ("🎟 کدهای تخفیف", "🎟 Discount codes"), "s_bc": ("📣 همگانی", "📣 Broadcast"), "s_texts": ("📝 متن‌ها", "📝 Texts"),
+    "s_admins": ("🧑‍💼 مدیران", "🧑‍💼 Admins"), "s_auto": ("{i} اتوماسیون کل", "{i} Global automation"), "s_me": ("👤 پنل من", "👤 My panel"), "s_auto_on": ("🟢 اتوماسیون کل روشن شد", "🟢 Global automation on"), "s_auto_off": ("🔴 اتوماسیون کل خاموش شد", "🔴 Global automation off"),
+    "s_plans_title": ("🧾 <b>پلن‌ها</b>", "🧾 <b>Plans</b>"), "s_plan_new": ("➕ پلن", "➕ Plan"), "s_plan_created": ("✅ «{name}» ساخته شد", "✅ “{name}” created"), "s_plan_deleted": ("🗑 پلن حذف شد", "🗑 Plan deleted"),
+    "s_plan_view": ("🧾 <b>{name}</b> / {name_en} {free} {st}\n{desc}\n{desc_en}\n⏳ {days}d · 📢 {posts}/d · 🧪 {tests}/d · 🌐 {src} · 📣 {ch}\n💰 {price} / {price_en} · 🔢 {price_num}\n👥 {n} کاربر", "🧾 <b>{name}</b> / {name_en} {free} {st}\n{desc}\n{desc_en}\n⏳ {days}d · 📢 {posts}/d · 🧪 {tests}/d · 🌐 {src} · 📣 {ch}\n💰 {price} / {price_en} · 🔢 {price_num}\n👥 {n} users"),
+    "s_plan_free_set": ("🎁 رایگان شود", "🎁 Make free"), "s_plan_free_done": ("🎁 پلن رایگان تنظیم شد", "🎁 Free plan set"), "s_plan_del": ("🗑 حذف پلن", "🗑 Delete plan"), "s_field_prompt": ("مقدار جدید «{f}»:", "New value for “{f}”:"),
+    "s_discs_title": ("🎟 <b>کدهای تخفیف</b>", "🎟 <b>Discount codes</b>"), "s_disc_new": ("➕ کد", "➕ Code"), "s_disc_line": ("\n{i} <code>{code}</code> −{p}% · تا {exp} · {used}/{max}", "\n{i} <code>{code}</code> −{p}% · until {exp} · {used}/{max}"),
+    "s_disc_view": ("🎟 <code>{code}</code> {st}\n−{p}% · انقضا {exp} · استفاده {used}/{max}", "🎟 <code>{code}</code> {st}\n−{p}% · expires {exp} · used {used}/{max}"), "s_disc_created": ("✅ کد {code} ساخته شد", "✅ Code {code} created"), "s_disc_dup": ("⚠️ کد تکراری یا نامعتبر", "⚠️ Duplicate or invalid code"),
+    "s_disc_exp_bad": ("⚠️ انقضا: عدد روز یا تاریخ YYYY-MM-DD", "⚠️ Expiry: days number or YYYY-MM-DD"), "s_disc_p": ("✏️ درصد", "✏️ Percent"), "s_disc_e": ("✏️ انقضا", "✏️ Expiry"), "s_disc_m": ("✏️ سقف استفاده", "✏️ Max uses"), "s_disc_del": ("🗑 حذف کد", "🗑 Delete code"), "unlimited": ("∞", "∞"),
+    "s_users_title": ("👥 <b>{what}</b> ({n}) · {p}/{pp}", "👥 <b>{what}</b> ({n}) · {p}/{pp}"), "s_users_w": ("کاربران", "Users"), "s_admins_w": ("مدیران", "Admins"), "s_prev": ("⬅️", "⬅️"), "s_next": ("➡️", "➡️"),
+    "s_user_view": ("👤 <b>{name}</b> · <code>{id}</code> · {role} · {ban} · {lang} {prem}\n🧾 {plan} {act}{exp}{nxt}\n📢 امروز {p} پست · {t} تست · 📣 {c} کانال · 🌐 {s} منبع\n📰 ۲۴h: {d} کشف · {pub} منتشر · 🎁 رایگان {free}\n🕐 عضویت {join} · آخرین {seen}", "👤 <b>{name}</b> · <code>{id}</code> · {role} · {ban} · {lang} {prem}\n🧾 {plan} {act}{exp}{nxt}\n📢 today {p} posts · {t} tests · 📣 {c} channels · 🌐 {s} sources\n📰 24h: {d} found · {pub} published · 🎁 free {free}\n🕐 joined {join} · seen {seen}"),
+    "s_ban_y": ("⛔ مسدود", "⛔ banned"), "s_ban_n": ("✅ آزاد", "✅ active"), "s_uplan": ("🧾 تعیین پلن", "🧾 Assign plan"), "s_urevoke": ("❌ لغو پلن", "❌ Revoke plan"), "s_uban": ("⛔ مسدود/آزاد", "⛔ Ban/unban"), "s_umsg": ("✉️ پیام", "✉️ Message"),
+    "s_ureport": ("📊 کانال‌ها", "📊 Channels"), "s_ufree": ("🔁 ریست رایگان", "🔁 Reset free"), "s_utests": ("🧪 ریست تست", "🧪 Reset tests"), "s_uposts": ("📢 ریست پست", "📢 Reset posts"),
+    "s_plan_pick": ("🧾 پلن این کاربر:", "🧾 Plan for this user:"), "s_assigned": ("✅ پلن تا {d} فعال شد", "✅ Plan active until {d}"), "s_assigned_q": ("⏭ پلن بعدی (پس از {d})", "⏭ Queued as next (after {d})"),
+    "s_revoked": ("❌ پلن لغو شد", "❌ Plan revoked"), "s_banned": ("⛔ مسدود شد", "⛔ Banned"), "s_unbanned": ("✅ آزاد شد", "✅ Unbanned"), "s_free_reset": ("🔁 سهمیه‌ی رایگان ریست شد", "🔁 Free quota reset"), "s_tests_reset": ("🧪 تست امروز ریست شد", "🧪 Tests reset"), "s_posts_reset": ("📢 پست امروز ریست شد", "📢 Posts reset"),
+    "s_no_channels": ("کانالی ندارد", "No channels"), "s_pick_channel": ("📢 کانال:", "📢 Channel:"),
+    "s_models_title": ("🤖 <b>مدل‌ها</b>\nبه ترتیب اولویت؛ با خرابی یکی، بعدی استفاده می‌شود. هر سرویس سازگار با OpenAI / Anthropic / Gemini پشتیبانی می‌شود.", "🤖 <b>Models</b>\nUsed in priority order; on failure the next is used. Any OpenAI-compatible / Anthropic / Gemini service is supported."), "s_model_add": ("➕ مدل", "➕ Model"), "s_models_test": ("🧪 تست همه", "🧪 Test all"),
+    "s_model_view": ("🤖 <b>{name}</b> · {kind}\n<code>{model}</code>\n🔗 <code>{base}</code>\n🔑 <code>{key}</code>\n⚙️ اولویت {pr} · دما {temp} · توکن {mx}\n{st} · ✅ {ok} · ⚠️×{fc}\n🕐 موفق {lo} · خطا {lf}{err}", "🤖 <b>{name}</b> · {kind}\n<code>{model}</code>\n🔗 <code>{base}</code>\n🔑 <code>{key}</code>\n⚙️ priority {pr} · temp {temp} · tokens {mx}\n{st} · ✅ {ok} · ⚠️×{fc}\n🕐 ok {lo} · error {lf}{err}"),
+    "s_m_off": ("⏸ خاموش", "⏸ off"), "s_m_ok": ("🟢 سالم", "🟢 healthy"), "s_m_down": ("🔴 خراب", "🔴 down"), "s_model_test": ("🧪 تست", "🧪 Test"), "s_model_del": ("🗑 حذف مدل", "🗑 Delete model"),
+    "s_model_testing": ("🧪 در حال تست…", "🧪 Testing…"), "s_model_res": ("{i} {t}s: {out}", "{i} {t}s: {out}"), "s_model_added": ("✅ مدل «{name}» اضافه شد · {res}", "✅ Model “{name}” added · {res}"), "s_model_need": ("⚠️ Base URL و نام مدل الزامی است", "⚠️ Base URL and model name are required"), "s_model_on": ("🟢 مدل روشن شد", "🟢 Model on"), "s_model_off": ("⏸ مدل خاموش شد", "⏸ Model off"),
+    "s_pays_title": ("🛎 <b>پرداخت‌های معلق</b>", "🛎 <b>Pending payments</b>"), "s_pay_none": ("— خالی —", "— none —"), "s_pay_line": ("\n• #{id} {who} → <b>{plan}</b> · {price} · {t}", "\n• #{id} {who} → <b>{plan}</b> · {price} · {t}"), "s_pay_rc": ("📎 #{id}", "📎 #{id}"),
+    "s_pay_ok": ("✅ تأیید", "✅ Approve"), "s_pay_no": ("❌ رد", "❌ Reject"), "s_pay_done_ok": ("✅ تأیید شد؛ پلن فعال/رزرو شد", "✅ Approved; plan activated/queued"), "s_pay_done_no": ("❌ رد شد", "❌ Rejected"), "s_pay_seen": ("⚠️ قبلاً بررسی شده", "⚠️ Already handled"),
+    "s_pay_new": ("🛎 <b>پرداخت #{id}</b>\n👤 {who} (<code>{uid}</code>)\n🧾 <b>{plan}</b> · 💰 {price}{disc}{note}", "🛎 <b>Payment #{id}</b>\n👤 {who} (<code>{uid}</code>)\n🧾 <b>{plan}</b> · 💰 {price}{disc}{note}"),
+    "s_bc_prompt": ("پیام همگانی (متن/عکس/ویدیو؛ فرمت حفظ می‌شود):", "Broadcast message (text/photo/video; formatting kept):"), "s_bc_confirm": ("📣 ارسال به <b>{n}</b> کاربر؟", "📣 Send to <b>{n}</b> users?"), "s_bc_go": ("✅ ارسال", "✅ Send"), "s_bc_sending": ("📣 ارسال به {n} کاربر…", "📣 Sending to {n} users…"), "s_bc_done": ("📣 موفق {ok} · ناموفق {fail}", "📣 ok {ok} · failed {fail}"),
+    "s_texts_title": ("📝 <b>متن‌ها</b> (فارسی/انگلیسی) · جای‌گذارها: welcome {{name}} · pay {{plan}} {{price}}", "📝 <b>Texts</b> (fa/en) · placeholders: welcome {{name}} · pay {{plan}} {{price}}"), "s_text_prompt": ("متن جدید «{k}» ({lg}):", "New “{k}” text ({lg}):"), "s_text_saved": ("✅ متن ذخیره شد", "✅ Text saved"), "s_text_reset_done": ("↩️ پیش‌فرض شد", "↩️ Reset to default"),
+    "s_umsg_prompt": ("پیام برای این کاربر:", "Message to this user:"), "s_umsg_sent": ("✅ ارسال شد", "✅ Sent"), "s_umsg_head": ("📩 <b>پیام مدیریت:</b>\n\n", "📩 <b>Admin message:</b>\n\n"),
+    "sup_open": ("💬 <b>پشتیبانی</b>\nهر پیامی بفرستید مستقیم به مدیر می‌رسد و پاسخ همین‌جا می‌آید.", "💬 <b>Support</b>\nAny message goes straight to the admin; replies arrive here."), "sup_close": ("❌ پایان گفتگو", "❌ End chat"), "sup_closed": ("✅ گفتگو پایان یافت", "✅ Chat ended"),
+    "sup_reply_head": ("💬 <b>پاسخ پشتیبانی:</b>\n", "💬 <b>Support reply:</b>\n"), "sup_sent": ("✅ ارسال شد", "✅ Sent"), "sup_fail": ("❌ ارسال نشد: {e}", "❌ Not sent: {e}"), "sup_received": ("✅", "✅"),
+    "dl_notfound": ("🔎 متأسفم، نسخهٔ کامل این مطلب پیدا نشد — ممکن است پاک شده باشد. لطفاً از خودِ کانال پست را باز کن یا چند دقیقه بعد دوباره امتحان کن.", "🔎 Sorry, this full version could not be found — it may have been removed. Please open the post in the channel or try again later."), "dl_source": ("🔗 Source", "🔗 Source"),
 }
 def tr(lang, key, / , **kw):
     s = TXT[key][1 if lang == "en" else 0]
@@ -2818,11 +2879,19 @@ WIZ = {
 }
 # ============================================================
 # ابزار UI
+def bar(used, cap, width=10):
+    """نوار پیشرفت سهمیه؛ cap=None یعنی نامحدود (نوار خالی)."""
+    if not cap or cap <= 0: return ""
+    filled = min(width, max(0, int(round(width * min(used, cap) / cap))))
+    return "▰" * filled + "▱" * (width - filled)
+def quota_bars(rows, width=10):
+    """خط نوارِ سهمیه‌ها: rows = [(emoji, used, cap), ...] — بدون متن، پس نیازی به i18n ندارد."""
+    out = [f"{i} <code>{bar(u, c, width)}</code>  <b>{u}</b>/{c}" for i, u, c in rows if c is not None]
+    return ("\n" + "  ·  ".join(out)) if out else ""
 def B(t, d): return InlineKeyboardButton(t, callback_data=d[:64])
 def U(t, url): return InlineKeyboardButton(t, url=url)
 def esc(x): return html.escape(str(x if x is not None else ""))
 def onoff(v): return "✅" if v else "❌"
-def bar(p): f = int(p // 10); return "█" * f + "░" * (10 - f)
 def to_int(s):
     text = str(s).strip().translate(_FA_DIGITS)
     if not re.fullmatch(r"[+-]?[0-9]+", text): raise ValueError("Expected an integer")
@@ -2837,26 +2906,8 @@ def kbm(kb):
     return InlineKeyboardMarkup([[B(t, d) if not str(d).startswith("http") else U(t, d) for t, d in row] for row in kb]) if kb else None
 _current_operation = ContextVar("current_operation", default=None)
 _operations, _user_controls = {}, {}
-_temp_messages, _temp_tasks = set(), set()
-
-# --- TEMP DEBUG INSTRUMENTATION (will be removed after root-cause confirmation) ---
-import os as _os
-_DEBUG_TEST = _os.getenv("DEBUG_TEST", "").lower() in ("1", "true", "yes")
-_test_run_counter = {"n": 0}
-if _DEBUG_TEST:
-    _test_dbg_handler = logging.FileHandler("test_debug.log", mode="w", encoding="utf-8")
-    _test_dbg_handler.setLevel(logging.DEBUG)
-    _test_dbg_handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d | %(levelname)s | %(message)s", datefmt="%H:%M:%S"))
-    _test_dbg_logger = logging.getLogger("TEST_DEBUG")
-    _test_dbg_logger.setLevel(logging.DEBUG)
-    _test_dbg_logger.addHandler(_test_dbg_handler)
-    _test_dbg_logger.propagate = False
-else:
-    _test_dbg_logger = logging.getLogger("TEST_DEBUG")
-
-def _dbg(msg):
-    if _DEBUG_TEST:
-        _test_dbg_logger.info(msg)
+_temp_messages = {}      # (chat_id, message_id) → (مهلت پاک‌سازی monotonic | None اگر زمان‌بندی نشده، bot)
+_temp_sweeper = None
 
 @dataclass
 class Operation:
@@ -2864,7 +2915,6 @@ class Operation:
     channel: int | None
     operation_type: str
     chat_id: int
-    started_at: str = field(default_factory=now_iso)
     task: asyncio.Task | None = None
     cancelled: bool = False
     started: bool = False
@@ -2874,40 +2924,29 @@ class Operation:
     status_message_id: int | None = None
     status_text: str = ""
     final_status: bool = False
-    ai_popup: bool = False
     status_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    debug_tag: str = ""
     thinking_step: int = 0  # اسپینر Thinking/Working
     thinking_task: asyncio.Task | None = None
     terminalized: bool = False
     status_display: str = ""
-    steps: list = field(default_factory=list)            # هر قدم: {emoji,text,status,model?,ts}
+    steps: list = field(default_factory=list)            # هر قدم: {category,key,status,variant,model,fmt,entered}
     header_kind: str = "thinking"                       # thinking | working | none
-
+    t0: float = field(default_factory=time.time)         # زمان شروع برای شمارندهٔ سپری‌شده
 
 def operation_checkpoint():
     op = _current_operation.get()
     if op and op.cancelled: raise asyncio.CancelledError
 
-
 def clear_interaction(context, keep=()):
     for key in ("await", "notice", "disc", "bc_src", "qs", "qs_channel", "status_message_id"):
         if key not in keep:
-            _old = context.user_data.get(key, "<absent>")
             context.user_data.pop(key, None)
-            _dbg(f"clear_interaction: popped key={key} old_value={_old}")
 
 
 def user_control(uid):
     if uid not in _user_controls: _user_controls[uid] = asyncio.Lock()
     return _user_controls[uid]
 
-
-STEP_VARIANTS = {
-    "thinking": [("🧠 Thinking…", "🧠 Thinking…"), ("🤔 Thinking…", "🤔 Thinking…"), ("🔎 Thinking…", "🔎 Thinking…")],
-    "working": [("⚙️ Working…", "⚙️ Working…"), ("⏳ Working…", "⏳ Working…"), ("🛠 Working…", "🛠 Working…")],
-}
-STEP_ICON = {"ok": "✅", "fail": "❌", "run": "⏳", "warn": "⚠️"}
 def step_add(op, category, key=None, status="run", model=None, **fmt):
     """سابقه‌ی مرحله‌ای با سه وارینت از هر دسته؛ در هر نمایش، وارینت جدید به‌صورت رندوم انتخاب می‌شود."""
     if op is None: return
@@ -2928,15 +2967,11 @@ def step_add(op, category, key=None, status="run", model=None, **fmt):
         op.header_kind = "thinking"
 
 DOTS_SEQ = (3, 2, 1, 0, 1, 2)          # ابتدا سه نقطه یکی‌یکی پاک می‌شود، سپس یکی‌یکی برمی‌گردد
-def thinking_animation(step):
-    return "Thinking" + "." * DOTS_SEQ[step % len(DOTS_SEQ)]
-
 
 def strip_thinking_prefix(text):
     """Remove only a leading Thinking header from a status body."""
     if not text: return ""
     return re.sub(r"^\s*(?:<b>)?Thinking(?:\.{1,3}|…)(?:</b>)?\s*\n", "", str(text), count=1)
-
 
 SPHARSE = {
   # --- مدل‌ها (وضعیت Working) — همیشه با ضمیر اول‌شخص
@@ -2991,23 +3026,27 @@ def _step_text(st, lang):
     try: out = key_tpl.format(model, **f)
     except Exception: out = key_tpl
     return re.sub(r"\{[a-z_]+\}", "", out).strip()   # هیچ جای‌نگهدار بی‌مقداری در متن نمی‌ماند
+STATUS_STEPS = 6                       # چند مرحلهٔ آخر در پنل زنده دیده شود
+STEP_ICON = {"run": "⏳", "ok": "✅", "fail": "❌", "skip": "⏭"}
+def _elapsed(op): return max(0, int(time.time() - getattr(op, "t0", time.time()))) if op else 0
 def make_status(lang, text, step=None):
-    """هدر Thinking/Working + لیست مراحل جاری (حداکثر ۶ خط). متن بیرونی فقط به‌عنوان خط جاری/نهایی.
+    """پنل Thinking، شبیه چت‌بات‌های هوش مصنوعی: هر مرحله با آیکونِ وضعیتِ خودش، ترتیب زمانی
+    (قدیمی‌ترین بالا، کارِ جاری پایین)، شمارندهٔ مراحلِ جمع‌شده و زمان سپری‌شده در هدر.
     """
     if step is None: return str(text or "")
     op = _current_operation.get()
     kind = getattr(op, "header_kind", "thinking")
     dots = "." * DOTS_SEQ[step % len(DOTS_SEQ)]
     header = f"Working{dots}" if kind == "working" else f"Thinking{dots}"
-    steps = (op.steps[-6:] if (op and op.steps) else [])
-    lines = []
-    for st in steps:
-        t = _step_text(st, lang) or st.get("category")
-        lines.append(t)
+    el = _elapsed(op)
+    head = f"<b>{header}</b>" + (f" <code>{el}s</code>" if el >= 3 else "")
+    steps = sorted(getattr(op, "steps", None) or [], key=lambda x: x.get("entered", 0.0)) if op else []
+    hidden, shown = max(0, len(steps) - STATUS_STEPS), steps[-STATUS_STEPS:]
     body = strip_thinking_prefix(text)
+    lines = [tr(lang, "more_steps", n=hidden)] if hidden else []
+    lines += [f"{STEP_ICON.get(st.get('status'), '⏳')} {_step_text(st, lang) or st.get('category') or ''}" for st in shown]
     if body: lines.append(body)
-    return f"<b>{header}</b>\n" + "\n".join(lines[-7:])
-
+    return head + ("\n" + "\n".join(lines) if lines else "")
 
 def operation_text(lang, key):
     texts = {
@@ -3021,50 +3060,63 @@ def operation_text(lang, key):
     }
     return texts[key][1 if lang == "en" else 0]
 
-
-async def delete_temp(bot, chat_id, mid, seconds=5):
-    key = (chat_id, mid)
-    try:
-        if seconds: await asyncio.sleep(seconds)
-        if key in _temp_messages:
-            _dbg(f"delete_temp: DELETING message_id={mid} chat_id={chat_id} after {seconds}s")
-            await bot.delete_message(chat_id, mid)
-    except Exception as e:
-        _dbg(f"delete_temp: FAILED to delete message_id={mid} chat_id={chat_id}: {type(e).__name__}: {e}")
-        log.debug("temporary message deletion failed", exc_info=True)
-    finally:
-        _temp_messages.discard(key)
-        _dbg(f"delete_temp: DONE message_id={mid} in_temp_messages={key in _temp_messages}")
-
+async def _temp_sweeper_loop():
+    """یک تسکِ مشترک برای پاک‌سازی همهٔ پیام‌های موقت (به‌جای یک تسکِ خواب‌رفته به‌ازای هر پیام)."""
+    while True:
+        await asyncio.sleep(0.5)
+        now = time.monotonic()
+        for key, (due, bot) in list(_temp_messages.items()):
+            if due is None or due > now: continue
+            _temp_messages.pop(key, None)
+            try: await bot.delete_message(*key)
+            except Exception: log.debug("temporary message deletion failed", exc_info=True)
 
 def expire_temp(bot, chat_id, mid, seconds=5):
-    task = asyncio.create_task(delete_temp(bot, chat_id, mid, seconds))
-    _temp_tasks.add(task); task.add_done_callback(_temp_tasks.discard)
-
+    """پیام موقت را برای پاک‌سازی خودکار علامت می‌زند؛ تسک جدیدی ساخته نمی‌شود."""
+    global _temp_sweeper
+    prev = _temp_messages.get((chat_id, mid), (None, None))[1]
+    _temp_messages[(chat_id, mid)] = (time.monotonic() + max(0.0, float(seconds)), bot or prev)
+    if _temp_sweeper is None or _temp_sweeper.done():
+        try: _temp_sweeper = asyncio.create_task(_temp_sweeper_loop(), name="temp-sweeper")
+        except RuntimeError: pass          # خارج از event loop؛ با اولین پیام بعدی راه می‌افتد
 
 async def create_temp(bot, chat_id, text, temporary=True):
-    _dbg(f"create_temp: sending message to chat_id={chat_id} temporary={temporary} text={text[:60]!r}")
+
     task = asyncio.create_task(bot.send_message(chat_id, text[:4000], parse_mode=HTML, disable_web_page_preview=True))
     try: msg = await asyncio.shield(task)
     except asyncio.CancelledError:
-        _dbg(f"create_temp: CANCELLED during send to chat_id={chat_id}")
+
         try:
             msg = await task
             if temporary:
-                _temp_messages.add((chat_id, msg.message_id))
+                _temp_messages[(chat_id, msg.message_id)] = (None, bot)
                 expire_temp(bot, chat_id, msg.message_id, 0)
             else:
                 op = _current_operation.get()
                 if op: op.status_message_id = msg.message_id
-                _dbg(f"create_temp: cancel-but-delivered message_id={msg.message_id} op.sm set")
-        except Exception as e:
-            _dbg(f"create_temp: cancel delivery failed: {e}")
+
+        except Exception:
             log.debug("cancelled status delivery failed", exc_info=True)
         raise
-    if temporary: _temp_messages.add((chat_id, msg.message_id))
-    _dbg(f"create_temp: SENT message_id={msg.message_id} temporary={temporary}")
+    if temporary: _temp_messages[(chat_id, msg.message_id)] = (None, bot)
+
     return msg.message_id
 
+async def _paint_status(op, context, display):
+    """وضعیت را روی پیام موجود می‌نویسد و اگر پیام نبود یکی می‌سازد (منطق مشترکِ حالت زنده و حالت پایانی)."""
+    candidate_id = op.status_message_id or context.user_data.get("status_message_id")
+    if candidate_id is not None:
+        try:
+            await context.bot.edit_message_text(display, chat_id=op.chat_id, message_id=candidate_id, parse_mode=HTML, disable_web_page_preview=True)
+            op.status_message_id = candidate_id
+        except BadRequest as e:
+            if "not modified" not in str(e).lower(): op.status_message_id = None
+    if op.status_message_id is None:
+        op.status_message_id = await create_temp(context.bot, op.chat_id, display, temporary=False)
+    if op.status_message_id is not None:
+        context.user_data["status_message_id"] = op.status_message_id
+        return True
+    return False
 
 async def operation_status(context, text, failed=False, terminal=False):
     op = _current_operation.get()
@@ -3083,25 +3135,16 @@ async def operation_status(context, text, failed=False, terminal=False):
             task = op.thinking_task
             op.thinking_task = None
             if task and not task.done(): task.cancel()
-            steps = getattr(op, "steps", [])
-            syms = {"run": "⏳", "ok": "✅", "fail": "❌"}
-            step_lines = [f"{syms.get(st.get('status'), '⏳')} {_step_text(st, lang)}" for st in steps[-6:]]
+            steps = sorted(getattr(op, "steps", None) or [], key=lambda x: x.get("entered", 0.0))
+            hidden, shown = max(0, len(steps) - STATUS_STEPS), steps[-STATUS_STEPS:]
+            step_lines = ([tr(lang, "more_steps", n=hidden)] if hidden else []) + [f"{STEP_ICON.get(st.get('status'), '⏳')} {_step_text(st, lang)}" for st in shown]
             base = body or strip_thinking_prefix(op.status_text)
-            display = (("\n".join(step_lines) + "\n") if step_lines else "") + (base or "")
-            candidate_id = op.status_message_id or context.user_data.get("status_message_id")
-            if candidate_id is not None:
-                try:
-                    await context.bot.edit_message_text(display, chat_id=op.chat_id, message_id=candidate_id, parse_mode=HTML, disable_web_page_preview=True)
-                    op.status_message_id = candidate_id
-                except BadRequest as e:
-                    if "not modified" not in str(e).lower(): op.status_message_id = None
-            if op.status_message_id is None:
-                op.status_message_id = await create_temp(context.bot, op.chat_id, display, temporary=False)
-                context.user_data["status_message_id"] = op.status_message_id
+            el = _elapsed(op)
+            display = (("\n".join(step_lines) + "\n") if step_lines else "") + (base or "") + (f"\n\n<i>⏱ {el}s</i>" if el >= 3 and base else "")
+            await _paint_status(op, context, display)
             if op.status_message_id is not None:
-                context.user_data["status_message_id"] = op.status_message_id
-                # فاز ۳: پیام نتیجه‌ی نهایی پس از نمایش ۵ ثانیه‌ای پاک می‌شود تا صفحه تمیز بماند
-                _temp_messages.add((op.chat_id, op.status_message_id))
+                # پیام نتیجه‌ی نهایی پس از نمایش ۵ ثانیه‌ای پاک می‌شود تا صفحه تمیز بماند
+                _temp_messages[(op.chat_id, op.status_message_id)] = (None, context.bot)
                 expire_temp(context.bot, op.chat_id, op.status_message_id, 5)
         return True
 
@@ -3114,18 +3157,7 @@ async def operation_status(context, text, failed=False, terminal=False):
         op._last_status_update = now
         display = make_status(lang, body, op.thinking_step)
         op.status_display = display
-        candidate_id = op.status_message_id or context.user_data.get("status_message_id")
-        if candidate_id is not None:
-            try:
-                await context.bot.edit_message_text(display, chat_id=op.chat_id, message_id=candidate_id, parse_mode=HTML, disable_web_page_preview=True)
-                op.status_message_id = candidate_id
-            except BadRequest as e:
-                msg = str(e).lower()
-                if "not modified" not in msg:
-                    op.status_message_id = None
-        if op.status_message_id is None:
-            op.status_message_id = await create_temp(context.bot, op.chat_id, display, temporary=False)
-            context.user_data["status_message_id"] = op.status_message_id
+        await _paint_status(op, context, display)
 
         if op.thinking_task is None or op.thinking_task.done():
             async def animate():
@@ -3151,34 +3183,30 @@ async def operation_status(context, text, failed=False, terminal=False):
             op.thinking_task = asyncio.create_task(animate(), name=f"thinking:{op.user}:{op.operation_type}")
     return True
 
-
 async def run_user_operation(update, context, kind, channel, work, show_status=False, replace=False, keep=()):
     uid = update.effective_user.id; lang = L(update)
-    _test_run_counter["n"] += 1
-    tag = f"TEST-{_test_run_counter['n']}"
-    _dbg(f"[{tag}] ENTER run_user_operation kind={kind} channel={channel} replace={replace} uid={uid} "
-         f"uid_in_ops={uid in _operations} status_msg_id={context.user_data.get('status_message_id')}")
+
     async with user_control(uid):
-        _dbg(f"[{tag}] ACQUIRED user_control lock uid={uid}")
+
         replaced_status = False
         if replace:
             replaced_status = await cancel_user_operation(uid)
-            _dbg(f"[{tag}] cancel_user_operation returned replaced_status={replaced_status}")
+
             clear_interaction(context, keep=keep)
         if uid in _operations:
-            _dbg(f"[{tag}] BLOCKED: uid {uid} still in _operations — op.status_message_id={getattr(_operations.get(uid), 'status_message_id', 'N/A')}")
+
             await popup(update, context, operation_text(lang, "busy"), alert=True)
             return
-        op = Operation(uid, channel, kind, update.effective_chat.id, replaced_status=replaced_status, debug_tag=tag)
+        op = Operation(uid, channel, kind, update.effective_chat.id, replaced_status=replaced_status)
         context.user_data.pop("status_message_id", None)  # clear stale status message from prior operation
-        _dbg(f"[{tag}] op created status_message_id={op.status_message_id} final_status={op.final_status}")
+
         async def run():
             token = _current_operation.set(op)
             outcome = "completed"
             try:
                 op.started = True
                 log_event("INFO", f"operation start type={kind} channel={channel}", uid)
-                _dbg(f"[{tag}] OPERATION START work={work}")
+
                 operation_checkpoint()
                 if show_status: await operation_status(context, operation_text(lang, "running"))
                 result = await work()
@@ -3186,18 +3214,15 @@ async def run_user_operation(update, context, kind, channel, work, show_status=F
                 if op.failed: outcome = "failed"
                 return result
             except asyncio.CancelledError:
-                _dbg(f"[{tag}] CancelledError in run_user_operation")
                 op.cancelled = True; outcome = "cancelled"
                 raise
-            except Exception as e:
-                _dbg(f"[{tag}] Exception in run: {type(e).__name__}: {e}")
+            except Exception:
                 op.failed = True; outcome = "failed"
                 op.final_status = False
                 log.exception("operation failed user=%s type=%s channel=%s", uid, kind, channel)
                 clear_interaction(context)
             finally:
-                _dbg(f"[{tag}] FINALLY: outcome={outcome} op.status_message_id={op.status_message_id} op.final_status={op.final_status} op.failed={op.failed} _operations_has_uid={uid in _operations}")
-                _dbg(f"[{tag}] OPERATION END outcome={outcome} status_message_id={op.status_message_id}")
+
                 try:
                     if outcome == "cancelled":
                         clear_interaction(context)
@@ -3214,14 +3239,14 @@ async def run_user_operation(update, context, kind, channel, work, show_status=F
                     op.thinking_task = None
                     context.user_data.pop("status_message_id", None)
                     if _operations.get(uid) is op: _operations.pop(uid, None)
-                    _dbg(f"[{tag}] AFTER POP: uid in _operations={uid in _operations} user_data status_msg_id={context.user_data.get('status_message_id')}")
+
                     _current_operation.reset(token)
         op.task = asyncio.create_task(run(), name=f"user:{uid}:{kind}")
         _operations[uid] = op
-        _dbg(f"[{tag}] _operations[{uid}] = op (status_message_id={op.status_message_id})")
+
     try: return await asyncio.shield(op.task)
     except asyncio.CancelledError:
-        _dbg(f"[{tag}] CancelledError at shield level")
+
         if not op.cancelled:
             op.cancelled = True
             if op.started: op.task.cancel()
@@ -3229,9 +3254,8 @@ async def run_user_operation(update, context, kind, channel, work, show_status=F
             try: await asyncio.shield(op.task)
             except asyncio.CancelledError: pass
     finally:
-        _dbg(f"[{tag}] EXIT run_user_operation. _operations has uid={uid in _operations}")
-        if op.task.done() and _operations.get(uid) is op: _operations.pop(uid, None)
 
+        if op.task.done() and _operations.get(uid) is op: _operations.pop(uid, None)
 
 async def cancel_user_operation(uid):
     op = _operations.get(uid)
@@ -3244,7 +3268,6 @@ async def cancel_user_operation(uid):
         if not op.task.done(): raise
     if _operations.get(uid) is op: _operations.pop(uid, None)
     return op.status_message_id is not None
-
 
 def _ai_status_reporter(context, lang):
     async def report(event, label, code):
@@ -3290,11 +3313,9 @@ def _ai_status_reporter(context, lang):
         await operation_status(context, body)
     return report
 
-
 async def run_model_test(update, context, mid, personal=False):
     uid = update.effective_user.id; lang = L(update); m = get_model(mid)
     op = _current_operation.get()
-    if op: op.ai_popup = True
     if not m or (personal and m["owner_id"] != uid):
         return await popup(update, context, tr(lang, "notfound"), alert=True)
     started = time.monotonic(); label = _model_label(m, uid if personal else None)
@@ -3319,7 +3340,6 @@ async def run_model_test(update, context, mid, personal=False):
     finally:
         _ai_events.reset(token)
 
-
 async def popup(update, context, text, alert=False):
     op = _current_operation.get()
     plain = strip_tags(text); temp = None
@@ -3341,28 +3361,26 @@ async def popup(update, context, text, alert=False):
         except Exception: pass
     await send_temp(context, update.effective_chat.id, text, seconds=temp)
 async def render(update, context, text, kb=None, force_new=False):
-    op = _current_operation.get()
-    tag = getattr(op, 'debug_tag', '?')
     operation_checkpoint()
     notice = context.user_data.pop("notice", None)
-    _dbg(f"[{tag}] render ENTER text={text[:60]!r} force_new={force_new} has_qy={update.callback_query is not None} panel_msg={context.user_data.get('panel')}")
+
     if notice: await popup(update, context, notice)
     text = text[:4000]; markup = InlineKeyboardMarkup(kb) if kb else None; qy = update.callback_query; chat_id = update.effective_chat.id
     if qy and qy.message and not force_new:
-        _dbg(f"[{tag}] render: editing callback message_id={qy.message.message_id}")
-        try: await qy.edit_message_text(text, reply_markup=markup, parse_mode=HTML, disable_web_page_preview=True); context.user_data["panel"] = qy.message.message_id; _dbg(f"[{tag}] render: edited callback message OK"); return
+
+        try: await qy.edit_message_text(text, reply_markup=markup, parse_mode=HTML, disable_web_page_preview=True); context.user_data["panel"] = qy.message.message_id; return
         except BadRequest as e:
-            _dbg(f"[{tag}] render: BadRequest on qy.message.edit: {e}")
+
             if "not modified" in str(e).lower(): return
     mid = context.user_data.get("panel")
     if mid and not force_new:
-        _dbg(f"[{tag}] render: editing panel message_id={mid}")
-        try: await context.bot.edit_message_text(text, chat_id=chat_id, message_id=mid, reply_markup=markup, parse_mode=HTML, disable_web_page_preview=True); _dbg(f"[{tag}] render: edited panel OK"); return
+
+        try: await context.bot.edit_message_text(text, chat_id=chat_id, message_id=mid, reply_markup=markup, parse_mode=HTML, disable_web_page_preview=True); return
         except BadRequest as e:
-            _dbg(f"[{tag}] render: BadRequest on panel.edit: {e}")
+
             if "not modified" in str(e).lower(): return
-    _dbg(f"[{tag}] render: SENDING NEW message (no panel)")
-    m = await context.bot.send_message(chat_id, text, reply_markup=markup, parse_mode=HTML, disable_web_page_preview=True); context.user_data["panel"] = m.message_id; _dbg(f"[{tag}] render: sent new message_id={m.message_id}")
+
+    m = await context.bot.send_message(chat_id, text, reply_markup=markup, parse_mode=HTML, disable_web_page_preview=True); context.user_data["panel"] = m.message_id;
 async def ask(update, context, prompt, kind, back, **extra):
     lang = L(update); context.user_data["await"] = {"kind": kind, "back": back, **extra}
     await render(update, context, f"✏️ {prompt}\n\n<i>{tr(lang, 'send_value')}</i>", [[B(tr(lang, "cancel"), "c:cancel")]])
@@ -3453,7 +3471,7 @@ def _upgrade_price(uid, p, cur, disc_percent):
     new_num = _price_num(p)
     if not new_num or not cur or not _price_num(cur): return None, None
     cur_num, cur_days = _price_num(cur), cur["days"] or 0
-    rv = proration_remaining_value(uid, new_num, cur_num, cur_days)
+    rv = proration_remaining_value(uid, cur_num, cur_days)
     amt = round(max(0.0, new_num - rv), 2)
     if disc_percent: amt = round(amt * (100 - disc_percent) / 100, 2)
     return amt, rv
@@ -3483,6 +3501,8 @@ async def view_admin_home(update, context):
     pname = "∞" if is_super(uid) else (plan_txt(lim["plan"], "name", lang) or tr(lang, "no_plan"))
     text = (f"{tr(lang, 'panel')}\n🧾 <b>{esc(pname)}</b>" + (tr(lang, "until", d=fmt_date(lim["expires"], admin_offset(uid))) if lim["expires"] else "") + "\n" +
             tr(lang, "today_line", p=use["posts"], pc=cap(lim["daily_posts"]), t=use["tests"], tc=cap(lim["daily_tests"]), c=len(chs), cc=cap(lim["max_channels"]), s=count_sources(uid), sc=cap(lim["max_sources"])))
+    text += quota_bars([("📝", use["posts"], lim["daily_posts"]), ("🧪", use["tests"], lim["daily_tests"]),
+                        ("📢", len(chs), lim["max_channels"]), ("🔗", count_sources(uid), lim["max_sources"])])
     if lim["next_plan"]: text += "\n" + tr(lang, "plans_next", name=esc(plan_txt(lim["next_plan"], "name", lang)))
     if not lim["active"]: text += "\n\n" + tr(lang, "plan_inactive")
     text += "\n\n" + (tr(lang, "pick_channel") if chs else tr(lang, "no_channels"))
@@ -3496,14 +3516,55 @@ async def view_channel(update, context, cid):
     s = get_settings(cid); on = s["enabled"]
     text = (tr(lang, "ch_panel", title=esc(ch["title"])) + (f" · @{ch['username']}" if ch["username"] else "") + "\n" + tr(lang, "ch_status", i="🟢" if on else "🔴", st=tr(lang, "on" if on else "off"), mode=tr(lang, "auto" if s["mode"] == "auto" else "review")) + "\n" +
             tr(lang, "ch_stats", s=len(list_sources(cid, True)), q=ready_count(cid), p=count_articles(cid=cid, hours=24, status="published"), r=count_articles(cid=cid, hours=24, status="rejected"), a=ago_text(s["last_run"], lang)))
-    kb = [[B(tr(lang, "report"), f"a:rep:{cid}"), B(tr(lang, "test"), f"a:test:{cid}")], [B(tr(lang, "sources", n=len(list_sources(cid))), f"a:src:{cid}"), B(tr(lang, "content"), f"a:con:{cid}")],
-          [B(tr(lang, "sched"), f"a:sch:{cid}"), B(tr(lang, "queue", n=ready_count(cid)), f"a:que:{cid}")], [B(tr(lang, "rejected"), f"a:rej:{cid}"), B(tr(lang, "lock"), f"a:lock:{cid}")],
-          [B(tr(lang, "logs"), f"a:logs:{cid}"), B(tr(lang, "automation", i="🟢" if on else "🔴"), f"a:tog:{cid}:enabled")], [B(tr(lang, "ch_del"), f"a:chdel:{cid}")], [B(tr(lang, "back"), "a:home")]]
+    text += quota_bars([("📝", channel_posts_today(cid, admin_offset(uid)), s.get("daily_posts_cap"))])
+    kb = [[B(tr(lang, "report"), f"a:rep:{cid}"), B(tr(lang, "test"), f"a:test:{cid}")],
+          [B(tr(lang, "sources", n=len(list_sources(cid))), f"a:src:{cid}"), B(tr(lang, "content"), f"a:con:{cid}")],
+          [B(tr(lang, "sched"), f"a:sch:{cid}"), B(tr(lang, "queue", n=ready_count(cid)), f"a:que:{cid}")],
+          [B(tr(lang, "rejected"), f"a:rej:{cid}")],
+          [B(tr(lang, "automation", i="🟢" if on else "🔴"), f"a:tog:{cid}:enabled"), B(tr(lang, "ch_del"), f"a:chdel:{cid}")],
+          [B(tr(lang, "back"), "a:home")]]
     await render(update, context, text, kb)
-async def view_lock(update, context, cid):
-    lang = L(update); ch = channel_owned(cid, update.effective_user.id)
-    if not ch: return await view_admin_home(update, context)
-    await render(update, context, tr(lang, "lock_text", title=esc(ch["title"]), code=ch["lock_code"] or regen_lock(cid)), [[B(tr(lang, "lock_regen"), f"a:lockre:{cid}")], [B(tr(lang, "back"), f"a:ch:{cid}")]])
+async def channel_claim(update, context, existing, uid, lang, back, ud):
+    """کانالی که در پنل دیگری است: ثبت‌کنندهٔ نخست «بررسی» می‌گیرد؛ دیگران باید توکن ۱۰ رقمی مالک را بیاورند."""
+    cid = existing["id"]; owner = first_registrant(cid)
+    if owner is None: return await popup(update, context, tr(lang, "notfound"), alert=True)
+    cur = existing["admin_id"]; ow = get_user(cur)
+    owho = f"{esc(uname(ow))} (<code>{cur}</code>)"
+    ud.pop("await", None)
+    if uid == owner or is_super(uid):
+        return await render(update, context, tr(lang, "ch_recover_text", title=esc(existing["title"]), who=owho),
+                            [[B(tr(lang, "b_recheck"), f"a:chrec:{cid}")], [B(tr(lang, "cancel"), "c:cancel")]])
+    tok = issue_transfer_token(cid, owner)
+    if not tok: return await popup(update, context, tr(lang, "ch_recheck_err"), alert=True)
+    me = get_user(uid); who_me = f"{esc(uname(me))} (<code>{uid}</code>)"
+    await notify_user_fn(owner, tr(user_lang(owner) or "fa", "ch_token_dm", title=esc(existing["title"]), who=who_me, token=tok, min=TRANSFER_TTL_MIN))
+    await notify_supers(f"«{esc(existing['title'])}» transfer token issued for {who_me}")
+    log_event("WARN", f"توکن انتقال «{existing['title']}» صادر شد (متقاضی {uid})", uid)
+    ud["await"] = {"kind": "chtoken", "cid": cid, "back": back, "tries": 0, "title": existing["title"]}
+    text = tr(lang, "ch_taken", who=owho) + "\n\n" + tr(lang, "ch_token_sent", who=esc(uname(ow)), min=TRANSFER_TTL_MIN)
+    await render(update, context, text, [[B(tr(lang, "cancel"), "c:cancel")]])
+async def channel_recheck(update, context, cid):
+    """بازیابی مالکیت: ثبت‌کنندهٔ نخست، پس از سلب دسترسی مالک فعلی در تلگرام، مالکیت را برمی‌گرداند."""
+    uid = update.effective_user.id; lang = L(update)
+    ch = get_channel(cid); owner = first_registrant(cid)
+    if not ch or owner is None or (uid != owner and not is_super(uid)):
+        return await popup(update, context, tr(lang, "notfound"), alert=True)
+    cur = ch["admin_id"]
+    if cur == uid:
+        await popup(update, context, tr(lang, "ch_exists_mine")); return await view_channel(update, context, cid)
+    ow = get_user(cur); owho = f"{esc(uname(ow))} (<code>{cur}</code>)"
+    try:
+        mem = await context.bot.get_chat_member(ch["chat_id"], cur); still = mem.status in ("administrator", "creator")
+    except Exception:
+        return await popup(update, context, tr(lang, "ch_recheck_err"), alert=True)
+    if still: return await popup(update, context, tr(lang, "ch_recheck_still", who=owho), alert=True)
+    try: old = revert_channel_owner(cid, uid)
+    except RuntimeError: return await popup(update, context, tr(lang, "test_busy"), alert=True)
+    log_event("WARN", f"مالکیت «{ch['title']}» از {old} به ثبت‌کنندهٔ نخست {uid} برگشت", uid)
+    await notify_user_fn(cur, tr(user_lang(cur) or "fa", "ch_reverted", title=esc(ch["title"]), who=owho))
+    await notify_supers(f"«{esc(ch['title'])}» ownership reverted {old} → {uid}")
+    await popup(update, context, tr(lang, "ch_recheck_ok", title=esc(ch["title"])))
+    return await dispatch(update, context, f"a:ch:{cid}")
 # ============================================================
 # منابع
 async def view_sources(update, context, cid):
@@ -3580,6 +3641,7 @@ async def view_queue(update, context, cid, status="ready"):
     else: text = tr(lang, "rej_title", title=esc(ch["title"])) + "\n" + "".join(f"\n• {esc((r['title'] or hostname(r['url']))[:40])} — <i>{esc(reason_text(r['reason'], lang))}</i>" for r in arts)
     kb = [[B(f"{'⭐' + str(a['score']) if a['score'] else '•'} {(a['title'] or hostname(a['url']))[:35]}", f"a:art:{a['id']}")] for a in arts]
     if status == "ready" and arts: kb.append([B(tr(lang, "pub_first"), f"a:pub:{arts[0]['id']}")])
+    if status == "ready": kb.append([B(tr(lang, "queue_reset"), f"a:qreset:{cid}")])
     kb.append([B(tr(lang, "back"), f"a:ch:{cid}")]); await render(update, context, text, kb)
 async def view_article(update, context, aid):
     uid = update.effective_user.id; lang = L(update); a = get_article(aid)
@@ -3602,7 +3664,7 @@ async def view_article(update, context, aid):
         kb.append(row)
     kb.append([B(tr(lang, "back"), f"a:que:{cid}" if a["status"] in ("ready", "published") else f"a:rej:{cid}")]); await render(update, context, text, kb)
 # ============================================================
-# پلن من، لاگ، تست فوری (با محدودیت نرخ)
+# پلن من، تست فوری (با محدودیت نرخ)
 async def view_my_ai(update, context):
     """مدل‌های شخصیِ همین مدیر (جدا از مدل‌های عمومی مدیر کلان)."""
     uid = update.effective_user.id; lang = L(update); ms = list_models(owner_id=uid)
@@ -3621,13 +3683,6 @@ async def view_my_plan(update, context):
     text = tr(lang, "myplan", name=esc(pname), st=tr(lang, "st_active" if lim["active"] else "st_expired"), exp=tr(lang, "exp_at", d=fmt_date(lim["expires"], admin_offset(uid), True)) if lim["expires"] else "", nxt=("\n" + tr(lang, "plans_next", name=esc(plan_txt(lim["next_plan"], "name", lang)))) if lim["next_plan"] else "",
               p=use["posts"], pc=cap(lim["daily_posts"]), t=use["tests"], tc=cap(lim["daily_tests"]), s=count_sources(uid), sc=cap(lim["max_sources"]), c=len(list_channels(uid)), cc=cap(lim["max_channels"]))
     await render(update, context, text, [[B(tr(lang, "upgrade_btn"), "u:plans")], [B(tr(lang, "back"), "a:home")]])
-async def view_logs(update, context, admin_id=None, level=None, back="a:home", refresh="a:logs"):
-    """مدیران فقط ۱۰ مورد آخر را می‌بینند (پیام‌ها پیش از ثبت از نام مدل و Base URL پاک شده‌اند)؛ سوپرادمین ۲۰ مورد."""
-    lang = L(update); n = 10 if admin_id else 20; rows = recent_logs(n, admin_id=admin_id, level=level)
-    text = tr(lang, "logs_title", lvl=f" · {level}" if level else "") + ("\n".join(f"{'🔴' if r['level'] == 'ERROR' else '🟡' if r['level'] == 'WARN' else '🔵'} <code>{r['ts'][11:16]}</code> {esc(r['msg'][:100])}" for r in rows) or tr(lang, "logs_empty"))
-    if admin_id: text += tr(lang, "logs_note")
-    kb = [[B(tr(lang, "refresh"), refresh)], [B(tr(lang, "back"), back)]] if admin_id else [[B(tr(lang, "all"), "s:logs:all"), B(tr(lang, "errors"), "s:logs:ERROR"), B(tr(lang, "warns"), "s:logs:WARN")], [B(tr(lang, "back"), back)]]
-    await render(update, context, text, kb)
 async def run_test(update, context, cid):
     uid = update.effective_user.id; lang = L(update); ch = channel_owned(cid, uid); qy = update.callback_query
     if not ch: return await view_admin_home(update, context)
@@ -3637,17 +3692,15 @@ async def run_test(update, context, cid):
     if not is_super(uid) and not rate_free(f"test:{cid}", TEST_COOLDOWN_SEC): await popup(update, context, tr(lang, "test_wait", n=rate_left(f"test:{cid}", TEST_COOLDOWN_SEC)), alert=True); return await view_channel(update, context, cid)
     try: await qy.answer(); context._callback_answered = True
     except Exception: pass
-    _op_dbg = _current_operation.get()
-    tag = _op_dbg.debug_tag if _op_dbg else "unknown"
-    _dbg(f"TEST START run_test tag={tag} cid={cid} uid={uid} op.status_message_id={getattr(_op_dbg, 'status_message_id', 'N/A')}")
-    last = [0.0]; head = tr(lang, "test_head", title=esc(ch["title"]))
-    _dbg(f"[{tag}] ENTER run_test cid={cid} uid={uid} head={head[:40]!r} op.status_message_id={getattr(_op_dbg, 'status_message_id', 'N/A')}")
+
+    last = [0.0]
+
     async def progress(pct, txt):
         if time.time() - last[0] < 1.6 and pct < 100:
-            _dbg(f"[{tag}] progress SKIP rate-limited (last={last[0]:.1f} pct={pct} txt={txt[:40]!r})")
+
             return
         last[0] = time.time()
-        _dbg(f"[{tag}] progress({pct}, {txt[:50]!r})")
+
         await operation_status(context, txt)
     await progress(1, tr(lang, "preparing"))
     model_labels = []; report_ai = _ai_status_reporter(context, lang)
@@ -3657,12 +3710,12 @@ async def run_test(update, context, cid):
     ai_token = _ai_events.set(ai_progress)
     try:
         res = await run_channel_cycle(context.bot, uid, cid, test_mode=True, progress=progress)
-        _dbg(f"[{tag}] run_channel_cycle returned published={res.get('published')} queued={res.get('queued')}")
+
     except Exception as e:
-        _dbg(f"[{tag}] run_test EXCEPTION: {type(e).__name__}: {e}")
+
         log_event("ERROR", f"تست کانال {ch['title']}: {e}", uid); d = Diag(); d.add("ai_fail", err=ai_err_text(err_code(e), lang)); res = {"published": 0, "queued": 0, "links": [], "diag": d, "src": ""}
     except asyncio.CancelledError:
-        _dbg(f"[{tag}] run_test CancelledError")
+
         raise
     finally:
         _ai_events.reset(ai_token)
@@ -3691,49 +3744,16 @@ async def run_test(update, context, cid):
     else:
         final = tr(lang, 'test_summary_fail')
     if model_line: final += "\n\n" + model_line
-    _dbg(f"[{tag}] run_test sending terminal status: final={final!r} ok={ok} op={op} op.status_message_id={getattr(op, 'status_message_id', 'N/A')}")
+
     await operation_status(context, final, failed=not ok, terminal=True)
     if op: op.failed = not ok; op.final_status = True
-    _dbg(f"[{tag}] run_test set op.final_status=True op.status_message_id={op.status_message_id if op else 'N/A'}")
+
     kb.append([B(tr(lang, "back_panel"), f"a:ch:{cid}")]); await render(update, context, text, kb)
-    _dbg(f"[{tag}] EXIT run_test — render done, returning to run_user_operation finally block")
-    _dbg(f"TEST END run_test tag={tag} cid={cid} op.status_message_id={op.status_message_id if op else 'N/A'} final_status={getattr(op, 'final_status', 'N/A') if op else 'N/A'}")
+
 # ---------- پایان پنل مدیر میانی ----------
 # ============================================================
 # پنل مدیر کلان، dispatch (با محدودکننده‌ی نرخ)، ورودی‌ها، پشتیبانی، دیپ‌لینک، main
 # ============================================================
-TXT.update({
-    "s_title": ("👑 <b>مدیر کلان</b>\n🤖 مدل‌ها {m} ({ms}) · 👥 مدیران {a} / کاربران {u}\n🛎 پرداخت معلق {p} · 🎟 کد تخفیف {dc} · ⚖️ صف {due}\n💓 {hb}", "👑 <b>Super admin</b>\n🤖 models {m} ({ms}) · 👥 admins {a} / users {u}\n🛎 pending payments {p} · 🎟 discount codes {dc} · ⚖️ queue {due}\n💓 {hb}"),
-    "s_all_ok": ("سالم", "healthy"), "s_down": ("{n} خراب 🔴", "{n} down 🔴"), "s_report": ("📊 گزارش", "📊 Report"), "s_logs": ("📜 لاگ", "📜 Logs"), "s_plans": ("🧾 پلن‌ها", "🧾 Plans"), "s_users": ("👥 کاربران", "👥 Users"),
-    "s_models": ("🤖 مدل‌ها", "🤖 Models"), "s_pays": ("🛎 پرداخت‌ها ({n})", "🛎 Payments ({n})"), "s_discs": ("🎟 کدهای تخفیف", "🎟 Discount codes"), "s_bc": ("📣 همگانی", "📣 Broadcast"), "s_texts": ("📝 متن‌ها", "📝 Texts"),
-    "s_admins": ("🧑‍💼 مدیران", "🧑‍💼 Admins"), "s_auto": ("{i} اتوماسیون کل", "{i} Global automation"), "s_me": ("👤 پنل من", "👤 My panel"), "s_auto_on": ("🟢 اتوماسیون کل روشن شد", "🟢 Global automation on"), "s_auto_off": ("🔴 اتوماسیون کل خاموش شد", "🔴 Global automation off"),
-    "s_plans_title": ("🧾 <b>پلن‌ها</b>", "🧾 <b>Plans</b>"), "s_plan_new": ("➕ پلن", "➕ Plan"), "s_plan_created": ("✅ «{name}» ساخته شد", "✅ “{name}” created"), "s_plan_deleted": ("🗑 پلن حذف شد", "🗑 Plan deleted"),
-    "s_plan_view": ("🧾 <b>{name}</b> / {name_en} {free} {st}\n{desc}\n{desc_en}\n⏳ {days}d · 📢 {posts}/d · 🧪 {tests}/d · 🌐 {src} · 📣 {ch}\n💰 {price} / {price_en} · 🔢 {price_num}\n👥 {n} کاربر", "🧾 <b>{name}</b> / {name_en} {free} {st}\n{desc}\n{desc_en}\n⏳ {days}d · 📢 {posts}/d · 🧪 {tests}/d · 🌐 {src} · 📣 {ch}\n💰 {price} / {price_en} · 🔢 {price_num}\n👥 {n} users"),
-    "s_plan_free_set": ("🎁 رایگان شود", "🎁 Make free"), "s_plan_free_done": ("🎁 پلن رایگان تنظیم شد", "🎁 Free plan set"), "s_plan_del": ("🗑 حذف پلن", "🗑 Delete plan"), "s_field_prompt": ("مقدار جدید «{f}»:", "New value for “{f}”:"),
-    "s_discs_title": ("🎟 <b>کدهای تخفیف</b>", "🎟 <b>Discount codes</b>"), "s_disc_new": ("➕ کد", "➕ Code"), "s_disc_line": ("\n{i} <code>{code}</code> −{p}% · تا {exp} · {used}/{max}", "\n{i} <code>{code}</code> −{p}% · until {exp} · {used}/{max}"),
-    "s_disc_view": ("🎟 <code>{code}</code> {st}\n−{p}% · انقضا {exp} · استفاده {used}/{max}", "🎟 <code>{code}</code> {st}\n−{p}% · expires {exp} · used {used}/{max}"), "s_disc_created": ("✅ کد {code} ساخته شد", "✅ Code {code} created"), "s_disc_dup": ("⚠️ کد تکراری یا نامعتبر", "⚠️ Duplicate or invalid code"),
-    "s_disc_exp_bad": ("⚠️ انقضا: عدد روز یا تاریخ YYYY-MM-DD", "⚠️ Expiry: days number or YYYY-MM-DD"), "s_disc_p": ("✏️ درصد", "✏️ Percent"), "s_disc_e": ("✏️ انقضا", "✏️ Expiry"), "s_disc_m": ("✏️ سقف استفاده", "✏️ Max uses"), "s_disc_del": ("🗑 حذف کد", "🗑 Delete code"), "unlimited": ("∞", "∞"),
-    "s_users_title": ("👥 <b>{what}</b> ({n}) · {p}/{pp}", "👥 <b>{what}</b> ({n}) · {p}/{pp}"), "s_users_w": ("کاربران", "Users"), "s_admins_w": ("مدیران", "Admins"), "s_prev": ("⬅️", "⬅️"), "s_next": ("➡️", "➡️"),
-    "s_user_view": ("👤 <b>{name}</b> · <code>{id}</code> · {role} · {ban} · {lang} {prem}\n🧾 {plan} {act}{exp}{nxt}\n📢 امروز {p} پست · {t} تست · 📣 {c} کانال · 🌐 {s} منبع\n📰 ۲۴h: {d} کشف · {pub} منتشر · 🎁 رایگان {free}\n🕐 عضویت {join} · آخرین {seen}", "👤 <b>{name}</b> · <code>{id}</code> · {role} · {ban} · {lang} {prem}\n🧾 {plan} {act}{exp}{nxt}\n📢 today {p} posts · {t} tests · 📣 {c} channels · 🌐 {s} sources\n📰 24h: {d} found · {pub} published · 🎁 free {free}\n🕐 joined {join} · seen {seen}"),
-    "s_ban_y": ("⛔ مسدود", "⛔ banned"), "s_ban_n": ("✅ آزاد", "✅ active"), "s_uplan": ("🧾 تعیین پلن", "🧾 Assign plan"), "s_urevoke": ("❌ لغو پلن", "❌ Revoke plan"), "s_uban": ("⛔ مسدود/آزاد", "⛔ Ban/unban"), "s_umsg": ("✉️ پیام", "✉️ Message"),
-    "s_ureport": ("📊 کانال‌ها", "📊 Channels"), "s_ufree": ("🔁 ریست رایگان", "🔁 Reset free"), "s_utests": ("🧪 ریست تست", "🧪 Reset tests"), "s_uposts": ("📢 ریست پست", "📢 Reset posts"),
-    "s_plan_pick": ("🧾 پلن این کاربر:", "🧾 Plan for this user:"), "s_assigned": ("✅ پلن تا {d} فعال شد", "✅ Plan active until {d}"), "s_assigned_q": ("⏭ پلن بعدی (پس از {d})", "⏭ Queued as next (after {d})"),
-    "s_revoked": ("❌ پلن لغو شد", "❌ Plan revoked"), "s_banned": ("⛔ مسدود شد", "⛔ Banned"), "s_unbanned": ("✅ آزاد شد", "✅ Unbanned"), "s_free_reset": ("🔁 سهمیه‌ی رایگان ریست شد", "🔁 Free quota reset"), "s_tests_reset": ("🧪 تست امروز ریست شد", "🧪 Tests reset"), "s_posts_reset": ("📢 پست امروز ریست شد", "📢 Posts reset"),
-    "s_no_channels": ("کانالی ندارد", "No channels"), "s_pick_channel": ("📢 کانال:", "📢 Channel:"),
-    "s_models_title": ("🤖 <b>مدل‌ها</b>\nبه ترتیب اولویت؛ با خرابی یکی، بعدی استفاده می‌شود. هر سرویس سازگار با OpenAI / Anthropic / Gemini پشتیبانی می‌شود.", "🤖 <b>Models</b>\nUsed in priority order; on failure the next is used. Any OpenAI-compatible / Anthropic / Gemini service is supported."), "s_model_add": ("➕ مدل", "➕ Model"), "s_models_test": ("🧪 تست همه", "🧪 Test all"),
-    "s_model_view": ("🤖 <b>{name}</b> · {kind}\n<code>{model}</code>\n🔗 <code>{base}</code>\n🔑 <code>{key}</code>\n⚙️ اولویت {pr} · دما {temp} · توکن {mx}\n{st} · ✅ {ok} · ⚠️×{fc}\n🕐 موفق {lo} · خطا {lf}{err}", "🤖 <b>{name}</b> · {kind}\n<code>{model}</code>\n🔗 <code>{base}</code>\n🔑 <code>{key}</code>\n⚙️ priority {pr} · temp {temp} · tokens {mx}\n{st} · ✅ {ok} · ⚠️×{fc}\n🕐 ok {lo} · error {lf}{err}"),
-    "s_m_off": ("⏸ خاموش", "⏸ off"), "s_m_ok": ("🟢 سالم", "🟢 healthy"), "s_m_down": ("🔴 خراب", "🔴 down"), "s_model_test": ("🧪 تست", "🧪 Test"), "s_model_del": ("🗑 حذف مدل", "🗑 Delete model"),
-    "s_model_testing": ("🧪 در حال تست…", "🧪 Testing…"), "s_model_res": ("{i} {t}s: {out}", "{i} {t}s: {out}"), "s_model_added": ("✅ مدل «{name}» اضافه شد · {res}", "✅ Model “{name}” added · {res}"), "s_model_need": ("⚠️ Base URL و نام مدل الزامی است", "⚠️ Base URL and model name are required"), "s_model_on": ("🟢 مدل روشن شد", "🟢 Model on"), "s_model_off": ("⏸ مدل خاموش شد", "⏸ Model off"),
-    "s_pays_title": ("🛎 <b>پرداخت‌های معلق</b>", "🛎 <b>Pending payments</b>"), "s_pay_none": ("— خالی —", "— none —"), "s_pay_line": ("\n• #{id} {who} → <b>{plan}</b> · {price} · {t}", "\n• #{id} {who} → <b>{plan}</b> · {price} · {t}"), "s_pay_rc": ("📎 #{id}", "📎 #{id}"),
-    "s_pay_ok": ("✅ تأیید", "✅ Approve"), "s_pay_no": ("❌ رد", "❌ Reject"), "s_pay_done_ok": ("✅ تأیید شد؛ پلن فعال/رزرو شد", "✅ Approved; plan activated/queued"), "s_pay_done_no": ("❌ رد شد", "❌ Rejected"), "s_pay_seen": ("⚠️ قبلاً بررسی شده", "⚠️ Already handled"),
-    "s_pay_new": ("🛎 <b>پرداخت #{id}</b>\n👤 {who} (<code>{uid}</code>)\n🧾 <b>{plan}</b> · 💰 {price}{disc}{note}", "🛎 <b>Payment #{id}</b>\n👤 {who} (<code>{uid}</code>)\n🧾 <b>{plan}</b> · 💰 {price}{disc}{note}"),
-    "s_bc_prompt": ("پیام همگانی (متن/عکس/ویدیو؛ فرمت حفظ می‌شود):", "Broadcast message (text/photo/video; formatting kept):"), "s_bc_confirm": ("📣 ارسال به <b>{n}</b> کاربر؟", "📣 Send to <b>{n}</b> users?"), "s_bc_go": ("✅ ارسال", "✅ Send"), "s_bc_sending": ("📣 ارسال به {n} کاربر…", "📣 Sending to {n} users…"), "s_bc_done": ("📣 موفق {ok} · ناموفق {fail}", "📣 ok {ok} · failed {fail}"),
-    "s_texts_title": ("📝 <b>متن‌ها</b> (فارسی/انگلیسی) · جای‌گذارها: welcome {{name}} · pay {{plan}} {{price}}", "📝 <b>Texts</b> (fa/en) · placeholders: welcome {{name}} · pay {{plan}} {{price}}"), "s_text_prompt": ("متن جدید «{k}» ({lg}):", "New “{k}” text ({lg}):"), "s_text_saved": ("✅ متن ذخیره شد", "✅ Text saved"), "s_text_reset_done": ("↩️ پیش‌فرض شد", "↩️ Reset to default"),
-    "s_umsg_prompt": ("پیام برای این کاربر:", "Message to this user:"), "s_umsg_sent": ("✅ ارسال شد", "✅ Sent"), "s_umsg_head": ("📩 <b>پیام مدیریت:</b>\n\n", "📩 <b>Admin message:</b>\n\n"),
-    "sup_open": ("💬 <b>پشتیبانی</b>\nهر پیامی بفرستید مستقیم به مدیر می‌رسد و پاسخ همین‌جا می‌آید.", "💬 <b>Support</b>\nAny message goes straight to the admin; replies arrive here."), "sup_close": ("❌ پایان گفتگو", "❌ End chat"), "sup_closed": ("✅ گفتگو پایان یافت", "✅ Chat ended"),
-    "sup_reply_head": ("💬 <b>پاسخ پشتیبانی:</b>\n", "💬 <b>Support reply:</b>\n"), "sup_sent": ("✅ ارسال شد", "✅ Sent"), "sup_fail": ("❌ ارسال نشد: {e}", "❌ Not sent: {e}"), "sup_received": ("✅", "✅"),
-    "dl_notfound": ("🔎 متأسفم، نسخهٔ کامل این مطلب پیدا نشد — ممکن است پاک شده باشد. لطفاً از خودِ کانال پست را باز کن یا چند دقیقه بعد دوباره امتحان کن.", "🔎 Sorry, this full version could not be found — it may have been removed. Please open the post in the channel or try again later."), "dl_source": ("🔗 Source", "🔗 Source"),
-})
 PLAN_FIELDS = [("name", "نام (فا)", "Name (fa)"), ("name_en", "نام (en)", "Name (en)"), ("days", "مدت (روز)", "Days"), ("daily_posts", "پست/روز", "Posts/day"), ("max_sources", "منابع", "Sources"), ("max_channels", "کانال‌ها", "Channels"), ("daily_tests", "تست/روز", "Tests/day"), ("price", "قیمت (فا)", "Price (fa)"), ("price_en", "قیمت (en)", "Price (en)"), ("price_num", "قیمت عددی (برای proration)", "Numeric price (proration)"), ("description", "توضیح (فا)", "Description (fa)"), ("description_en", "توضیح (en)", "Description (en)")]
 MODEL_FIELDS = [("model", "نام مدل", "Model"), ("base_url", "Base URL", "Base URL"), ("api_key", "کلید API", "API key"), ("name", "نام نمایشی", "Display name"), ("priority", "اولویت", "Priority"), ("temperature", "دما (0–2)", "Temperature (0–2)"), ("max_tokens", "حداکثر توکن", "Max tokens")]
 TEXT_KEYS = ["welcome", "help", "about", "pay"]
@@ -3743,7 +3763,7 @@ def fl(fields, key, lang): return next((f[2] if lang == "en" else f[1] for f in 
 async def view_super_home(update, context):
     lang = L(update); models = list_models(); down = sum(1 for m in models if m["active"] and m["status"] == "down"); auto = gget("automation_enabled", True); n_pay = len(pay_pending())
     text = tr(lang, "s_title", m=len(models), ms=tr(lang, "s_all_ok") if not down else tr(lang, "s_down", n=down), a=len(list_users("admin")), u=len(list_users()), p=n_pay, dc=len(disc_list()), due=gget("load_due", 0), hb=ago_text(gget("heartbeat"), lang))
-    kb = [[B(tr(lang, "s_report"), "s:report"), B(tr(lang, "s_logs"), "s:logs:all")], [B(tr(lang, "s_plans"), "s:plans"), B(tr(lang, "s_discs"), "s:discs")], [B(tr(lang, "s_users"), "s:users:0"), B(tr(lang, "s_admins"), "s:admins:0")],
+    kb = [[B(tr(lang, "s_report"), "s:report")], [B(tr(lang, "s_plans"), "s:plans"), B(tr(lang, "s_discs"), "s:discs")], [B(tr(lang, "s_users"), "s:users:0"), B(tr(lang, "s_admins"), "s:admins:0")],
           [B(tr(lang, "s_models"), "s:models"), B(tr(lang, "s_pays", n=n_pay), "s:pays")], [B(tr(lang, "s_bc"), "s:bc"), B(tr(lang, "s_texts"), "s:texts")], [B(tr(lang, "s_auto", i="🟢" if auto else "🔴"), "s:auto"), B(tr(lang, "s_me"), "a:home")]]
     await render(update, context, text, kb)
 async def view_s_plans(update, context):
@@ -3880,9 +3900,6 @@ async def dispatch(update, context, data):
             if b == "myai_e": return await ask(update, context, tr(lang, "s_field_prompt", f=fl(MODEL_FIELDS, d, lang)), "model_field", f"a:myai_v:{mid}", mid=mid, field=d, own=1)
             await run_model_test(update, context, mid, personal=True)
             return await view_my_ai_model(update, context, mid)
-        if b == "logs":
-            if c.lstrip("-").isdigit() and channel_owned(int(c), uid): return await view_logs(update, context, admin_id=uid, back=f"a:ch:{c}", refresh=f"a:logs:{c}")
-            return await view_logs(update, context, admin_id=uid)
         if b == "chadd":
             if lim["max_channels"] is not None and len(list_channels(uid)) >= lim["max_channels"]: await popup(update, context, tr(lang, "limit_channels", n=lim["max_channels"]), alert=True); return await view_admin_home(update, context)
             return await ask(update, context, tr(lang, "ch_add_prompt"), "ch_add", "a:home")
@@ -3921,7 +3938,7 @@ async def dispatch(update, context, data):
                     for chunk in split_html(tr(lang, "full_head") + fv): await context.bot.send_message(uid, chunk, parse_mode=HTML, disable_web_page_preview=True)
                 return await view_article(update, context, aid)
             if b == "pub":
-                rem = remaining(uid, "posts")
+                rem = remaining(uid, "posts", cid)
                 if rem is not None and rem <= 0: await popup(update, context, tr(lang, "limit_posts", n=lim["daily_posts"]), alert=True); return await view_queue(update, context, cid)
                 if ch_lock(cid).locked(): await popup(update, context, tr(lang, "test_busy"), alert=True); return await view_queue(update, context, cid)
                 await render(update, context, tr(lang, "publishing"))
@@ -3931,19 +3948,21 @@ async def dispatch(update, context, data):
                     log.exception("manual publish failed article=%s channel=%s", aid, cid)
                     ok, out = False, f"send_failed:{str(e)[:120]}"
                 await popup(update, context, tr(lang, "published_ok") if ok else tr(lang, "pub_failed", e=_pub_err(out, lang)), alert=not ok); return await view_queue(update, context, cid)
+        if b == "chrec":
+            cid = int(c) if c.lstrip("-").isdigit() else 0
+            return await channel_recheck(update, context, cid)
         cid = int(c) if c.lstrip("-").isdigit() else 0; ch = channel_owned(cid, uid)
         if not ch: await popup(update, context, tr(lang, "notfound")); return await view_admin_home(update, context)
         s = get_settings(cid)
         if b == "ch": return await view_channel(update, context, cid)
         if b == "rep": return await render(update, context, report_text(uid, cid, lang), [[B(tr(lang, "refresh"), f"a:rep:{cid}")], [B(tr(lang, "back"), f"a:ch:{cid}")]])
         if b == "test": return await run_test(update, context, cid)
-        if b == "lock": return await view_lock(update, context, cid)
-        if b == "lockre": return await render(update, context, tr(lang, "lock_reset_q"), [[B(tr(lang, "yes"), f"a:lockre2:{cid}"), B(tr(lang, "no"), f"a:lock:{cid}")]])
-        if b in ("lockre2", "chdel2") and publication_pending(cid):
+        if b == "qreset": return await render(update, context, tr(lang, "queue_reset_q"), [[B(tr(lang, "yes"), f"a:qreset2:{cid}"), B(tr(lang, "no"), f"a:que:{cid}")]])
+        if b in ("qreset2", "chdel2") and publication_pending(cid):
             return await popup(update, context, tr(lang, "test_busy"), alert=True)
-        if b == "lockre2":
-            code, n = reset_channel_link(cid); log_event("WARN", f"ریست امنیتی کانال {ch['title']}", uid)
-            await popup(update, context, tr(lang, "lock_reset_ok", n=n), alert=True); return await view_lock(update, context, cid)
+        if b == "qreset2":
+            n = reset_channel_queue(cid); log_event("WARN", f"ریست صف کانال {ch['title']}", uid)
+            await popup(update, context, tr(lang, "queue_reset_ok", n=n), alert=True); return await view_queue(update, context, cid)
         if b == "chdel": return await render(update, context, tr(lang, "ch_del_q", title=esc(ch["title"])), [[B(tr(lang, "yes"), f"a:chdel2:{cid}"), B(tr(lang, "no"), f"a:ch:{cid}")]])
         if b == "chdel2": del_channel(cid, ch["admin_id"]); await popup(update, context, tr(lang, "ch_deleted")); return await view_admin_home(update, context)
         if b == "tog":
@@ -3997,7 +4016,6 @@ async def dispatch(update, context, data):
         if not is_super(uid): return
         if b == "home": return await view_super_home(update, context)
         if b == "report": return await render(update, context, report_text(None, None, lang), [[B(tr(lang, "refresh"), "s:report")], [B(tr(lang, "back"), "s:home")]])
-        if b == "logs": return await view_logs(update, context, level=None if c == "all" else c, back="s:home")
         if b == "auto": new = not gget("automation_enabled", True); gset("automation_enabled", new); await popup(update, context, tr(lang, "s_auto_on" if new else "s_auto_off")); return await view_super_home(update, context)
         if b == "texts": return await view_s_texts(update, context)
         if b == "txt": return await ask(update, context, tr(lang, "s_text_prompt", k=c, lg=d), "gtext", "s:texts", key=c, lg=d)
@@ -4103,7 +4121,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "home", "plans", "plan", "myai", "myai_v", "srcv", "src", "art", "ch",
         "sch", "con", "quiet", "tz", "cat", "catv", "cri", "criv", "que", "rej",
         "models", "model", "users", "admins", "user", "texts", "discs", "disc",
-        "pays", "report", "rep", "logs", "lock", "man_close")
+        "pays", "report", "rep", "qreset", "man_close")
     back = (context.user_data.get("await") or {}).get("back", "home")
     channel = int(parts[2]) if len(parts) > 2 and parts[0] == "a" and action == "test" and parts[2].isdigit() else None
     keep = ("disc",) if parts[0] == "u" and action in ("plan", "req", "disc", "discx") else ("bc_src",) if action == "bc_go" else ("qs", "qs_channel") if action == "qe" else ()
@@ -4197,13 +4215,8 @@ def _input_value(field, raw, lang, name_limit=100):
         if t == "": return None
         try: value = to_int(t)
         except (ValueError, TypeError): invalid("عدد صحیح بین ۱ تا سقف پلن", "Integer between 1 and plan cap")
-        hi = None
-        # در این جا فقط num+plan را می‌خوانیم؛ st را signal از ترافیک سطح بالا می‌گیریم (context.user_data است آن زمان)
-        # برای این فیلد کاربر باید یا لیست کانال داشته باشد. استفاده از remaining-info
-        try: pass
-        except Exception: pass
-        if not 1 <= value <= 500: invalid("بین ۱ تا سقف پلن انتخاب کنید.", "Between 1 and plan cap")
-        if hi is not None and value > hi: invalid(f"حداکثر {hi} انتخاب کنید", f"Max {hi}")
+        if not 1 <= value <= MAX_DAILY_POSTS_CAP: invalid(f"بین ۱ تا {MAX_DAILY_POSTS_CAP} انتخاب کنید.", f"Between 1 and {MAX_DAILY_POSTS_CAP}")
+        # سقف واقعیِ «پلن» در handle_input بررسی می‌شود؛ آن‌جا context و uid در دسترس است
         return value
     if field in INT_FIELDS or field in ("days", "daily_posts", "max_sources", "max_channels", "daily_tests", "max_tokens", "max_uses", "priority", "weight", "percent", "price_num"):
         try: value = to_int(text) if field != "price_num" else float(text.translate(_FA_DIGITS).replace(",", ""))
@@ -4227,7 +4240,7 @@ def _input_access(st, uid, lang):
     if user and user["banned"] and not is_super(uid): return tr(lang, "banned")
     if kind in ("plan_field", "disc_field", "gtext", "umsg", "bc") or wiz in ("plan_new", "model_add", "disc_add") or (kind == "model_field" and not st.get("own")):
         if not is_super(uid): return tr(lang, "no_admin")
-    if kind in ("field", "cat_style", "crit_weight", "src_add", "src_api_url", "src_api_key", "ch_add", "lockcode", "art_edit") or wiz in ("cat_add", "crit_add", "my_ai_add") or (kind == "model_field" and st.get("own")):
+    if kind in ("field", "cat_style", "crit_weight", "src_add", "src_api_url", "src_api_key", "ch_add", "chtoken", "art_edit") or wiz in ("cat_add", "crit_add", "my_ai_add") or (kind == "model_field" and st.get("own")):
         if not can_admin(uid): return tr(lang, "no_admin")
     cid = st.get("data", {}).get("cid") if wiz in ("cat_add", "crit_add") else st.get("cid") if kind in ("field", "cat_style", "crit_weight", "src_add") else None
     if cid is not None and not channel_owned(cid, uid): return tr(lang, "notfound")
@@ -4237,7 +4250,7 @@ def _input_access(st, uid, lang):
     if kind == "model_field":
         model = get_model(st["mid"])
         if not model or (st.get("own") and model["owner_id"] != uid): return tr(lang, "notfound")
-    if kind in ("src_add", "ch_add", "lockcode"):
+    if kind in ("src_add", "ch_add", "chtoken"):
         lim = admin_limits(uid)
         if not lim["active"]: return tr(lang, "plan_inactive")
         if kind == "src_add" and lim["max_sources"] is not None and count_sources(uid) >= lim["max_sources"]: return tr(lang, "limit_sources", n=lim["max_sources"])
@@ -4262,7 +4275,7 @@ async def handle_input(update, context, st):
     if kind == "wiz":
         steps = WIZ.get(st.get("wiz"), ()); step = st.get("step")
         if type(step) is not int or not 0 <= step < len(steps): done(); return
-        key, _, typ = steps[step]
+        key = steps[step][0]
         try: val = _input_value(key, raw_text, lang, name_limit=40 if st["wiz"] in ("cat_add", "crit_add") else 100)
         except (ValueError, TypeError) as e: return await popup(update, context, str(e), alert=True)
         st["data"][key] = val; st["step"] += 1
@@ -4399,39 +4412,47 @@ async def handle_input(update, context, st):
         existing = channel_by_chat(chat.id)
         if existing:
             if existing["admin_id"] == uid: update_channel_meta(existing["id"], chat.title, chat.username or ""); done(tr(lang, "ch_exists_mine")); return await dispatch(update, context, f"a:ch:{existing['id']}")
-            ud["await"] = {"kind": "lockcode", "cid": existing["id"], "back": back, "tries": 0, "title": chat.title}
-            return await render(update, context, tr(lang, "ch_locked"), [[B(tr(lang, "cancel"), "c:cancel")]])
+            return await channel_claim(update, context, existing, uid, lang, back, ud)
         lim = admin_limits(uid)
         if lim["max_channels"] is not None and len(list_channels(uid)) >= lim["max_channels"]: return await popup(update, context, tr(lang, "limit_channels", n=lim["max_channels"]), alert=True)
         cid = add_channel(uid, chat.id, chat.title or str(chat.id), chat.username or "", uid, lang); log_event("INFO", f"کانال ثبت شد: {chat.title} ({chat.id})", uid)
         done(tr(lang, "ch_added", title=esc(chat.title))); return await dispatch(update, context, f"a:ch:{cid}")
-    if kind == "lockcode":
-        cid = st["cid"]; ch = get_channel(cid); me = get_user(uid); who = f"{esc(uname(me))} (<code>{uid}</code>)"
+    if kind == "chtoken":
+        cid = st["cid"]; ch = get_channel(cid)
         if not ch: return await popup(update, context, tr(lang, "notfound"), alert=True)
-        if check_lock(cid, text):
-            if not await bot_can_post(context.bot, ch["chat_id"]): return await popup(update, context, tr(lang, "ch_bot_not_admin"), alert=True)
-            try: mem = await context.bot.get_chat_member(ch["chat_id"], uid); user_is_admin = mem.status in ("administrator", "creator")
-            except Exception: user_is_admin = False
-            if ud.get("await") is not st: return
-            if not user_is_admin: return await popup(update, context, tr(lang, "ch_user_not_admin"), alert=True)
-            denied = _input_access(st, uid, lang)
-            if denied: return await popup(update, context, denied, alert=True)
-            ch = get_channel(cid)
-            if not ch or not check_lock(cid, text): return await popup(update, context, tr(lang, "ch_lock_bad"), alert=True)
-            lim = admin_limits(uid)
-            if lim["max_channels"] is not None and len(list_channels(uid)) >= lim["max_channels"]: return await popup(update, context, tr(lang, "limit_channels", n=lim["max_channels"]), alert=True)
-            if publication_pending(cid): return await popup(update, context, tr(lang, "test_busy"), alert=True)
-            old_uid = ch["admin_id"]; ol = user_lang(old_uid) or "fa"
-            transfer_channel(cid, uid, lang); done(); log_event("WARN", f"کانال {ch['title']} از {old_uid} به {uid} منتقل شد", uid)
-            await notify_user_fn(old_uid, tr(ol, "ch_owner_moved", title=esc(ch["title"]), who=who)); await notify_supers(f"«{esc(ch['title'])}» transferred {old_uid} → {uid}")
-            done(tr(lang, "ch_lock_ok", title=esc(ch["title"]))); return await dispatch(update, context, f"a:ch:{cid}")
+        # ۱) اعتبارسنجی بدون مصرف: توکن باطل نباید سهمیه/حالت را هدر بدهد
+        if not check_transfer_token(cid, text):
+            st["tries"] = int(st.get("tries") or 0) + 1
+            log_event("WARN", f"توکن انتقال نادرست/منقضی برای «{ch['title']}» توسط {uid}", uid)
+            if st["tries"] >= 3:
+                done(); await popup(update, context, tr(lang, "ch_token_bad"), alert=True)
+                return await dispatch(update, context, back)
+            await popup(update, context, tr(lang, "ch_token_bad"), alert=True)
+            if ud.get("await") is st:
+                return await render(update, context, tr(lang, "ch_token_sent", who=esc(uname(get_user(first_registrant(cid)))), min=TRANSFER_TTL_MIN), [[B(tr(lang, "cancel"), "c:cancel")]])
+            return
+        # ۲) همهٔ بررسی‌ها پیش از مصرف توکن تا یک تلاشِ ناقص، توکن را نسوزاند
+        if not await bot_can_post(context.bot, ch["chat_id"]): return await popup(update, context, tr(lang, "ch_bot_not_admin"), alert=True)
+        try: mem = await context.bot.get_chat_member(ch["chat_id"], uid); user_is_admin = mem.status in ("administrator", "creator")
+        except Exception: user_is_admin = False
+        if ud.get("await") is not st: return
+        if not user_is_admin: return await popup(update, context, tr(lang, "ch_user_not_admin"), alert=True)
+        denied = _input_access(st, uid, lang)
+        if denied: return await popup(update, context, denied, alert=True)
+        ch = get_channel(cid)
+        if not ch: return await popup(update, context, tr(lang, "notfound"), alert=True)
+        lim = admin_limits(uid)
+        if lim["max_channels"] is not None and len(list_channels(uid)) >= lim["max_channels"]: return await popup(update, context, tr(lang, "limit_channels", n=lim["max_channels"]), alert=True)
+        if publication_pending(cid): return await popup(update, context, tr(lang, "test_busy"), alert=True)
+        # ۳) مصرف اتمی یک‌بارمصرف؛ تنها برندهٔ UPDATE منتقل می‌کند
+        if not consume_transfer_token(cid, text): return await popup(update, context, tr(lang, "ch_token_bad"), alert=True)
+        me = get_user(uid); who = f"{esc(uname(me))} (<code>{uid}</code>)"
         old_uid = ch["admin_id"]; ol = user_lang(old_uid) or "fa"
-        st["tries"] += 1
-        if st["tries"] >= 3: done()
-        await notify_user_fn(old_uid, tr(ol, "ch_owner_alert", title=esc(ch["title"]), who=who)); log_event("WARN", f"کد قفل اشتباه برای {ch['title']} توسط {uid}", uid)
-        await popup(update, context, tr(lang, "ch_lock_bad"), alert=True)
-        if st["tries"] >= 3: return await dispatch(update, context, back)
-        if ud.get("await") is st: return await render(update, context, tr(lang, "ch_locked"), [[B(tr(lang, "cancel"), "c:cancel")]])
+        try: transfer_channel(cid, uid, lang)
+        except RuntimeError: return await popup(update, context, tr(lang, "test_busy"), alert=True)
+        done(); log_event("WARN", f"کانال {ch['title']} از {old_uid} به {uid} منتقل شد", uid)
+        await notify_user_fn(old_uid, tr(ol, "ch_owner_moved", title=esc(ch["title"]), who=who)); await notify_supers(f"«{esc(ch['title'])}» transferred {old_uid} → {uid}")
+        done(tr(lang, "ch_token_ok", title=esc(ch["title"]))); return await dispatch(update, context, f"a:ch:{cid}")
     # ---- مقاله
     if kind == "art_edit":
         art = get_article(st["aid"])
@@ -4560,7 +4581,6 @@ def managed_command(handler):
         return await run_user_operation(update, context, f"command:{handler.__name__}", None, lambda: handler(update, context), replace=True)
     return command
 
-
 async def _prep(update, context):
     u = update.effective_user; ensure_user(u.id, u.username, u.full_name, premium=getattr(u, "is_premium", None)); context.user_data.pop("await", None); context.user_data["panel"] = None
     return user_lang(u.id)
@@ -4622,33 +4642,68 @@ async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def job_tick(context: ContextTypes.DEFAULT_TYPE):
     try: await scheduler_tick(context.bot)
     except Exception as e: log_event("ERROR", f"scheduler: {e}")
-async def job_persist(context: ContextTypes.DEFAULT_TYPE):
-    await persist_db()
 async def post_init(app: Application):
     global BOT_USERNAME, NOTIFY_SUPER, NOTIFY_USER
     me = await app.bot.get_me(); BOT_USERNAME = me.username; NOTIFY_SUPER = notify_supers; NOTIFY_USER = notify_user_fn
     await app.bot.set_my_commands([BotCommand("start", "منوی اصلی"), BotCommand("create", "پنل مدیریت / پلن"), BotCommand("man", "پشتیبانی"), BotCommand("about", "درباره"), BotCommand("lang", "زبان"), BotCommand("help", "راهنما"), BotCommand("cancel", "لغو عملیات")], language_code="fa")
     await app.bot.set_my_commands([BotCommand("start", "Main menu"), BotCommand("create", "Admin panel / plan"), BotCommand("man", "Support"), BotCommand("about", "About"), BotCommand("lang", "Language"), BotCommand("help", "Help"), BotCommand("cancel", "Cancel action")])
     app.job_queue.run_repeating(job_tick, interval=TICK_SECONDS, first=15, name="tick")
-    if CF_ENABLED: app.job_queue.run_repeating(job_persist, interval=PERSIST_INTERVAL_SECONDS, first=30, name="persist")
     log_event("INFO", f"ربات @{me.username} راه‌اندازی شد")
     await notify_supers(f"🚀 @{me.username} راه‌اندازی شد · 🤖 مدل‌های فعال {len(list_models(True))} · CF KV {'✅' if CF_ENABLED else '❌'} · تیک هر {TICK_SECONDS}s · AI×{AI_CONCURRENCY} CYCLE×{CYCLE_CONCURRENCY}")
 async def post_shutdown(app: Application):
-    global _http
-    try: await persist_db()
-    except Exception: pass
+    if _temp_sweeper is not None and not _temp_sweeper.done():   # تسک پاک‌کننده‌ی پیام‌های موقت را تمیز جمع می‌کنیم
+        _temp_sweeper.cancel()
+        try: await _temp_sweeper
+        except BaseException: pass
     if _http:
         try: await _http.aclose()
         except Exception: pass
+    try:
+        log_event("INFO", "ربات خاموش شد"); log.info("خاموشی تمیز انجام شد.")
+    except Exception: pass
 async def on_error(update, context):
     log.exception("خطا: %s", context.error)
     try: log_event("ERROR", f"unhandled: {context.error}")
     except Exception: pass
+def preflight():
+    """اعتبارسنجی پیکربندی پیش از راه‌اندازی. همه‌ی ایرادها یک‌جا گزارش می‌شوند تا کارِ اپراتور یک‌بار باشد."""
+    bad, warn = [], []
+    if not BOT_TOKEN:
+        bad.append("BOT_TOKEN تنظیم نشده است → توکن BotFather را بگذارید (BOT_TOKEN=123456789:AA...)")
+    elif not re.fullmatch(r"\d{6,}:[A-Za-z0-9_-]{30,}", BOT_TOKEN):
+        warn.append("BOT_TOKEN قالب استاندارد ندارد (باید شبیه 123456789:AA... باشد)؛ برای سرور Bot API محلی نادیده بگیرید.")
+    if not SUPER_ADMIN_IDS:
+        bad.append("SUPER_ADMIN_IDS تنظیم نشده است → شناسه‌ی عددی تلگرام خودتان (SUPER_ADMIN_IDS=123456789)")
+    folder = os.path.dirname(os.path.abspath(DB_FILE)) or "."
+    if not os.path.isdir(folder):
+        try: os.makedirs(folder, exist_ok=True)
+        except Exception as e: bad.append(f"پوشه‌ی دیتابیس ساخته نشد: {folder} ({e})")
+    if os.path.isdir(folder) and not os.access(folder, os.W_OK):
+        bad.append(f"پوشه‌ی دیتابیس قابل نوشتن نیست: {folder}")
+    if os.path.exists(DB_FILE) and not os.access(DB_FILE, os.W_OK):
+        bad.append(f"فایل دیتابیس قابل نوشتن نیست: {DB_FILE}")
+    if not -12 <= DEFAULT_UTC_OFFSET <= 14:
+        bad.append(f"DEFAULT_UTC_OFFSET بیرون از بازه‌ی ‎-12..14‎ است: {DEFAULT_UTC_OFFSET}")
+    for nm, val, lo, hi in (("TICK_SECONDS", TICK_SECONDS, 10, 3600), ("AI_CONCURRENCY", AI_CONCURRENCY, 1, 32),
+                            ("FETCH_CONCURRENCY", FETCH_CONCURRENCY, 1, 64), ("CYCLE_CONCURRENCY", CYCLE_CONCURRENCY, 1, 16),
+                            ("MAX_CYCLES_PER_TICK", MAX_CYCLES_PER_TICK, 1, 64), ("AI_INPUT_TEXT_CHARS", AI_INPUT_TEXT_CHARS, 500, 200000),
+                            ("MAX_ARTICLE_CHARS", MAX_ARTICLE_CHARS, 1000, 2000000), ("MAX_ARTICLE_PAGES", MAX_ARTICLE_PAGES, 1, 50), ("MIN_INTERVAL", MIN_INTERVAL, 1, 1440),
+                            ("DATA_TTL_HOURS", DATA_TTL_HOURS, 1, 8760), ("MAX_DAILY_POSTS_CAP", MAX_DAILY_POSTS_CAP, 1, 10000)):
+        if not lo <= val <= hi: bad.append(f"{nm} بیرون از بازه‌ی مجاز {lo}..{hi} است: {val}")
+    if POST_LIMIT_MAX > CAPTION_LIMIT - 100:   # قاعده‌ی سخت: کپشن هرگز نباید پست را دو پیام کند
+        bad.append(f"POST_LIMIT_MAX ({POST_LIMIT_MAX}) باید حداقل ۱۰۰ کاراکتر زیر سقف تلگرام ({CAPTION_LIMIT}) بماند")
+    filled_cf = sum(bool(x) for x in (CF_ACCOUNT_ID, CF_KV_NAMESPACE_ID, CF_API_TOKEN))
+    if filled_cf and filled_cf != 3:
+        warn.append("Cloudflare KV ناقص تنظیم شده (هر سه مقدار لازم است) → آینه‌ی «بیشتر» محلی می‌مانَد.")
+    for w in warn: log.warning("پیکربندی: %s", w)
+    if bad:
+        raise SystemExit("⛔ راه‌اندازی متوقف شد — ایرادهای پیکربندی:\n" + "\n".join(f"  • {b}" for b in bad))
+    log.info("پیکربندی سالم | دیتابیس=%s | منطقه=UTC+%s | ادمین کلان=%d", DB_FILE, DEFAULT_UTC_OFFSET, len(SUPER_ADMIN_IDS))
+
+
 def main():
     global APP
-    if not BOT_TOKEN: raise SystemExit("BOT_TOKEN تنظیم نشده است.")
-    if not SUPER_ADMIN_IDS: raise SystemExit("SUPER_ADMIN_IDS تنظیم نشده است.")
-    _restore_db_snapshot()
+    preflight()
     init_core(); _bld = Application.builder().token(BOT_TOKEN)
     if API_BASE: _bld = _bld.base_url(API_BASE)          # سرور محلی Bot API (اختیاری) → پشتیبانی از فایل‌های تا ۲ گیگ
     APP = _bld.post_init(post_init).post_shutdown(post_shutdown).concurrent_updates(True).build()
@@ -4656,5 +4711,10 @@ def main():
     APP.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.COMMAND, managed_command(cmd_unknown)))
     APP.add_handler(CallbackQueryHandler(on_callback)); APP.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_message)); APP.add_error_handler(on_error)
     log.info("در حال اجرا…"); APP.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    import sys as _sys
+    if "--check" in _sys.argv:      # خودآزمایی بدون پولینگ: پیکربندی + ساخت/مهاجرت دیتابیس — مناسب CI و پیش از دیپلوی
+        preflight(); init_core(); log.info("✅ خودآزمایی موفق: پیکربندی و دیتابیس سالم است.")
+    else:
+        main()
 # ---------- پایان فایل newsbot.py ----------
