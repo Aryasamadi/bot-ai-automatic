@@ -160,6 +160,7 @@ CREATE TABLE IF NOT EXISTS dedup(channel_id INTEGER, fp TEXT, ts TEXT, PRIMARY K
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS support(user_id INTEGER PRIMARY KEY, open INTEGER DEFAULT 0, opened_at TEXT);
 CREATE TABLE IF NOT EXISTS support_map(msg_id INTEGER PRIMARY KEY, user_id INTEGER, ts TEXT);
+CREATE TABLE IF NOT EXISTS plan_changes(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, plan_id INTEGER, from_plan INTEGER, kind TEXT, credit_used REAL DEFAULT 0, surplus REAL DEFAULT 0, paid REAL, rem_days REAL, ts TEXT);
 CREATE TABLE IF NOT EXISTS pay_requests(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, plan_id INTEGER, status TEXT DEFAULT 'pending', created_at TEXT, receipt_chat INTEGER, receipt_msg INTEGER, note TEXT, decided_at TEXT, discount TEXT, final_price TEXT);
 CREATE INDEX IF NOT EXISTS idx_art_ch_status ON articles(channel_id, status);
 CREATE INDEX IF NOT EXISTS idx_art_created ON articles(created_at);
@@ -179,7 +180,8 @@ MIGRATIONS = [("users", "next_plan_id", "INTEGER"), ("users", "next_plan_days", 
               ("channels", "verified_by", "INTEGER"), ("channels", "created_at", "TEXT"), ("channels", "settings", "TEXT"), ("channels", "original_admin_id", "INTEGER"),
               ("sources", "channel_id", "INTEGER"), ("sources", "feed_url", "TEXT"), ("sources", "last_error", "TEXT"), ("articles", "channel_id", "INTEGER"),
               ("articles", "send_fails", "INTEGER DEFAULT 0"), ("sources", "bot_active", "INTEGER DEFAULT 1"), ("sources", "api_url", "TEXT"), ("sources", "api_key", "TEXT"), ("sources", "api_note", "TEXT DEFAULT ''"),
-              ("pay_requests", "discount", "TEXT"), ("pay_requests", "final_price", "TEXT"),
+              ("pay_requests", "discount", "TEXT"), ("pay_requests", "final_price", "TEXT"), ("pay_requests", "pc", "TEXT"),
+              ("users", "credit", "REAL DEFAULT 0"),
               ("ai_models", "temperature", "REAL DEFAULT 0.5"), ("ai_models", "max_tokens", "INTEGER DEFAULT 2500"), ("ai_models", "owner_id", "INTEGER"),
               ("ai_models", "fail_count", "INTEGER DEFAULT 0"), ("ai_models", "next_try_after", "TEXT DEFAULT ''"),
               ("plans", "daily_tests", "INTEGER DEFAULT 2"), ("plans", "price_num", "REAL DEFAULT 0"), ("sources", "found_total", "INTEGER DEFAULT 0"), ("sources", "title", "TEXT DEFAULT ''")
@@ -198,6 +200,8 @@ def _ensure_schema(conn):
     global _SCHEMA_READY
     with _lock:
         if _SCHEMA_READY: return
+        try: os.chmod(DB_FILE, 0o600)   # کلیدهای API متن ساده در این فایل‌اند؛ دسترسی فقط برای مالک
+        except Exception: pass
         conn.executescript(SCHEMA + "\n" + DB_INDEXES)
         conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
         have = {}
@@ -330,13 +334,12 @@ def assign_plan(uid, pid, days=None):
     cur = parse_dt(u["plan_expires"]) if u else None; active = bool(cur and cur > now and u["plan_id"])
     if active and not p["is_free"] and (get_plan(u["plan_id"]) or {"is_free": 0})["is_free"]: active = False
     if active and u["plan_id"] != pid:
-        # ارتقا فوری: روزهای باقی‌ماندهٔ واقعیِ پلن فعلی به پلن جدید منتقل می‌شود و پلن جدید هم همین حالا فعال می‌شود
-        carry = upgrade_carryover_days(uid)
-        d_total = d + carry
-        exp = now + timedelta(days=d_total)
-        q("UPDATE users SET plan_id=?, plan_expires=?, next_plan_id=NULL, next_plan_days=NULL, remind_key=NULL, role=CASE WHEN role='user' THEN 'admin' ELSE role END, free_used=free_used WHERE id=?",
-          (pid, exp.isoformat(), uid), commit=True)
-        return exp, False
+        # تغییر پلن: تاریخ پایان دست‌نخورده می‌ماند و فقط پلن و سهمیه‌ها عوض می‌شوند
+        # (مبلغ طبق upgrade_quote فقط برای روزهای باقی‌مانده محاسبه شده است).
+        q("UPDATE users SET plan_id=?, next_plan_id=NULL, next_plan_days=NULL, remind_key=NULL, role=CASE WHEN role='user' THEN 'admin' ELSE role END WHERE id=?",
+          (pid, uid), commit=True)
+        admin_limits_invalidate(uid)
+        return cur, False
     exp = (cur if active else now) + timedelta(days=d)
     q("UPDATE users SET plan_id=?, plan_expires=?, remind_key=NULL, role=CASE WHEN role='user' THEN 'admin' ELSE role END, free_used=CASE WHEN ?=1 THEN 1 ELSE free_used END WHERE id=?", (pid, exp.isoformat(), p["is_free"], uid), commit=True)
     admin_limits_invalidate(uid)   # وگرنه تا ۶۰ ثانیه سهمیهٔ کهنه اعمال می‌شود
@@ -714,7 +717,7 @@ def source_fail(sid, err):
     wait = min(SOURCE_PAUSE_MIN * (2 ** max(0, _source_fail_count(sid))), 720)
     until = (now_utc() + timedelta(minutes=wait)).isoformat()
     q("UPDATE sources SET last_fetch=?, fail_count=fail_count+1, last_error=?, next_try_after=? WHERE id=?",
-      (now_iso(), str(err)[:200], until, sid), commit=True)
+      (now_iso(), redact(err)[:200], until, sid), commit=True)
 def _source_fail_count(sid):
     r = q("SELECT fail_count c FROM sources WHERE id=?", (sid,), one=True); return int(r["c"]) if r else 0
 # ============================================================
@@ -874,7 +877,7 @@ def cleanup():
     # توجه: kv_cache و deeplinks هرگز پاک نمی‌شوند — متن کامل «بیشتر» باید همیشه در ربات بماند
     q("DELETE FROM usage WHERE day<?", ((now_utc() - timedelta(days=60)).strftime("%Y-%m-%d"),), commit=True)
     q("DELETE FROM support_map WHERE ts<?", ((now_utc() - timedelta(days=7)).isoformat(),), commit=True)
-    q("DELETE FROM pay_requests WHERE status!='pending' AND decided_at<?", ((now_utc() - timedelta(days=90)).isoformat(),), commit=True)
+    q("DELETE FROM pay_requests WHERE status!='pending' AND COALESCE(decided_at, created_at)<?", ((now_utc() - timedelta(days=90)).isoformat(),), commit=True)
     try: q("PRAGMA wal_checkpoint(TRUNCATE)")
     except Exception: pass
     gset("last_cleanup", time.time())
@@ -888,8 +891,10 @@ def support_map_set(msg_key, uid): q("INSERT OR REPLACE INTO support_map VALUES(
 def support_map_get(msg_key):
     r = q("SELECT user_id FROM support_map WHERE msg_id=?", (msg_key,), one=True); return r["user_id"] if r else None
 def pay_pending_for(uid, pid): return q("SELECT * FROM pay_requests WHERE user_id=? AND plan_id=? AND status='pending'", (uid, pid), one=True)
-def pay_create(uid, pid, receipt_chat=None, receipt_msg=None, note="", discount=None, final_price=None):
-    return q("INSERT INTO pay_requests(user_id,plan_id,created_at,receipt_chat,receipt_msg,note,discount,final_price) VALUES(?,?,?,?,?,?,?,?)", (uid, pid, now_iso(), receipt_chat, receipt_msg, (note or "")[:500], discount, final_price), commit=True)
+def pay_create(uid, pid, receipt_chat=None, receipt_msg=None, note="", discount=None, final_price=None, pc=None):
+    return q("INSERT INTO pay_requests(user_id,plan_id,created_at,receipt_chat,receipt_msg,note,discount,final_price,pc) VALUES(?,?,?,?,?,?,?,?,?)",
+             (uid, pid, now_iso(), receipt_chat, receipt_msg, (note or "")[:500], discount, final_price,
+              json.dumps(pc, ensure_ascii=False) if pc else None), commit=True)
 def pay_pending(): return q("SELECT r.*, u.username, u.name, p.name plan_name, p.price plan_price FROM pay_requests r JOIN users u ON u.id=r.user_id JOIN plans p ON p.id=r.plan_id WHERE r.status='pending' ORDER BY r.id")
 def pay_get(rid): return q("SELECT * FROM pay_requests WHERE id=?", (rid,), one=True)
 def pay_set(rid, status): q("UPDATE pay_requests SET status=?, decided_at=? WHERE id=?", (status, now_iso(), rid), commit=True)
@@ -1103,7 +1108,7 @@ async def _mark_fail(m, err):
     cur = get_model(m["id"]) or m   # اسنپ‌شاتِ ورودی ممکن است کهنه باشد؛ شمارنده از سطر فعلی خوانده می‌شود
     fc = (cur["fail_count"] or 0) + 1
     ntry = (now_utc() + timedelta(minutes=min(5 * (2 ** min(fc, 6)), MODEL_BACKOFF_MAX_MIN))).isoformat()
-    update_model(m["id"], fail_count=fc, last_error=str(err)[:300], last_fail=now_iso(), next_try_after=ntry,
+    update_model(m["id"], fail_count=fc, last_error=redact(err)[:300], last_fail=now_iso(), next_try_after=ntry,
                  status="down" if fc >= 2 else cur["status"])
     if fc >= 2 and cur["status"] != "down":
         log_event("ERROR", f"مدل «{m['name']}» از کار افتاد: {err}")
@@ -2024,6 +2029,11 @@ async def _summarize_chunks(s, full, on_queue=None, owner_id=None, _depth=0):
         user_msg = f"Chunk {idx+1}/{len(chunks)} — summarize:\n{chunk}"
         raw, _, err = await ai_chat(sysc, user_msg, on_queue=on_queue, owner_id=owner_id, validate=None)
         if err: return None, err
+        if not (raw or "").strip():
+            # قطعهٔ خالی بی‌صدا حذف نمی‌شود: یک‌بار دیگر تلاش، و اگر باز هم خالی بود خودِ متن منبع حفظ می‌شود
+            raw, _, err = await ai_chat(sysc, user_msg, on_queue=on_queue, owner_id=owner_id, validate=None)
+            if err: return None, err
+            if not (raw or "").strip(): raw = chunk[:per_chunk]
         lines.append(raw or "")
     merged = "\n".join(x for x in lines if x and x.strip())
     if len(merged) <= AI_INPUT_TEXT_CHARS or _depth >= AI_MERGE_MAX_DEPTH: return merged, None
@@ -2207,6 +2217,7 @@ async def _send_media(bot, chat_id, caption, pm, media):
     except (NetworkError, Forbidden): raise
     except Exception:
         raise
+MSG_LIMIT = 4096   # سقف متن یک پیام تلگرام (کپشن سقف مستقل خودش را دارد)
 async def send_post(bot, chat_id, text, media=None):
     """رسانه + کپشنِ یک‌تکه (کپشن همیشه زیر محدودیت ۱۰۲۴ تلگرام می‌ماند) · خطای پارس → تنزل تدریجی فرمت (معمولی → ساده).
     هیچ‌وقت پست را به دو پیام نمی‌شکند: ادامهٔ محتوا فقط از راه «بیشتر» داخل ربات دیده می‌شود."""
@@ -2221,6 +2232,7 @@ async def send_post(bot, chat_id, text, media=None):
                 if isinstance(bot, PublicationTransport): bot.caption_complete = True
                 m = sent_media or await _send_media(bot, chat_id, cap, pm, media)
                 if m: return m
+            if len(t) > MSG_LIMIT: t = fit_html(t, MSG_LIMIT - 100)[0]   # وگرنه پست بالای ۴۰۹۶ با «too long» هرگز منتشر نمی‌شد
             return await bot.send_message(chat_id, t, parse_mode=pm, disable_web_page_preview=True)
         except RetryAfter as e:
             await asyncio.sleep(min(30, float(e.retry_after) + 1)); return await bot.send_message(chat_id, t, parse_mode=pm, disable_web_page_preview=True, **({"reply_to_message_id": sent_media.message_id} if sent_media else {}))
@@ -2985,6 +2997,11 @@ def quota_bars(rows, width=10):
 def B(t, d): return InlineKeyboardButton(t, callback_data=d[:64])
 def U(t, url): return InlineKeyboardButton(t, url=url)
 def esc(x): return html.escape(str(x if x is not None else ""))
+def redact(x):
+    """رازها را از متن خطا پاک می‌کند (Bearer، apikey/token در هدر یا query) پیش از ذخیره یا نمایش."""
+    t = str(x if x is not None else "")
+    t = re.sub(r"(?i)\b(bearer|apikey|api[-_]?key|access[-_]?token|token|authorization)([=:\s]+)[\w\-.~+/=]{6,}", r"\1\2•••", t)
+    return re.sub(r"(?i)([?&](?:key|api_key|apikey|token|access_token)=)[^&\s]+", r"\1•••", t)
 def onoff(v): return "✅" if v else "❌"
 def to_int(s):
     text = str(s).strip().translate(_FA_DIGITS)
@@ -3560,15 +3577,43 @@ def _price_num(p):
         return float(p["price_num"] or 0)
     except (KeyError, IndexError, TypeError, ValueError):
         return 0.0
-def _upgrade_price(uid, p, cur, disc_percent):
-    """مبلغ ارتقا با proration: max(0, price_num - remaining_value)؛ تخفیف روی همان مبلغ اعمال می‌شود."""
-    new_num = _price_num(p)
-    if not new_num or not cur or not _price_num(cur): return None, None
-    cur_num, cur_days = _price_num(cur), cur["days"] or 0
-    rv = proration_remaining_value(uid, cur_num, cur_days)
-    amt = round(max(0.0, new_num - rv), 2)
-    if disc_percent: amt = round(amt * (100 - disc_percent) / 100, 2)
-    return amt, rv
+def _user_credit(uid):
+    """موجودی کیف پول کاربر (از مابه‌التفاوت کاهش پلن)."""
+    try:
+        r = q("SELECT credit FROM users WHERE id=?", (uid,), one=True); return float(r["credit"] or 0) if r else 0.0
+    except (KeyError, IndexError, TypeError, ValueError): return 0.0
+def upgrade_quote(uid, p, cur, disc_percent=None):
+    """مبلغ ارتقا/خرید طبق قاعده‌ی محصول:
+      قابل پرداخت = (قیمت پلن جدید ÷ روزهای دوره‌ی جدید) × روزهای باقی‌مانده
+                    − اعتبار باقی‌مانده‌ی پلن فعلی − موجودی کیف پول
+    تاریخ پایان دوره دست‌نخورده می‌ماند و فقط پلن و سهمیه‌ها عوض می‌شوند.
+    اگر پلن جدید برای روزهای باقی‌مانده ارزان‌تر از اعتبار پلن فعلی باشد، مابه‌التفاوت به کیف پول می‌رود (کاهش پلن).
+    اگر قیمت عددیِ پلن ثبت نشده باشد، محاسبه انجام نمی‌شود و قیمت متنی نمایش داده می‌شود."""
+    new_num = _price_num(p); new_days = int(p["days"] or 0); rem = proration_remaining_days(uid); bal = _user_credit(uid)
+    out = {"kind": "fresh", "rem_days": rem, "credit": 0.0, "new_cost": 0.0, "surplus": 0.0,
+           "balance": bal, "used_balance": 0.0, "payable": 0.0, "keep_expiry": False, "payable_num": False,
+           "from_plan": (cur["id"] if cur else None), "to_plan": p["id"]}
+    if not new_num or new_days <= 0:
+        return out
+    if rem > 0 and cur and _price_num(cur) and int(cur["days"] or 0) > 0:
+        credit = proration_remaining_value(uid, _price_num(cur), int(cur["days"]))
+        new_cost = round(new_num * (rem / new_days), 2)          # هزینه‌ی پلن جدید فقط برای روزهای باقی‌مانده
+        backend = round(max(0.0, new_cost - credit), 2)
+        out.update(kind="upgrade", credit=credit, new_cost=new_cost, surplus=round(max(0.0, credit - new_cost), 2),
+                   used_balance=round(min(bal, backend), 2), payable=round(backend - min(bal, backend), 2),
+                   keep_expiry=True, payable_num=True)
+    else:
+        out.update(kind="fresh", new_cost=new_num, used_balance=round(min(bal, new_num), 2),
+                   payable=round(new_num - min(bal, new_num), 2), payable_num=True)
+    if disc_percent: out["payable"] = round(out["payable"] * (100 - disc_percent) / 100, 2)
+    return out
+def apply_plan_change(uid, pid, pc):
+    """کیف پول را مصرف می‌کند، مابه‌التفاوت کاهش پلن را برمی‌گرداند و سابقه‌ی تغییر پلن را ثبت می‌کند."""
+    used = float(pc.get("used_balance") or 0); surplus = float(pc.get("surplus") or 0)
+    if used or surplus:
+        q("UPDATE users SET credit=MAX(0, COALESCE(credit,0) - ? + ?) WHERE id=?", (used, surplus, uid), commit=True)
+    q("INSERT INTO plan_changes(user_id, plan_id, from_plan, kind, credit_used, surplus, paid, rem_days, ts) VALUES(?,?,?,?,?,?,?,?,?)",
+      (uid, pid, pc.get("from_plan"), pc.get("kind") or "fresh", used, surplus, pc.get("payable"), pc.get("rem_days"), now_iso()), commit=True)
 async def do_request(update, context, pid):
     uid = update.effective_user.id; lang = L(update); p = get_plan(pid)
     if not p: await popup(update, context, tr(lang, "plan_notfound")); return await view_plans(update, context)
@@ -3578,17 +3623,22 @@ async def do_request(update, context, pid):
     if pay_pending_for(uid, pid): await popup(update, context, tr(lang, "req_pending"), alert=True); return await view_plan(update, context, pid)
     lim = admin_limits(uid); cur = get_plan(lim["plan_id"]) if lim["plan_id"] else None
     d = _applied_disc(context, pid); new_price, _ = _price_text(p, lang, d)
-    amt, rv = _upgrade_price(uid, p, cur, d["percent"] if d else None)
+    qt = upgrade_quote(uid, p, cur, d["percent"] if d else None); amt, rv = (qt["payable"] if qt["payable_num"] else None), qt["credit"]
     # single source of truth: amount (number) and display (text) computed exactly once here;
     # the same amount persists to pay_requests.final_price at receipt time (no later overwrite)
     if amt is not None:
         final_amount = str(amt)
-        display = f"{_fmt_price(amt)}  (بقایای {plan_txt(cur, 'name', lang)}: −{_fmt_price(rv)})"
+        if qt["kind"] == "upgrade":
+            b = [f"− اعتبار {plan_txt(cur, 'name', lang)} {_fmt_price(rv)}"]
+            if qt["used_balance"]: b.append(f"− کیف پول {_fmt_price(qt['used_balance'])}")
+            display = f"{_fmt_price(amt)}  (هزینه {plan_txt(p, 'name', lang)} برای {round(qt['rem_days'])} روز: {_fmt_price(qt['new_cost'])} · " + " · ".join(b) + ")"
+        else:
+            display = f"{_fmt_price(amt)}" + (f"  (از کیف پول −{_fmt_price(qt['used_balance'])})" if qt["used_balance"] else "")
     else:
         final_amount = new_price
         display = new_price
     context.user_data["await"] = {"kind": "receipt", "pid": pid, "back": f"u:plan:{pid}", "disc": d["code"] if d else None,
-                                   "final": final_amount, "display": display, "upgrade_amt": amt}
+                                   "final": final_amount, "display": display, "upgrade_amt": amt, "pc": qt}
     await render(update, context, gtext("pay", lang, plan=esc(plan_txt(p, "name", lang)), price=esc(display)) + tr(lang, "receipt_hint"), [[B(tr(lang, "cancel"), "c:cancel")]])
 async def view_receipt_ok(update, context): lang = L(update); await render(update, context, tr(lang, "receipt_ok"), [[B(tr(lang, "wait_btn"), "home")]], force_new=True)
 # ============================================================
@@ -3677,7 +3727,7 @@ async def view_source(update, context, sid):
     bot_on = s["bot_active"] is None or s["bot_active"]
     st = tr(lang, "src_st", c="🟢" if s["active"] else "🔴", b="🤖" if bot_on else "🚫")
     api = tr(lang, "src_api_on", u=esc(str(s["api_url"])[:60])) if _has_api(s) else tr(lang, "src_api_none")
-    text = tr(lang, "src_view", host=esc(hostname(s["url"])), url=esc(s["url"]), feed=tr(lang, "src_feed", u=esc(s["feed_url"])) if s["feed_url"] and s["feed_url"] != s["url"] else "", st=st, last=ago_text(s["last_fetch"], lang), n=s["found_total"], f=s["fail_count"], err=f"\n⚠️ <code>{esc((s['last_error'] or '')[:120])}</code>" if s["last_error"] else "") + "\n" + api
+    text = tr(lang, "src_view", host=esc(hostname(s["url"])), url=esc(s["url"]), feed=tr(lang, "src_feed", u=esc(s["feed_url"])) if s["feed_url"] and s["feed_url"] != s["url"] else "", st=st, last=ago_text(s["last_fetch"], lang), n=s["found_total"], f=s["fail_count"], err=f"\n⚠️ <code>{esc(redact(s['last_error'] or '')[:120])}</code>" if s["last_error"] else "") + "\n" + api
     kb = [[B(tr(lang, "src_recheck"), f"a:srcr:{sid}")], [B(("🟢 " if s["active"] else "🔴 ") + tr(lang, "tog_ch"), f"a:srct:{sid}"), B(("🟢 " if bot_on else "🔴 ") + tr(lang, "tog_bot"), f"a:srctb:{sid}")],
           [B(tr(lang, "src_api"), f"a:srcapi:{sid}")] + ([B(tr(lang, "src_api_del"), f"a:srcapix:{sid}")] if _has_api(s) else []), [B(tr(lang, "delete"), f"a:srcd:{sid}")], [B(tr(lang, "back"), f"a:src:{s['channel_id']}")]]
     await render(update, context, text, kb)
@@ -3921,7 +3971,7 @@ async def view_s_model(update, context, mid):
     lang = L(update); m = get_model(mid)
     if not m: return await view_s_models(update, context)
     key = m["api_key"] or ""; masked = (key[:5] + "…" + key[-4:]) if len(key) > 12 else "—"
-    text = tr(lang, "s_model_view", name=esc(m["name"]), kind=m["kind"], model=esc(m["model"]), base=esc(m["base_url"]), key=esc(masked), pr=m["priority"], temp=m["temperature"], mx=m["max_tokens"], st=tr(lang, "s_m_off" if not m["active"] else "s_m_ok" if m["status"] == "ok" else "s_m_down"), ok=m["ok_count"], fc=m["fail_count"], lo=ago_text(m["last_ok"], lang), lf=ago_text(m["last_fail"], lang), err=f"\n<code>{esc((m['last_error'] or '')[:150])}</code>" if m["last_error"] else "")
+    text = tr(lang, "s_model_view", name=esc(m["name"]), kind=m["kind"], model=esc(m["model"]), base=esc(m["base_url"]), key=esc(masked), pr=m["priority"], temp=m["temperature"], mx=m["max_tokens"], st=tr(lang, "s_m_off" if not m["active"] else "s_m_ok" if m["status"] == "ok" else "s_m_down"), ok=m["ok_count"], fc=m["fail_count"], lo=ago_text(m["last_ok"], lang), lf=ago_text(m["last_fail"], lang), err=f"\n<code>{esc(redact(m['last_error'] or '')[:150])}</code>" if m["last_error"] else "")
     kb = [[B(tr(lang, "s_model_test"), f"s:model_test:{mid}"), B(tr(lang, "toggle"), f"s:model_t:{mid}")]] + pairs([B(f"✏️ {f[2] if lang == 'en' else f[1]}", f"s:model_e:{mid}:{f[0]}") for f in MODEL_FIELDS]) + [[B(tr(lang, "s_model_del"), f"s:model_d:{mid}")], [B(tr(lang, "back"), "s:models")]]
     if m["owner_id"] is None:
         selected = gget("test_model_id") == mid
@@ -3954,6 +4004,12 @@ async def decide_pay(update, context, rid, approve, from_list):
         except Exception:
             pay_set(rid, "pending")   # تأیید نیمه‌کاره نباید پرداخت را در processing جا بگذارد
             raise
+        try:
+            pc = json.loads(r["pc"]) if ("pc" in r.keys() and r["pc"]) else {}
+        except Exception:
+            pc = {}
+        try: apply_plan_change(r["user_id"], r["plan_id"], pc)      # مصرف کیف پول + ثبت سابقهٔ تغییر پلن
+        except Exception: log.exception("plan change bookkeeping failed uid=%s", r["user_id"])
         if exp is None:
             pay_set(rid, "pending"); await popup(update, context, tr(lang, "notfound"), alert=True); return await view_s_pays(update, context) if from_list else None
         pay_set(rid, "approved")
@@ -4245,6 +4301,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception: pass
 # ============================================================
 # ورودی‌های متنی (ویزاردها، فیلدها، منبع، افزودن کانال + کد قفل، کد تخفیف، رسید …)
+_ALLOW_PRIVATE_MODELS = os.getenv("ALLOW_PRIVATE_MODEL_HOSTS", "").strip() == "1"   # پیش‌فرض: مقصد داخلی مسدود
 def _input_url(text, explicit_scheme=False):
     """Validate syntax only; local model providers are deliberately supported."""
     if not text or any(c.isspace() or ord(c) < 32 or 127 <= ord(c) <= 159 for c in text): raise ValueError
@@ -4256,6 +4313,12 @@ def _input_url(text, explicit_scheme=False):
     if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc or parsed.username is not None or parsed.password is not None: raise ValueError
     host = parsed.hostname
     if not host or any(c in parsed.netloc for c in "{}%") or parsed.netloc.endswith(":"): raise ValueError
+    if explicit_scheme and not _ALLOW_PRIVATE_MODELS:
+        # base_url مدل شخصی: مقصد داخلی مسدود است، وگرنه هر کاربرِ پلن‌فعال می‌تواند ربات را به سرویس داخلی POST بفرستد (SSRF)
+        h = (host or "").strip("[]").lower().rstrip(".")
+        if (h in ("localhost", "::1", "0.0.0.0") or h.endswith((".local", ".internal", ".localhost"))
+                or re.match(r"^(127\.|10\.|192\.168\.|169\.254\.|0\.|172\.(1[6-9]|2\d|3[01])\.)", h)):
+            raise ValueError("private model host")
     if parsed.netloc.startswith("["):
         if not re.fullmatch(r"\[[0-9a-fA-F:.]+\](?::[0-9]+)?", parsed.netloc): raise ValueError
     elif parsed.netloc.count(":") > 1: raise ValueError
@@ -4586,7 +4649,7 @@ async def handle_input(update, context, st):
         if not (msg.photo or msg.document or text): await popup(update, context, tr(lang, "receipt_empty")); return
         if pay_pending_for(uid, pid): done(tr(lang, "req_pending")); return await dispatch(update, context, back)
         # st["final"] is the single source of truth (prorated amount for upgrades, full price text otherwise)
-        rid = pay_create(uid, pid, msg.chat_id, msg.message_id, text, st.get("disc"), st.get("final"))
+        rid = pay_create(uid, pid, msg.chat_id, msg.message_id, text, st.get("disc"), st.get("final"), st.get("pc"))
         done(); ud.get("disc", {}).pop(str(pid), None)
         disc = f"\n🎟 {esc(st['disc'])}" if st.get("disc") else ""; note = f"\n📝 {esc(text[:400])}" if text else ""
         header = tr("fa", "s_pay_new", id=rid, who=esc(uname(u)), uid=uid, plan=esc(p["name"]), price=esc(st.get("display") or st.get("final") or p["price"]), disc=disc, note=note); kb = InlineKeyboardMarkup([[B("✅ تأیید / Approve", f"s:pay_ok:{rid}"), B("❌ رد / Reject", f"s:pay_no:{rid}")]])
@@ -4718,7 +4781,9 @@ async def send_deeplink(update, context, key):
         await asyncio.sleep(.3)
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = await _prep(update, context)
-    if context.args and context.args[0].startswith("r_"): return await send_deeplink(update, context, context.args[0][2:])
+    if context.args and context.args[0].startswith("r_"):
+        if not rate_ok(f"dl:{update.effective_user.id}", CB_RATE): return   # جلوی تقویتِ درخواست بیرونی با /start تکراری را می‌گیرد
+        return await send_deeplink(update, context, context.args[0][2:])
     if not lang: return await view_lang(update, context)
     await go_home(update, context)
 async def cmd_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
