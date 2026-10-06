@@ -12,6 +12,8 @@ from urllib.parse import urljoin, urlparse
 from email.utils import parsedate_to_datetime
 import httpx, feedparser, trafilatura
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+load_dotenv()
 #  ============================================================
 # تنظیمات محیطی
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN", "")
